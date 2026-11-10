@@ -237,6 +237,8 @@ type App struct {
 	mcpRestartMu  sync.Mutex
 	plans         map[string][]PlanStep // sessionID → the plan's steps
 	planRevisions map[string]int64
+	goalStoreMu   sync.Mutex
+	goalStore     *GoalStore
 	// sessionWorkspaceMaps freezes the workspace map bytes per session
 	// (sessionID → map text) so the request prefix stays byte-stable across
 	// runs and provider prompt cache survive; guarded by mu (declared in
@@ -805,6 +807,7 @@ type ChatRequest struct {
 	Messages    []ChatMessageInput `json:"messages"`
 	Attachments []AttachmentInput  `json:"attachments,omitempty"`
 	Config      ConfigState        `json:"config"`
+	GoalID      string             `json:"-"`
 	// HTTP callers have no frontend to persist the session list metadata.
 	syncSessionIndex bool
 }
@@ -1708,6 +1711,23 @@ func (a *App) StartChat(req ChatRequest) (string, error) {
 	if err := a.ensureInitialized(); err != nil {
 		return "", err
 	}
+	if req.GoalID == "" {
+		req.GoalID = a.resumableGoalForSession(req.SessionID)
+	}
+	if req.GoalID != "" {
+		store, err := a.goalStoreInstance()
+		if err != nil {
+			return "", err
+		}
+		goal, ok := store.Get(req.GoalID)
+		if !ok || goal.SessionID != req.SessionID {
+			return "", errors.New("goal does not belong to this session")
+		}
+		req.Config, err = configForGoal(req.Config, goal)
+		if err != nil {
+			return "", err
+		}
+	}
 	cfg := a.effectiveConfig(req.Config)
 	return a.startChatWithConfig(req, cfg)
 }
@@ -1788,6 +1808,13 @@ func (a *App) startChatWithConfig(req ChatRequest, cfg ConfigState) (string, err
 	a.runSessions[runID] = req.SessionID
 	a.runInputs[runID] = make(chan runInput, runInputBufferSize)
 	a.mu.Unlock()
+	if req.GoalID != "" {
+		if err := a.attachGoalRun(req.GoalID, req.SessionID, runID); err != nil {
+			cancel()
+			a.finishRun(runID)
+			return "", err
+		}
+	}
 	if req.SessionID != "" {
 		a.publishSessionExtraRoots(req.SessionID, cfg.ExtraRoots)
 		if modelChanged {
@@ -2174,6 +2201,16 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 	// runs. messages therefore stays strictly monotonic, and the check still
 	// reaches the model (see requestMessages below).
 	var planCheckRequest *openai.ChatCompletionMessage
+	var goalInitialRequest *openai.ChatCompletionMessage
+	var goalContinueRequest *openai.ChatCompletionMessage
+	goalContinuations := 0
+	if req.GoalID != "" {
+		if store, err := a.goalStoreInstance(); err == nil {
+			if goal, ok := store.Get(req.GoalID); ok && goal.SessionID == sessionID {
+				goalInitialRequest = &openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: goalStartMessage(goal)}
+			}
+		}
+	}
 	emitRunEnd := func(event string, kind string, payload map[string]any) {
 		a.invalidateGitStatus(cfg.Workspace)
 		if payload == nil {
@@ -2193,6 +2230,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			RunID: runID, Status: kind, Error: stringValue(payload["error"]), UpdatedAt: time.Now().UnixMilli(),
 		}
 		a.mu.Unlock()
+		a.finishGoalRun(req.GoalID, runID, kind, stringValue(payload["error"]))
 		a.emit(event, payload)
 
 	}
@@ -2243,6 +2281,10 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 	// This run sends the same immutable tool list on every step. Count it once
 	// from that exact list, including across in-run history compaction.
 	tools := a.buildToolsForSession(sessionID, cfg)
+	if req.GoalID != "" && !toolListHasName(tools, "goal_update") {
+		emitRunEnd("run:error", "error", map[string]any{"error": "goal_update is not available in this session's frozen tool set; start the goal in a fresh session"})
+		return
+	}
 	ctx = withBuiltinToolAvailability(ctx, tools)
 	toolSchemaTokens := estimateToolSchemaTokens(tools)
 	breakdownAcc := newLiveBreakdownAccumulator(messages)
@@ -2278,7 +2320,12 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			emitRunEnd("run:error", "cancelled", map[string]any{"error": "已取消"})
 			return
 		default:
-		} // Inject user messages queued while this run was working: they wait
+		}
+		if req.GoalID != "" && step >= maxGoalStepsPerRun {
+			emitRunEnd("run:error", "error", map[string]any{"error": "目标单次 run 达到步骤上限；目标已暂停，可检查进展后继续。"})
+			return
+		}
+		// Inject user messages queued while this run was working: they wait
 		// for the current tool batch to complete and enter the context here,
 		// right before the next model request, so the model sees them in the
 		// following turn. They are persisted with the rest of the history.
@@ -2331,12 +2378,20 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		if planChecked {
 			requestTrigger = "plan_check_followup"
 		}
-		if planCheckRequest != nil {
+		if goalInitialRequest != nil {
+			requestTrigger = "goal_start"
+			requestMessages = append(append(make([]openai.ChatCompletionMessage, 0, len(messages)+1), messages...), *goalInitialRequest)
+			goalInitialRequest = nil
+		} else if planCheckRequest != nil {
 			requestTrigger = "plan_check"
 			// Tail-appended on a copy: the host question is for this one request
 			// only, so the persisted history never carries it.
 			requestMessages = append(append(make([]openai.ChatCompletionMessage, 0, len(messages)+1), messages...), *planCheckRequest)
 			planCheckRequest = nil
+		} else if goalContinueRequest != nil {
+			requestTrigger = "goal_continuation"
+			requestMessages = append(append(make([]openai.ChatCompletionMessage, 0, len(messages)+1), messages...), *goalContinueRequest)
+			goalContinueRequest = nil
 		}
 
 		toolCalls := []openai.ToolCall{}
@@ -2541,6 +2596,13 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 					continue
 				}
 			}
+			if req.GoalID != "" {
+				if marker, ok := a.goalContinuation(sessionID, req.GoalID, goalContinuations); ok {
+					goalContinuations++
+					goalContinueRequest = marker
+					continue
+				}
+			}
 			a.saveHistory(req.SessionID, messages)
 			success = true
 			emitRunEnd("run:done", "done", nil)
@@ -2607,6 +2669,9 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 				toolCallIndex: idx, toolCallID: c.ID, toolName: c.Function.Name, toolArgs: c.Function.Arguments,
 			})
 			toolCtx = context.WithValue(toolCtx, sessionReadCacheContextKey{}, readCache)
+			if req.GoalID != "" {
+				toolCtx = context.WithValue(toolCtx, goalRunContextKey{}, req.GoalID)
+			}
 			toolCtx = withBlackboardReservation(toolCtx, blackboardNames[idx])
 			return a.executeTool(toolCtx, toolCfg, sessionID, c.Function.Name, []byte(executionArgs))
 		}
@@ -2757,6 +2822,9 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 	name = normalizeToolName(name)
 	if toolshared.IsBuiltinTool(name) && builtinToolDisabled(ctx, cfg, name) {
 		return toolErrorResult(codedToolError("E_TOOL_DISABLED", fmt.Errorf("工具 %q 已禁用，请勿再次调用该工具。", name)))
+	}
+	if err := a.checkGoalToolExecution(ctx, sessionID, name); err != nil {
+		return toolErrorResult(err)
 	}
 
 	// 截断参数的 tool call 一律不执行：normalizeToolCalls 把流式截断的
@@ -3081,6 +3149,12 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		err, argWarnings = decodeJSON(&tReq)
 		if err == nil {
 			data, err = a.handlePlan(sessionID, tReq)
+		}
+	case "goal_update":
+		var req GoalUpdateRequest
+		err, argWarnings = decodeJSON(&req)
+		if err == nil {
+			data, err = a.updateGoalForSession(sessionID, req)
 		}
 	case "skill":
 		var skReq struct {

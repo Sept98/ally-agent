@@ -141,7 +141,7 @@ func (a *desktop) chatMessages(c *ui.Context, t *conversation, width float32) {
 				})
 			})
 		}
-		if st.SessionsOpen || len(a.plans[t.ID]) > 0 {
+		if st.SessionsOpen || len(a.plans[t.ID]) > 0 || a.goals[t.ID].ID != "" {
 			// The transcript and the composer are capped and centred, so a panel pinned
 			// to the window edge never lines up with either. Same cap, same centre,
 			// same side inset as the composer box it sits directly above.
@@ -149,6 +149,7 @@ func (a *desktop) chatMessages(c *ui.Context, t *conversation, width float32) {
 				if st.SessionsOpen {
 					a.sessionsMenu(c, t)
 				} else {
+					a.goalPanel(c, t)
 					a.planPanel(c, t)
 				}
 			})

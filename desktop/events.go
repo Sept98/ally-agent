@@ -71,6 +71,12 @@ func (a *desktop) applyEvent(name string, p map[string]any) {
 		}
 	case "plan:update":
 		a.applyPlanUpdate(p)
+	case "goal:update":
+		a.applyGoalUpdate(p)
+		return
+	case "goal:deleted":
+		a.applyGoalDelete(p)
+		return
 	case "tokens:update":
 		a.applyTokenUsage(p)
 	case "ssh:clusters-changed":

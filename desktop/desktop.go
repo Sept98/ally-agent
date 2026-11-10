@@ -145,6 +145,8 @@ type desktop struct {
 	gameF                                   gameUI
 	plans                                   map[string][]backend.PlanStep
 	planRev                                 map[string]int64
+	goals                                   map[string]backend.Goal
+	goalRev                                 map[string]int64
 	subRuns                                 map[string]*backend.SubagentRun
 	railExpanded                            bool
 	plugins                                 []backend.PluginInfo
@@ -393,6 +395,7 @@ func Run() {
 			}
 			autostart, autostartInitialized, autostartErr := initializeAutostart(a.core, prefs.AutostartInitialized)
 			sessions, _ := a.core.ListSessionIndex()
+			goals, goalErr := a.core.ListGoals()
 			workspace := startupWorkspace(sessions, cfg.Workspace)
 			skills, _ := a.core.ListSkills()
 			tools := a.core.ListTools()
@@ -424,6 +427,13 @@ func Run() {
 				a.setMCPServers(servers)
 				a.mcpSummary = mcpSummary(servers)
 				a.sessions, a.sessRev = sessions, a.sessRev+1
+				a.goals = make(map[string]backend.Goal, len(goals))
+				for _, goal := range goals {
+					a.goals[goal.SessionID] = goal
+				}
+				if goalErr != nil {
+					a.notifyError("目标记录加载失败：" + goalErr.Error())
+				}
 				for _, tab := range a.tabs {
 					a.loadWorkspaceInputHistory(tab)
 				}

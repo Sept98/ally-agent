@@ -102,6 +102,10 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 	if identityErr != nil {
 		return nil, codedToolError("E_BAD_ARGS", identityErr)
 	}
+	// Goal authority belongs to the parent session run only. A delegate must
+	// never inherit its parent's goal ID, even if it calls a tool that was not
+	// included in its advertised tool set.
+	ctx = context.WithValue(ctx, goalRunContextKey{}, "")
 	// The model must supply maxSteps; clamp into a safe range. A missing or
 	// invalid value falls back to a modest default rather than the hard maximum
 	// so a runaway delegate cannot silently burn tokens.

@@ -51,8 +51,10 @@ const (
 	// and a step title is what a later call names, so the number of steps and the
 	// title length are both bounded here and checked against these same numbers
 	// in the handler.
-	MaxPlanSteps          = 50
-	MaxPlanStepTitleChars = 200
+	MaxPlanSteps                    = 50
+	MaxPlanStepTitleChars           = 200
+	MaxGoalAcceptanceCriteria       = 32
+	MaxGoalAcceptanceCriterionChars = 200
 	// MaxDelegateStepBudget bounds one delegated run: it is both the subagent
 	// maxSteps maximum and the scheduled-task hard cap (scheduler.MaxSteps
 	// aliases it). The literal lives here, in the leaf package every tool
@@ -481,6 +483,15 @@ func chatToolsUncached() []openai.Tool {
 				},
 			},
 		}),
+		functionTool("goal_update", "Report the active goal's acceptance criteria, status, and progress. Define observable acceptance criteria before side effects; only an active goal accepts updates, and the runtime backend enforces this.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"status":     map[string]any{"type": "string", "enum": []string{"progress", "needs_user", "completed"}},
+				"progress":   map[string]any{"type": "string", "minLength": 1},
+				"acceptance": map[string]any{"type": "array", "maxItems": MaxGoalAcceptanceCriteria, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": MaxGoalAcceptanceCriterionChars}},
+			},
+			"required": []string{"status", "progress", "acceptance"},
+		}),
 		functionTool("subagent", "Run an isolated child task. The parent waits for the tool batch; same-stage calls can run concurrently. Children in the same chat run share a temporary Blackboard, not conversation history; give collaborating children unique names and mention peer names in their tasks. The child uses built-in and MCP tools, but cannot use ask, suggest, subagent, plan, skill, scheduled_task, render_html or screenshot. Verify its report and stopReason.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -538,6 +549,7 @@ var builtinToolExamples = map[string]string{
 	"render_html":        `{"html":"<div id=\"chart\" style=\"width:100%;height:350px;\"></div><script>const c=echarts.init(document.getElementById('chart'),'dark');c.setOption({title:{text:'Metrics'},xAxis:{data:['Mon','Tue','Wed','Thu','Fri']},yAxis:{},series:[{type:'bar',data:[12,34,56,78,90]}]});</script>"}`,
 	"screenshot":         `list: {"action":"list"}; a window by id: {"windowId":131076}; by unique title: {"windowTitle":"ally-agent"}; region: {"region":{"x":0,"y":0,"width":1280,"height":800}}`,
 	"plan":               `start: {"steps":["Inspect code","Run tests"]}; report progress: {"finish":"Inspect code"}; read: {}`,
+	"goal_update":        `{"status":"progress","progress":"Inspecting the relevant code","acceptance":["Relevant tests pass"]}`,
 }
 
 // modelOutputNote is the command schema's account of what the model receives.

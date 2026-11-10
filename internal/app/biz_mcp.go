@@ -2114,7 +2114,17 @@ func builtinToolsForConfig(cfg ConfigState) []openai.Tool {
 
 // buildToolsForConfig is the live set for stateless callers and new sessions.
 func (a *App) buildToolsForConfig(cfg ConfigState) []openai.Tool {
-	return a.buildToolsWithMcp(builtinToolsForConfig(cfg))
+	return a.buildToolsWithMcp(withoutGoalUpdateTool(builtinToolsForConfig(cfg)))
+}
+
+func withoutGoalUpdateTool(tools []openai.Tool) []openai.Tool {
+	filtered := make([]openai.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Function == nil || normalizeToolName(tool.Function.Name) != "goal_update" {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
 }
 
 type builtinToolAvailabilityKey struct{}
@@ -2163,6 +2173,14 @@ func (a *App) buildToolsForSession(sessionID string, cfg ConfigState) []openai.T
 	a.mu.Unlock()
 
 	tools := a.buildToolsForConfig(cfg)
+	if a.activeGoalForSession(sessionID) {
+		for _, tool := range builtinToolsForConfig(cfg) {
+			if tool.Function != nil && normalizeToolName(tool.Function.Name) == "goal_update" {
+				tools = append(tools, tool)
+				break
+			}
+		}
+	}
 	a.mu.Lock()
 	if a.sessionToolsets == nil {
 		a.sessionToolsets = map[string][]openai.Tool{}

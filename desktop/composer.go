@@ -387,6 +387,7 @@ type slashCommand struct {
 
 func (a *desktop) builtinCommands(t *conversation) []slashCommand {
 	return []slashCommand{
+		{"goal", "启动目标任务：/goal <目标>", "", nil},
 		{"new", "新建会话，清空上下文", "", func() { a.newSession() }},
 		{"skills", "查看可用技能", "", func() { a.changePage("skills") }},
 		{"sessions", "查看/切换历史会话", "", func() { a.openSessionsMenu(t) }},
@@ -473,6 +474,19 @@ func (a *desktop) builtinCommandFor(t *conversation, text string) *slashCommand 
 		return nil
 	}
 	fields := strings.Fields(strings.TrimPrefix(text, "/"))
+	if len(fields) == 0 {
+		return nil
+	}
+	if strings.EqualFold(fields[0], "goal") {
+		objective, _ := parseGoalCommand(text)
+		return &slashCommand{Label: "goal", Desc: "启动目标任务：/goal <目标>", Action: func() {
+			if objective == "" {
+				a.notify("用法：/goal <目标>")
+				return
+			}
+			a.startGoal(t, objective)
+		}}
+	}
 	if len(fields) != 1 {
 		return nil
 	}

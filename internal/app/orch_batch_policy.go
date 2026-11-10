@@ -18,6 +18,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -99,6 +100,10 @@ func planBatchWriteSource(arguments string) bool {
 	return err == nil && action != planActionRead
 }
 
+func goalUpdateOwnsBatch(call openai.ToolCall) bool {
+	return normalizeToolName(call.Function.Name) == "goal_update"
+}
+
 func detectToolBatchConflicts(cfg ConfigState, calls []openai.ToolCall) map[int]error {
 	conflicts := detectWriteBatchConflicts(cfg, calls)
 	if len(calls) <= 1 {
@@ -126,6 +131,16 @@ func detectToolBatchConflicts(cfg ConfigState, calls []openai.ToolCall) map[int]
 			continue
 		}
 		err := codedToolError(barrier.code, fmt.Errorf("%s must be the only tool call in its batch; no tool in this batch was executed", barrier.name))
+		for i := range calls {
+			conflicts[i] = err
+		}
+		return conflicts
+	}
+	for _, call := range calls {
+		if !goalUpdateOwnsBatch(call) {
+			continue
+		}
+		err := codedToolError("E_GOAL_UPDATE_BATCH_CONFLICT", errors.New("goal_update must be the only tool call in its batch; no tool in this batch was executed"))
 		for i := range calls {
 			conflicts[i] = err
 		}
