@@ -753,6 +753,14 @@ func (a *App) runCommandWithTimer(parent context.Context, cfg ConfigState, req C
 		select {
 		case err = <-waitDone:
 		case <-timeoutC:
+			if req.noPromote {
+				// Verification commands are bounded checks, never background services.
+				timedOut = true
+				cancel()
+				<-waitDone
+				err = context.DeadlineExceeded
+				break
+			}
 			// 超时收编：进程还活着（waitDone 未关），把原进程连同输出管道
 			// 一起移交给服务注册表，避免杀掉重跑撞 EADDRINUSE。
 			info, promoteErr := a.promoteTimedOutCommand(promoteCommandParams{

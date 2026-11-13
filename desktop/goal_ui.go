@@ -166,7 +166,7 @@ func goalStatusLabel(status backend.GoalStatus) string {
 	case backend.GoalStatusNeedsUser:
 		return "等待你补充信息"
 	case backend.GoalStatusCompleted:
-		return "Agent 报告完成 · 请核验"
+		return "Agent 报告完成 · 自动检查通过 · 请核验"
 	case backend.GoalStatusFailed:
 		return "启动失败"
 	default:
@@ -188,8 +188,61 @@ func (a *desktop) goalPanel(c *ui.Context, t *conversation) {
 		if goal.Progress != "" {
 			ui.Text(c, goal.Progress).FontSize(fsSmall).TextColor(a.secondaryInk())
 		}
+		if len(goal.Stages) > 0 {
+			ui.Text(c, "阶段检查点").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+			for i, stage := range goal.Stages {
+				label := map[string]string{"pending": "待开始", "active": "进行中", "completed": "阶段检查通过"}[stage.Status]
+				if stage.ReviewRequired {
+					label = "需要复核（副作用已阻止）"
+				}
+				ui.Text(c, fmt.Sprintf("%d. [%s] %s", i+1, label, stage.Title)).FontSize(fsTiny).TextColor(a.secondaryInk())
+				if stage.Objective != "" {
+					ui.Text(c, "   阶段目标："+stage.Objective).FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				if stage.Attempts > 0 {
+					ui.Text(c, fmt.Sprintf("   验收尝试：%d · 连续失败：%d/%d", stage.Attempts, stage.FailuresSinceReview, backend.GoalStageReviewFailureThreshold)).FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				if stage.Evidence != "" {
+					ui.Text(c, "   Agent 阶段说明（待核验）："+stage.Evidence).FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				for _, check := range stage.Verifications {
+					checkLabel := "失败"
+					if check.Passed {
+						checkLabel = "通过"
+					}
+					ui.Text(c, fmt.Sprintf("   检查 %s：%s（退出码 %d）", check.Name, checkLabel, check.ExitCode)).FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				for _, revision := range stage.ReviewHistory {
+					ui.Text(c, fmt.Sprintf("   方案复核：%s · %s", revision.Decision, revision.Rationale)).FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+			}
+		}
 		if goal.Model != nil {
 			ui.Text(c, "目标固定模型："+modelLabel(goal.Model.ProviderName, goal.Model.Model)).FontSize(fsTiny).TextColor(a.secondaryInk())
+		}
+		if goal.DeliverySummary != "" {
+			ui.Text(c, "交付摘要").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+			ui.Text(c, goal.DeliverySummary).FontSize(fsTiny).TextColor(a.secondaryInk())
+		}
+		if len(goal.Deliverables) > 0 {
+			ui.Text(c, "已检查的交付文件").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+			for _, deliverable := range goal.Deliverables {
+				hash := deliverable.SHA256
+				if len(hash) > 12 {
+					hash = hash[:12]
+				}
+				ui.Text(c, fmt.Sprintf("%s · %d B · SHA-256 %s…", deliverable.Path, deliverable.Size, hash)).FontSize(fsTiny).TextColor(a.secondaryInk())
+			}
+		}
+		if len(goal.Verifications) > 0 {
+			ui.Text(c, "自动验收命令结果").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+			for _, result := range goal.Verifications {
+				label := "失败"
+				if result.Passed {
+					label = "通过（退出码 0）"
+				}
+				ui.Text(c, fmt.Sprintf("%s：%s", result.Name, label)).FontSize(fsTiny).TextColor(a.secondaryInk())
+			}
 		}
 		if len(goal.Acceptance) > 0 {
 			ui.Text(c, "验收条件").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
@@ -204,7 +257,7 @@ func (a *desktop) goalPanel(c *ui.Context, t *conversation) {
 			ui.Text(c, "在聊天输入框补充信息并发送，即可继续目标。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
 		}
 		if goal.Status == backend.GoalStatusCompleted {
-			ui.Text(c, "完成状态由 Agent 报告；请依据实际测试和产物核验。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
+			ui.Text(c, "阶段证据仍由 Agent 报告；自动命令通过只代表退出码为 0，请核验测试覆盖和实际产物。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
 		}
 		if goal.Status == backend.GoalStatusPaused {
 			primary(c, "继续目标").OnClick(func() { a.continueGoal(goal) })

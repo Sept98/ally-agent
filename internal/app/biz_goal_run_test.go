@@ -22,7 +22,7 @@ func TestGoalRunContinuesUntilGoalUpdateCompletes(t *testing.T) {
 			if !strings.Contains(request, "ally-goal-continuation") {
 				t.Errorf("normal model stop did not trigger bounded continuation")
 			}
-			return sseChatToolCallChunk("goal_call", "goal_update", `{"status":"completed","progress":"acceptance tests passed","acceptance":["acceptance tests pass"]}`) +
+			return sseChatToolCallChunk("goal_call", "goal_update", `{"status":"completed","progress":"acceptance tests passed","acceptance":["acceptance tests pass"],"stages":[{"title":"Run acceptance tests","objective":"Run the package acceptance tests","status":"completed","evidence":"go test passed","verifications":[{"name":"stage tests","command":"echo stage-ok"}]}],"verifications":[{"name":"acceptance tests","command":"echo verified"}],"stage_review":{"stage":0,"decision":"","rationale":"","revised_title":"","revised_objective":""},"deliverable_paths":[],"delivery_summary":"Acceptance checks completed."}`) +
 				sseChatFinishChunk("tool_calls") + sseDone
 		case 3:
 			return sseChatChunk("验收条件已逐项核对。") + sseChatFinishChunk("stop") + sseDone
@@ -70,7 +70,7 @@ func TestGoalRunContinuesUntilGoalUpdateCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	updated, ok := store.Get(goal.ID)
-	if !ok || updated.Status != GoalStatusCompleted || updated.Progress != "acceptance tests passed" || updated.ActiveRunID != "" {
+	if !ok || updated.Status != GoalStatusCompleted || updated.Progress != "acceptance tests passed" || updated.ActiveRunID != "" || len(updated.Verifications) != 1 || !updated.Verifications[0].Passed {
 		t.Fatalf("goal did not reach reported-complete state: %+v, %v", updated, ok)
 	}
 	app.mu.Lock()

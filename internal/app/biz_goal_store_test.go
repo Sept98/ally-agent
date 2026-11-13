@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestGoalStoreReloadAndCRUD(t *testing.T) {
@@ -84,6 +85,62 @@ func TestGoalStoreValidation(t *testing.T) {
 	}
 	if !GoalStatusCompleted.Valid() || GoalStatus("bad").Valid() {
 		t.Fatal("status validation incorrect")
+	}
+}
+
+func TestGoalStorePersistsReviewVerificationAndDeliverableMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "goals.json")
+	store, err := NewGoalStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifiedAt := time.Now().UTC().Truncate(time.Second)
+	goal := Goal{ID: "metadata", SessionID: "session", Workspace: t.TempDir(), Title: "delivery", Acceptance: []string{"checks pass"}, Status: GoalStatusPaused, MaxRuns: 5,
+		Stages: []GoalStage{{Title: "Revised check", Objective: "Check observable output", Status: "active", Attempts: 3, Revision: 1,
+			ReviewHistory: []GoalStageRevision{{Decision: "revise", OldTitle: "Old check", OldObjective: "Old objective", NewTitle: "Revised check", NewObjective: "Check observable output", Rationale: "Clarified expected output", At: verifiedAt}},
+			Verifications: []GoalVerification{{Name: "stage tests", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}}}},
+		Verifications: []GoalVerification{{Name: "integration", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}},
+		Deliverables:  []GoalDeliverable{{Path: "artifact.txt", Size: 12, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt}}, DeliverySummary: "Artifact verified."}
+	if err := store.Create(goal); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.Get(goal.ID)
+	if !ok || got.Stages[0].ReviewHistory[0].Decision != "revise" || !got.Stages[0].Verifications[0].Passed || got.Verifications[0].Name != "integration" || got.Deliverables[0].SHA256 != strings.Repeat("a", 64) || got.DeliverySummary != "Artifact verified." {
+		t.Fatalf("metadata was not returned: %+v, %v", got, ok)
+	}
+	got.Stages[0].ReviewHistory[0].Rationale = "mutated"
+	got.Stages[0].Verifications[0].Name = "mutated"
+	got.Verifications[0].Name = "mutated"
+	got.Deliverables[0].Path = "mutated"
+	listed := store.List()
+	listed[0].Stages[0].ReviewHistory[0].Decision = "mutated"
+	persisted, ok := store.Get(goal.ID)
+	if !ok || persisted.Stages[0].ReviewHistory[0].Rationale != "Clarified expected output" || persisted.Stages[0].Verifications[0].Name != "stage tests" || persisted.Verifications[0].Name != "integration" || persisted.Deliverables[0].Path != "artifact.txt" {
+		t.Fatalf("returned metadata aliases stored state: %+v", persisted)
+	}
+	reloaded, err := NewGoalStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, ok := reloaded.Get(goal.ID)
+	if !ok || disk.Stages[0].ReviewHistory[0].NewObjective != "Check observable output" || !disk.Stages[0].Verifications[0].Passed || !disk.Verifications[0].Passed || disk.Deliverables[0].Size != 12 || disk.Deliverables[0].SHA256 != strings.Repeat("a", 64) || disk.DeliverySummary != "Artifact verified." {
+		t.Fatalf("metadata did not survive JSON reload: %+v, %v", disk, ok)
+	}
+}
+
+func TestGoalStoreAcceptsLegacyGoalWithoutNewMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "goals.json")
+	legacy := `[{"id":"legacy","session_id":"s","workspace":"/workspace","title":"old goal","status":"paused","max_runs":5}]`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewGoalStore(path)
+	if err != nil {
+		t.Fatalf("legacy goal without stage/review/delivery fields rejected: %v", err)
+	}
+	got, ok := store.Get("legacy")
+	if !ok || got.Status != GoalStatusPaused || len(got.Stages) != 0 || len(got.Deliverables) != 0 {
+		t.Fatalf("unexpected legacy goal: %+v, %v", got, ok)
 	}
 }
 

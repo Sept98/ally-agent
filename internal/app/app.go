@@ -1005,9 +1005,10 @@ type DeletePathsResult struct {
 }
 
 type CommandRequest struct {
-	Command string `json:"command"`
-	Cwd     string `json:"cwd"`
-	Timeout int    `json:"timeout"`
+	Command   string `json:"command"`
+	Cwd       string `json:"cwd"`
+	Timeout   int    `json:"timeout"`
+	noPromote bool   `json:"-"`
 }
 
 type StartServiceRequest struct {
@@ -3154,7 +3155,7 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		var req GoalUpdateRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
-			data, err = a.updateGoalForSession(sessionID, req)
+			data, err = a.updateGoalForSessionWithConfig(ctx, sessionID, cfg, req)
 		}
 	case "skill":
 		var skReq struct {

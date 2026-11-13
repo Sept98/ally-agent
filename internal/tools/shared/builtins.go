@@ -483,14 +483,31 @@ func chatToolsUncached() []openai.Tool {
 				},
 			},
 		}),
-		functionTool("goal_update", "Report the active goal's acceptance criteria, status, and progress. Define observable acceptance criteria before side effects; only an active goal accepts updates, and the runtime backend enforces this.", map[string]any{
+		functionTool("goal_update", "Persist a complete ordered stage plan and progress. Each completed stage requires named verification commands run by Ally in the workspace sandbox (120-second timeout, no background service). Failures are tracked per stage; after 3 failed attempts, side effects are blocked until stage_review explicitly chooses revise, continue, or needs_user. Final completion also requires passing integration commands, a delivery_summary and workspace-relative deliverable_paths for any file outputs; Ally checks each listed file exists and stores its size and SHA-256.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"status":     map[string]any{"type": "string", "enum": []string{"progress", "needs_user", "completed"}},
 				"progress":   map[string]any{"type": "string", "minLength": 1},
 				"acceptance": map[string]any{"type": "array", "maxItems": MaxGoalAcceptanceCriteria, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": MaxGoalAcceptanceCriterionChars}},
+				"stages": map[string]any{"type": "array", "maxItems": MaxPlanSteps, "items": map[string]any{"type": "object", "properties": map[string]any{
+					"title":         map[string]any{"type": "string", "minLength": 1, "maxLength": MaxPlanStepTitleChars},
+					"objective":     map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
+					"status":        map[string]any{"type": "string", "enum": []string{"pending", "active", "completed"}},
+					"evidence":      map[string]any{"type": "string", "maxLength": 2000},
+					"verifications": map[string]any{"type": "array", "maxItems": 10, "items": map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string", "minLength": 1, "maxLength": 120}, "command": map[string]any{"type": "string", "minLength": 1, "maxLength": 2000}}, "required": []string{"name", "command"}}},
+				}, "required": []string{"title", "objective", "status", "evidence", "verifications"}}},
+				"stage_review": map[string]any{"type": "object", "properties": map[string]any{
+					"stage":             map[string]any{"type": "integer", "minimum": 0, "maximum": MaxPlanSteps, "description": "One-based stage index; use 0 when no review is requested."},
+					"decision":          map[string]any{"type": "string", "enum": []string{"", "revise", "continue", "needs_user"}},
+					"rationale":         map[string]any{"type": "string", "maxLength": 2000},
+					"revised_title":     map[string]any{"type": "string", "maxLength": MaxPlanStepTitleChars},
+					"revised_objective": map[string]any{"type": "string", "maxLength": 2000},
+				}, "required": []string{"stage", "decision", "rationale", "revised_title", "revised_objective"}},
+				"deliverable_paths": map[string]any{"type": "array", "maxItems": 32, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 4096}},
+				"delivery_summary":  map[string]any{"type": "string", "maxLength": 4000},
+				"verifications":     map[string]any{"type": "array", "maxItems": 10, "items": map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string", "minLength": 1, "maxLength": 120}, "command": map[string]any{"type": "string", "minLength": 1, "maxLength": 2000}}, "required": []string{"name", "command"}}},
 			},
-			"required": []string{"status", "progress", "acceptance"},
+			"required": []string{"status", "progress", "acceptance", "stages", "verifications", "stage_review", "deliverable_paths", "delivery_summary"},
 		}),
 		functionTool("subagent", "Run an isolated child task. The parent waits for the tool batch; same-stage calls can run concurrently. Children in the same chat run share a temporary Blackboard, not conversation history; give collaborating children unique names and mention peer names in their tasks. The child uses built-in and MCP tools, but cannot use ask, suggest, subagent, plan, skill, scheduled_task, render_html or screenshot. Verify its report and stopReason.", map[string]any{
 			"type": "object",
@@ -549,7 +566,7 @@ var builtinToolExamples = map[string]string{
 	"render_html":        `{"html":"<div id=\"chart\" style=\"width:100%;height:350px;\"></div><script>const c=echarts.init(document.getElementById('chart'),'dark');c.setOption({title:{text:'Metrics'},xAxis:{data:['Mon','Tue','Wed','Thu','Fri']},yAxis:{},series:[{type:'bar',data:[12,34,56,78,90]}]});</script>"}`,
 	"screenshot":         `list: {"action":"list"}; a window by id: {"windowId":131076}; by unique title: {"windowTitle":"ally-agent"}; region: {"region":{"x":0,"y":0,"width":1280,"height":800}}`,
 	"plan":               `start: {"steps":["Inspect code","Run tests"]}; report progress: {"finish":"Inspect code"}; read: {}`,
-	"goal_update":        `{"status":"progress","progress":"Inspecting the relevant code","acceptance":["Relevant tests pass"]}`,
+	"goal_update":        `{"status":"progress","progress":"Inspecting the relevant code","acceptance":["Relevant tests pass"],"stages":[{"title":"Inspect code","objective":"Identify relevant implementation and tests","status":"active","evidence":"","verifications":[]},{"title":"Run tests","objective":"Run and inspect the acceptance tests","status":"pending","evidence":"","verifications":[]}],"verifications":[],"stage_review":{"stage":0,"decision":"","rationale":"","revised_title":"","revised_objective":""},"deliverable_paths":[],"delivery_summary":""}`,
 }
 
 // modelOutputNote is the command schema's account of what the model receives.

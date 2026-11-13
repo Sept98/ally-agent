@@ -36,36 +36,99 @@ func (s GoalStatus) Valid() bool {
 	}
 }
 
+// GoalStage is a persisted checkpoint; completion requires the recorded Ally-run checks.
+type GoalStage struct {
+	Title               string              `json:"title"`
+	Objective           string              `json:"objective,omitempty"`
+	Status              string              `json:"status"`
+	Evidence            string              `json:"evidence,omitempty"`
+	Attempts            int                 `json:"attempts,omitempty"`
+	FailuresSinceReview int                 `json:"failures_since_review,omitempty"`
+	ReviewRequired      bool                `json:"review_required,omitempty"`
+	Revision            int                 `json:"revision,omitempty"`
+	ReviewHistory       []GoalStageRevision `json:"review_history,omitempty"`
+	Verifications       []GoalVerification  `json:"verifications,omitempty"`
+}
+
+type GoalStageRevision struct {
+	Decision     string    `json:"decision"`
+	OldTitle     string    `json:"old_title"`
+	OldObjective string    `json:"old_objective,omitempty"`
+	NewTitle     string    `json:"new_title,omitempty"`
+	NewObjective string    `json:"new_objective,omitempty"`
+	Rationale    string    `json:"rationale"`
+	At           time.Time `json:"at"`
+}
+
+type GoalDeliverable struct {
+	Path       string    `json:"path"`
+	Size       int64     `json:"size"`
+	SHA256     string    `json:"sha256"`
+	VerifiedAt time.Time `json:"verified_at"`
+}
+
+// GoalVerificationSpec is a bounded command requested for final verification.
+type GoalVerificationSpec struct {
+	Name    string `json:"name"`
+	Command string `json:"command"`
+}
+
+// GoalVerification stores only the result metadata, not command text or output that may contain secrets.
+type GoalVerification struct {
+	Name       string    `json:"name"`
+	ExitCode   int       `json:"exit_code"`
+	Passed     bool      `json:"passed"`
+	VerifiedAt time.Time `json:"verified_at"`
+}
+
 // Goal contains user-authored goal text and lifecycle metadata. Credentials must not be stored here.
 type Goal struct {
-	ID          string         `json:"id"`
-	SessionID   string         `json:"session_id"`
-	Workspace   string         `json:"workspace"`
-	Title       string         `json:"title"`
-	Details     string         `json:"details,omitempty"`
-	Acceptance  []string       `json:"acceptance,omitempty"`
-	Model       *ModelIdentity `json:"model,omitempty"`
-	Progress    string         `json:"progress,omitempty"`
-	Status      GoalStatus     `json:"status"`
-	RunCount    int            `json:"run_count"`
-	MaxRuns     int            `json:"max_runs"`
-	Revision    uint64         `json:"revision"`
-	ActiveRunID string         `json:"active_run_id,omitempty"`
-	StopReason  string         `json:"stop_reason,omitempty"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	ID              string             `json:"id"`
+	SessionID       string             `json:"session_id"`
+	Workspace       string             `json:"workspace"`
+	Title           string             `json:"title"`
+	Details         string             `json:"details,omitempty"`
+	Acceptance      []string           `json:"acceptance,omitempty"`
+	Stages          []GoalStage        `json:"stages,omitempty"`
+	Verifications   []GoalVerification `json:"verifications,omitempty"`
+	Deliverables    []GoalDeliverable  `json:"deliverables,omitempty"`
+	DeliverySummary string             `json:"delivery_summary,omitempty"`
+	Model           *ModelIdentity     `json:"model,omitempty"`
+	Progress        string             `json:"progress,omitempty"`
+	Status          GoalStatus         `json:"status"`
+	RunCount        int                `json:"run_count"`
+	MaxRuns         int                `json:"max_runs"`
+	Revision        uint64             `json:"revision"`
+	ActiveRunID     string             `json:"active_run_id,omitempty"`
+	StopReason      string             `json:"stop_reason,omitempty"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
 const (
-	maxGoalRecords         = 1000
-	maxGoalIDRunes         = 128
-	maxGoalTitleRunes      = 512
-	maxGoalAcceptanceRunes = toolshared.MaxGoalAcceptanceCriterionChars
-	maxGoalDetailsRunes    = 16 * 1024
-	maxGoalProgressRunes   = 4000
-	maxGoalAcceptanceItems = toolshared.MaxGoalAcceptanceCriteria
-	maxGoalRunBudget       = 20
-	maxGoalStoreBytes      = 32 * 1024 * 1024
+	maxGoalRecords                  = 1000
+	maxGoalIDRunes                  = 128
+	maxGoalTitleRunes               = 512
+	maxGoalAcceptanceRunes          = toolshared.MaxGoalAcceptanceCriterionChars
+	maxGoalDetailsRunes             = 16 * 1024
+	maxGoalProgressRunes            = 4000
+	maxGoalAcceptanceItems          = toolshared.MaxGoalAcceptanceCriteria
+	maxGoalStageTitleRunes          = 200
+	maxGoalStageEvidenceRunes       = 2000
+	maxGoalStageItems               = 50
+	maxGoalVerificationItems        = 10
+	maxGoalVerificationNameRunes    = 120
+	maxGoalVerificationCommandRunes = 2000
+	maxGoalStageRevisionHistory     = 20
+	maxGoalDeliverables             = 32
+	maxGoalDeliveryPathRunes        = 4096
+	maxGoalDeliverySummaryRunes     = 4000
+	maxGoalStageAttempts            = 100
+	GoalStageReviewFailureThreshold = 3
+	goalStageReviewFailureThreshold = GoalStageReviewFailureThreshold
+	maxGoalStageVerificationResults = 100
+	maxGoalRunBudget                = 20
+	maxGoalStoreBytes               = 32 * 1024 * 1024
 )
 
 var (
@@ -165,6 +228,69 @@ func validateGoal(g Goal) error {
 			return errors.New("goal acceptance criteria must be non-empty and bounded")
 		}
 	}
+	if len(g.Stages) > maxGoalStageItems {
+		return errors.New("too many goal stages")
+	}
+	activeStages := 0
+	for _, stage := range g.Stages {
+		if strings.TrimSpace(stage.Title) == "" || len([]rune(stage.Title)) > maxGoalStageTitleRunes || len([]rune(stage.Objective)) > maxGoalStageEvidenceRunes || len([]rune(stage.Evidence)) > maxGoalStageEvidenceRunes {
+			return errors.New("goal stage title, objective or evidence is invalid")
+		}
+		if stage.Attempts < 0 || stage.Attempts > maxGoalStageAttempts || stage.FailuresSinceReview < 0 || stage.FailuresSinceReview > goalStageReviewFailureThreshold || stage.Revision < 0 || stage.Revision > maxGoalStageRevisionHistory {
+			return errors.New("goal stage attempt or revision counters are out of range")
+		}
+		if stage.ReviewRequired != (stage.FailuresSinceReview >= goalStageReviewFailureThreshold) {
+			return errors.New("goal stage review flag does not match its failure count")
+		}
+		if len(stage.ReviewHistory) > maxGoalStageRevisionHistory || len(stage.Verifications) > maxGoalStageVerificationResults {
+			return errors.New("goal stage review history or verification results exceed limits")
+		}
+		for _, review := range stage.ReviewHistory {
+			if review.Decision != "revise" && review.Decision != "continue" && review.Decision != "needs_user" || strings.TrimSpace(review.Rationale) == "" || len([]rune(review.Rationale)) > maxGoalStageEvidenceRunes || len([]rune(review.OldTitle)) > maxGoalStageTitleRunes || len([]rune(review.NewTitle)) > maxGoalStageTitleRunes || len([]rune(review.OldObjective)) > maxGoalStageEvidenceRunes || len([]rune(review.NewObjective)) > maxGoalStageEvidenceRunes {
+				return errors.New("goal stage review record is invalid")
+			}
+		}
+		for _, verification := range stage.Verifications {
+			if strings.TrimSpace(verification.Name) == "" || len([]rune(verification.Name)) > maxGoalVerificationNameRunes {
+				return errors.New("goal stage verification result is invalid")
+			}
+		}
+		switch stage.Status {
+		case "pending":
+		case "active":
+			activeStages++
+		case "completed":
+			if strings.TrimSpace(stage.Evidence) == "" {
+				return errors.New("completed goal stages require evidence")
+			}
+		default:
+			return fmt.Errorf("invalid goal stage status %q", stage.Status)
+		}
+	}
+	for i := 1; i < len(g.Stages); i++ {
+		if g.Stages[i].Status != "pending" && g.Stages[i-1].Status != "completed" {
+			return errors.New("goal stages must proceed in order")
+		}
+	}
+	if activeStages > 1 {
+		return errors.New("only one goal stage may be active")
+	}
+	if len(g.Verifications) > maxGoalVerificationItems {
+		return errors.New("too many goal verification results")
+	}
+	for _, verification := range g.Verifications {
+		if strings.TrimSpace(verification.Name) == "" || len([]rune(verification.Name)) > maxGoalVerificationNameRunes {
+			return errors.New("goal verification result name is invalid or too long")
+		}
+	}
+	if len(g.Deliverables) > maxGoalDeliverables || len([]rune(g.DeliverySummary)) > maxGoalDeliverySummaryRunes {
+		return errors.New("goal deliverable list or delivery summary exceeds limits")
+	}
+	for _, deliverable := range g.Deliverables {
+		if strings.TrimSpace(deliverable.Path) == "" || len([]rune(deliverable.Path)) > maxGoalDeliveryPathRunes || deliverable.Size < 0 || len(deliverable.SHA256) != 64 {
+			return errors.New("goal deliverable record is invalid")
+		}
+	}
 	if g.MaxRuns < 1 || g.MaxRuns > maxGoalRunBudget {
 		return errors.New("goal run budget is out of range")
 	}
@@ -179,6 +305,13 @@ func validateGoal(g Goal) error {
 
 func cloneGoal(g Goal) Goal {
 	g.Acceptance = append([]string(nil), g.Acceptance...)
+	g.Stages = append([]GoalStage(nil), g.Stages...)
+	for i := range g.Stages {
+		g.Stages[i].ReviewHistory = append([]GoalStageRevision(nil), g.Stages[i].ReviewHistory...)
+		g.Stages[i].Verifications = append([]GoalVerification(nil), g.Stages[i].Verifications...)
+	}
+	g.Verifications = append([]GoalVerification(nil), g.Verifications...)
+	g.Deliverables = append([]GoalDeliverable(nil), g.Deliverables...)
 	if g.Model != nil {
 		model := *g.Model
 		g.Model = &model
