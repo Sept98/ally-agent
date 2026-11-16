@@ -36,7 +36,7 @@ func TestDisabledBuiltinFollowsInjectedTools(t *testing.T) {
 		{"child", child, false}, {"stateless", context.Background(), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			result := a.executeTool(tc.ctx, cfg, "s", "calculate", []byte(`{"expression":"1+1"}`))
+			result := a.executeTool(tc.ctx, cfg, "s", "calculate", []byte(`{"purpose":"计算表达式","expression":"1+1"}`))
 			if result.OK != tc.allowed {
 				t.Fatalf("allowed=%v result=%+v", tc.allowed, result)
 			}
@@ -52,12 +52,13 @@ func TestDisabledBuiltinFollowsInjectedTools(t *testing.T) {
 // replacing the matched text with nothing. An explicit empty string is still the
 // documented way to delete, and must keep working.
 func TestEditRejectsChangeWithoutNewText(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	original := []byte("alpha\nbeta\n")
 	if err := os.WriteFile(filepath.Join(dir, "sample.txt"), original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	app := NewApp()
+	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: dir}
 	ctx := context.Background()
 	path := filepath.Join(dir, "sample.txt")
@@ -92,7 +93,8 @@ func TestEditRejectsChangeWithoutNewText(t *testing.T) {
 // extras ignored). It used to lose every chip and show the user a raw argument
 // error over a character count the model cannot get right.
 func TestSuggestItemsAreRepairedNotRejected(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: t.TempDir()}
 	ctx := context.Background()
 
@@ -229,7 +231,8 @@ func TestDisplayClippingRunsAfterTypeRepair(t *testing.T) {
 // promises the runtime ignored: a blank snippet rendered an empty card, and an
 // over-long title reached the UI unfiltered.
 func TestRenderHTMLRejectsBlankAndOversizedTitle(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: t.TempDir()}
 	ctx := context.Background()
 
@@ -257,30 +260,6 @@ func TestRenderHTMLRejectsBlankAndOversizedTitle(t *testing.T) {
 	}
 }
 
-// TestSSHClusterAddNamesEveryMissingField: the add branch needs host, username,
-// description and reason for an alias that is not registered yet, while the
-// schema can only require `alias` (the already-registered path ignores the other
-// four). Failing one field per round cost up to four wasted model turns, so the
-// rejection must name them together.
-func TestSSHClusterAddNamesEveryMissingField(t *testing.T) {
-	app := NewApp()
-	_, err := app.executeSSHClusterTool(context.Background(), "s-1", t.TempDir(), SSHClusterRequest{
-		Action: "add",
-		Alias:  "never-registered-node",
-	})
-	if err == nil {
-		t.Fatal("add without host/username/description/reason must fail")
-	}
-	if code := toolErrorCode(err); code != "E_BAD_SSH_CLUSTER" {
-		t.Fatalf("expected E_BAD_SSH_CLUSTER, got %q (%v)", code, err)
-	}
-	for _, field := range []string{"host", "username", "description", "reason"} {
-		if !strings.Contains(err.Error(), field) {
-			t.Fatalf("the rejection must name %s in the same round, got %q", field, err.Error())
-		}
-	}
-}
-
 // TestExecuteToolGatesEveryBuiltinTool is the guard against a schema that only
 // exists in the prompt: each declared tool must run its declaration at the
 // boundary, no matter which handler sits behind it. Undeclared arguments are
@@ -288,13 +267,20 @@ func TestSSHClusterAddNamesEveryMissingField(t *testing.T) {
 // parameter or a warning that names the stray key. A tool that accepted the key
 // without naming it would mean the gate never ran for it.
 func TestExecuteToolGatesEveryBuiltinTool(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: t.TempDir()}
 	for _, tool := range toolshared.Builtins() {
 		if tool.Function == nil {
 			continue
 		}
 		name := tool.Function.Name
+		// 截图工具没有必填参数，缺参时仍会真的抓屏：在 macOS 上这会弹系统
+		// 录屏权限请求并抓到用户屏幕。它的参数门禁由 orch_screenshot_test.go
+		// 覆盖，这里不再跑真实抓屏。
+		if name == "screenshot" {
+			continue
+		}
 		t.Run(name, func(t *testing.T) {
 			res := app.executeTool(context.Background(), cfg, "s-1", name, []byte(`{"allyUnknownArgument":1}`))
 			if res.OK {
@@ -344,25 +330,15 @@ func TestServiceStartRequiresDescription(t *testing.T) {
 	}
 }
 
-// TestServiceTuningStaysInsideTheDeclaredBounds: graceSeconds and tailBytes are
-// the two knobs the runtime always honoured but the schema never declared. They
-// must accept a value in range (reaching the service lookup) and refuse one
-// above the clamp, so the declared maximum is what the model is held to.
 func TestServiceTuningStaysInsideTheDeclaredBounds(t *testing.T) {
 	app := NewApp()
 	cfg := ConfigState{Workspace: t.TempDir()}
 	ctx := context.Background()
 
-	accepted := app.executeTool(ctx, cfg, "s-1", "service", []byte(`{"action":"stop","id":"svc_missing","graceSeconds":10}`))
-	if accepted.ErrorCode == "E_BAD_ARGS" {
-		t.Fatalf("a graceful-stop window inside the bound must reach the service lookup, got %q", accepted.Error)
+	var stop BackgroundProcessRequest
+	if err, warnings := decodeToolArguments("service", []byte(`{"action":"stop","id":"svc_missing","graceSeconds":10}`), &stop); err != nil || len(warnings) == 0 || stop.ID != "svc_missing" {
+		t.Fatalf("obsolete stop field: %+v %v %v", stop, err, warnings)
 	}
-
-	tooLong := app.executeTool(ctx, cfg, "s-1", "service", []byte(`{"action":"stop","id":"svc_missing","graceSeconds":31}`))
-	if tooLong.ErrorCode != "E_BAD_ARGS" || !strings.Contains(tooLong.Error, fmt.Sprintf("%d", toolshared.MaxServiceStopGraceSeconds)) {
-		t.Fatalf("a grace window above the clamp must be refused by name, got ok=%v code=%q err=%q", tooLong.OK, tooLong.ErrorCode, tooLong.Error)
-	}
-
 	acceptedRead := app.executeTool(ctx, cfg, "s-1", "service", []byte(`{"action":"read","id":"svc_missing","tailBytes":16384}`))
 	if acceptedRead.ErrorCode == "E_BAD_ARGS" {
 		t.Fatalf("a larger tail inside the bound must reach the service lookup, got %q", acceptedRead.Error)
@@ -380,7 +356,8 @@ func TestServiceTuningStaysInsideTheDeclaredBounds(t *testing.T) {
 // (todos, and the `next` parameter that the report replaced) are pinned below as
 // gone on purpose, so no compat layer creeps back.
 func TestPlanToolVocabularyPassesTheGate(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: t.TempDir()}
 	ctx := context.Background()
 
@@ -466,5 +443,24 @@ func TestSubagentStepBudgetIsHeldToTheDeclaredMaximum(t *testing.T) {
 		[]byte(`{"task":"noop","role":"tester","maxSteps":1001}`))
 	if res.OK || res.ErrorCode != "E_BAD_ARGS" || !strings.Contains(res.Error, "1000") {
 		t.Fatalf("maxSteps above the declared cap must be refused, got ok=%v code=%q err=%q", res.OK, res.ErrorCode, res.Error)
+	}
+}
+
+func TestRemovedReadAndCommandFieldsFollowUnknownFieldRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, args string
+		request    any
+	}{
+		{"read", `{"files":[{"path":"a.txt"}],"path":"other.txt","paths":["another.txt"]}`, &BatchReadRequest{}},
+		{"remote_read", `{"alias":"dev","files":[{"path":"/srv/a"}],"path":"/srv/b","startLine":1,"endLine":2}`, &RemoteReadFileRequest{}},
+		{"remote_run_command", `{"alias":"dev","command":"pwd","cwd":"/srv"}`, &RemoteRunCommandRequest{}},
+	} {
+		err, warnings := decodeToolArguments(tc.name, []byte(tc.args), tc.request)
+		if err != nil || len(warnings) == 0 {
+			t.Fatalf("%s: err=%v warnings=%v", tc.name, err, warnings)
+		}
+	}
+	if err, _ := decodeToolArguments("read", []byte(`{"path":"a.txt"}`), &BatchReadRequest{}); toolErrorCode(err) != "E_BAD_ARGS" {
+		t.Fatalf("old read form accepted: %v", err)
 	}
 }

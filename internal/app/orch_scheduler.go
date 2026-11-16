@@ -37,9 +37,12 @@ const (
 	defaultScheduledTaskSteps   = scheduler.DefaultSteps
 	maxScheduledTaskSteps       = scheduler.MaxSteps
 	defaultScheduledTaskTimeout = scheduler.DefaultTimeout
-	maxScheduledTasks           = scheduler.MaxTasks
-	scheduledTaskSummaryLimit   = scheduler.SummaryLimit
-	scheduledTaskErrorTextLimit = 8 * 1024
+	// scheduledCommandTimeoutSeconds 是命令工具自身的上限：command 型任务在运行时
+	// 被钳到这个数，所以给模型看的行必须报同一个数，不能报记录里的 3600s。
+	scheduledCommandTimeoutSeconds = 600
+	maxScheduledTasks              = scheduler.MaxTasks
+	scheduledTaskSummaryLimit      = scheduler.SummaryLimit
+	scheduledTaskErrorTextLimit    = 8 * 1024
 )
 
 type ScheduledTaskSchedule struct {
@@ -474,20 +477,19 @@ func (m *scheduledTaskManager) delete(id string) error {
 		m.mu.Unlock()
 		return codedToolError("E_SCHEDULED_TASK_NOT_FOUND", fmt.Errorf("scheduled task not found: %s", id))
 	}
+	delete(m.tasks, id)
+	if err := m.persistLocked(); err != nil {
+		m.tasks[id] = task
+		m.mu.Unlock()
+		return err
+	}
 	m.unregisterLocked(id)
 	if cancel := m.cancels[id]; cancel != nil {
 		cancel()
 		delete(m.cancels, id)
 	}
-	delete(m.tasks, id)
-	err := m.persistLocked()
-	if err == nil {
-		m.queueEventLocked("scheduled:update", map[string]any{"deleted": id})
-	}
+	m.queueEventLocked("scheduled:update", map[string]any{"deleted": id})
 	m.mu.Unlock()
-	if err != nil {
-		return err
-	}
 	m.flushEvents()
 	return nil
 }
@@ -700,7 +702,6 @@ func (m *scheduledTaskManager) run(task ScheduledTask) {
 	// 不会继承它；任务可能在 KB 会话中创建、稍后触发，因此按任务自身的
 	// workspace 重新计算 deny roots（与 runChat 的 withKBDenyRoots 同源），
 	// KB root 的计划任务同样无法写 sources/。
-	ctx = withKBDenyRoots(ctx, kbDenyRootsForConfig(cfg))
 
 	// 命令型任务：复用 command 工具的执行边界（AST 安全检查、工作区 cwd、
 	// 有界输出），不占 LLM 委托槽、不产生任何模型步骤。
@@ -771,8 +772,8 @@ func (m *scheduledTaskManager) run(task ScheduledTask) {
 func (m *scheduledTaskManager) runCommandTask(task ScheduledTask, ctx context.Context, cfg ConfigState) {
 	// command 工具自身的上限是 600s；更长的任务超时只约束外层 ctx。
 	timeout := task.TimeoutSeconds
-	if timeout <= 0 || timeout > 600 {
-		timeout = 600
+	if timeout <= 0 || timeout > scheduledCommandTimeoutSeconds {
+		timeout = scheduledCommandTimeoutSeconds
 	}
 	result, runErr := m.app.runCommandWithConfig(ctx, cfg, CommandRequest{
 		Command: task.Command,

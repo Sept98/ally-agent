@@ -3,6 +3,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -43,9 +44,71 @@ func modelHistoryHash(messages []openai.ChatCompletionMessage) string {
 	return fmt.Sprintf("%x", sha256.Sum256(raw))
 }
 
+// Embed SDK messages in application-owned storage rows so metadata is attached
+// without encoding and decoding the entire history before its final disk write.
+// Only the first row carries metadata; the on-disk format remains unchanged.
+type storedModelHistoryMessage struct {
+	openai.ChatCompletionMessage
+	modelHistoryMetadata
+}
+
+type modelHistoryMetadata struct {
+	ProtectedState []byte                         `json:"ally_model_state_v1,omitempty"`
+	ToolStatuses   map[string]bool                `json:"ally_tool_status_v1,omitempty"`
+	ToolMetadata   map[string]toolHistoryMetadata `json:"ally_tool_metadata_v1,omitempty"`
+	Task           *historyTaskBoundary           `json:"ally_task_v1,omitempty"`
+}
+
+func (m storedModelHistoryMessage) MarshalJSON() ([]byte, error) {
+	// Preserve the SDK's custom message encoding (including multimodal content)
+	// while adding storage-only fields to the first message object.
+	message, err := json.Marshal(m.ChatCompletionMessage)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := json.Marshal(m.modelHistoryMetadata)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(message[:len(message)-1], ','), metadata[1:]...), nil
+}
+
 func (a *App) modelHistoryForStorage(sessionID string, disk, history []openai.ChatCompletionMessage) any {
-	if len(disk) == 0 || a.modelHistoryCodec == nil || a.reasoningStash == nil {
+	if len(disk) == 0 {
 		return disk
+	}
+	task := a.historyTaskFor(sessionID, history)
+	replayOffset := 0
+	if candidate, err := a.projectFastCompactHistory(context.Background(), sessionID, history); err == nil && candidate.messageChange {
+		for _, m := range history[:candidate.cutoff] {
+			if m.Role == openai.ChatMessageRoleAssistant {
+				replayOffset++
+			}
+		}
+		history = candidate.history
+		disk = sanitizeHistoryMessagesForDisk(history)
+		if task != nil {
+			task.Start = candidate.tailStart
+		}
+	}
+	sealed := a.protectedModelHistoryForStorage(sessionID, disk, history, replayOffset)
+	statuses, metadata := a.toolHistoryForStorage(sessionID, history)
+	projected, origins := sanitizeHistoryMessagesWithOrigins(history, historyProfileDisk)
+	task = projectHistoryTask(task, history, projected, origins)
+	if len(sealed) == 0 && len(statuses) == 0 && len(metadata) == 0 && task == nil {
+		return disk
+	}
+	rows := make([]any, len(disk))
+	for i := range disk {
+		rows[i] = &disk[i]
+	}
+	rows[0] = storedModelHistoryMessage{disk[0], modelHistoryMetadata{ProtectedState: sealed, ToolStatuses: statuses, ToolMetadata: metadata, Task: task}}
+	return rows
+}
+
+func (a *App) protectedModelHistoryForStorage(sessionID string, disk, history []openai.ChatCompletionMessage, replayOffset int) []byte {
+	if len(disk) == 0 || a.modelHistoryCodec == nil || a.reasoningStash == nil {
+		return nil
 	}
 	original := history
 	history, origins := sanitizeHistoryMessagesWithOrigins(original, historyProfileProtected)
@@ -68,7 +131,7 @@ func (a *App) modelHistoryForStorage(sessionID string, disk, history []openai.Ch
 		}
 		sourceIndex := origins[i]
 		if responsesMessageKey(0, original[sourceIndex]) == responsesMessageKey(0, m) {
-			valid[responsesMessageKey(sourceOrdinals[sourceIndex], original[sourceIndex])] = responsesMessageKey(ordinal, m)
+			valid[responsesMessageKey(sourceOrdinals[sourceIndex]+replayOffset, original[sourceIndex])] = responsesMessageKey(ordinal, m)
 		}
 		ordinal++
 	}
@@ -95,44 +158,38 @@ func (a *App) modelHistoryForStorage(sessionID string, disk, history []openai.Ch
 	// the same bounded, protected payload; never introduce a plaintext fallback.
 	fastCompacted := false
 	for _, m := range history {
-		if strings.HasPrefix(m.Content, fastCompactToolMarker) || strings.HasPrefix(m.Content, fastCompactAssistantMarker) || strings.Contains(m.Content, fastCompactReasoningMarker) {
+		if isFastCompactHistory(m) || strings.HasPrefix(m.Content, fastCompactToolMarker) || strings.HasPrefix(m.Content, fastCompactAssistantMarker) || strings.Contains(m.Content, fastCompactReasoningMarker) {
 			fastCompacted = true
 			break
 		}
 	}
 	if len(scopes) == 0 && !fastCompacted {
-		return disk
+		return nil
 	}
 	state := protectedModelState{Version: 1, Session: sessionID, DiskHash: modelHistoryHash(disk), History: history, Responses: scopes}
 	raw, err := json.Marshal(state)
 	if err != nil {
 		log.Print("model replay persistence unavailable: state serialization failed")
-		return disk
+		return nil
 	}
 	if len(raw) > maxProtectedModelStateBytes {
 		log.Printf("model replay persistence unavailable: state exceeds size limit (%d > %d bytes)", len(raw), maxProtectedModelStateBytes)
-		return disk
+		return nil
 	}
 	a.modelHistoryCodec.mu.Lock()
 	sealed, err := a.modelHistoryCodec.protector.Seal(raw)
 	a.modelHistoryCodec.mu.Unlock()
 	if err != nil {
 		log.Print("model replay persistence unavailable: secure storage failed")
-		return disk
+		return nil
 	}
-	raw, _ = json.Marshal(disk)
-	var rows []map[string]json.RawMessage
-	if json.Unmarshal(raw, &rows) != nil {
-		return disk
-	}
-	rows[0][protectedModelStateField], _ = json.Marshal(sealed)
-	return rows
+	return sealed
 }
 
 // Decrypt before taking App.mu; publishing the returned closure only after the
 // session load ticket/revision check prevents a cancelled load from restoring
 // stale replay state into a released or rewound session.
-func (a *App) modelHistoryFromStorage(sessionID string, raw []byte, disk []openai.ChatCompletionMessage) ([]openai.ChatCompletionMessage, func()) {
+func (a *App) modelHistoryPayloadFromStorage(sessionID string, raw []byte, disk []openai.ChatCompletionMessage) ([]openai.ChatCompletionMessage, func()) {
 	if a.modelHistoryCodec == nil || a.reasoningStash == nil || !bytes.Contains(raw, []byte(`"`+protectedModelStateField+`"`)) {
 		return disk, nil
 	}
@@ -154,8 +211,10 @@ func (a *App) modelHistoryFromStorage(sessionID string, raw []byte, disk []opena
 	if json.Unmarshal(plain, &state) != nil || state.Version != 1 || state.Session != sessionID || state.DiskHash != modelHistoryHash(disk) {
 		return disk, nil
 	}
-	history := sanitizeHistoryMessages(state.History)
-	// The protected full model history must be the very history represented by
+	// Apply the current persistence policy to older protected snapshots too,
+	// so their raw observations cannot be resurrected into a restarted session.
+	history := sanitizeHistoryMessagesFor(state.History, historyProfileProtected)
+	// The protected model history must be the very history represented by
 	// this disk profile; no restored payload can substitute another session.
 	if modelHistoryHash(sanitizeHistoryMessagesForDisk(history)) != state.DiskHash {
 		return disk, nil

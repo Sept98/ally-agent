@@ -214,10 +214,7 @@ func TestLegacyTopLevelModelFieldsMigrateToIdentity(t *testing.T) {
 		t.Fatalf("derived model fields must not stay on the loaded config, got model=%q baseUrl=%q keys=%v", app.config.Model, app.config.BaseURL, app.config.APIKeys)
 	}
 
-	// 未初始化前先落一次盘：新形状必须只留 models[] + lastUsedModel。
-	if err := app.saveConfig(app.config); err != nil {
-		t.Fatal(err)
-	}
+	// Loading must migrate on disk without requiring a later settings save.
 	rewritten, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -400,6 +397,7 @@ func TestGitHubTokenSurvivesReloadAndMerge(t *testing.T) {
 // 两个写入方（局部保存的 saveConfig 与整份保存的 SaveConfig）共用 convergeLastUsedModel，
 // 只在一边清理就等于没清理。
 func TestSaveConfigConvergesDanglingLastUsedModel(t *testing.T) {
+	t.Parallel()
 	cases := map[string][]ModelConfig{
 		// 删掉那条模型
 		"deleted": {{ProviderName: "Relay", Model: "other"}},
@@ -408,7 +406,7 @@ func TestSaveConfigConvergesDanglingLastUsedModel(t *testing.T) {
 	}
 	for name, remaining := range cases {
 		t.Run(name, func(t *testing.T) {
-			app := NewApp()
+			app := newIsolatedTestApp(t)
 			app.initialized = true
 			path := filepath.Join(t.TempDir(), "config.json")
 			app.configPath = path
@@ -444,5 +442,44 @@ func TestSaveConfigConvergesDanglingLastUsedModel(t *testing.T) {
 				t.Fatalf("a dangling identity must not expand anything, got %q", cfg.Model)
 			}
 		})
+	}
+}
+
+func TestOldTokenParamsConvertAtFileBoundaries(t *testing.T) {
+	for _, tc := range []struct{ old, want string }{
+		{"completion", "max_completion_tokens"}, {"max-completion-token", "max_completion_tokens"},
+		{"tokens", "max_tokens"}, {"legacy", "max_tokens"},
+		{"max_tokens", "max_tokens"}, {"max_completion_tokens", "max_completion_tokens"}, {"auto", "auto"},
+	} {
+		imported := NormalizeImportedModel(ModelConfig{TokenParam: tc.old, MaxTokens: 1234})
+		if imported.TokenParam != tc.want || imported.MaxTokens != 1234 {
+			t.Fatalf("import %q: %+v", tc.old, imported)
+		}
+	}
+	if normalizeTokenParam("completion") != tokenParamAuto || normalizeTokenParam("legacy") != tokenParamAuto {
+		t.Fatal("runtime still interprets retired token aliases")
+	}
+	a := newIsolatedTestApp(t)
+	configPath := filepath.Join(a.AppDataDir(), "config.json")
+	if err := os.MkdirAll(a.AppDataDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	original := ConfigState{Models: []ModelConfig{{ProviderName: "custom", Model: "sample", TokenParam: "legacy", MaxTokens: 1234}}}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureInitialized(); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := readConfigFile(configPath)
+	if err != nil || len(saved.Models) != 1 || saved.Models[0].TokenParam != "max_tokens" || saved.Models[0].MaxTokens != 1234 {
+		t.Fatalf("canonical token param not persisted: %+v %v", saved.Models, err)
+	}
+	if original.Models[0].TokenParam != "legacy" {
+		t.Fatal("load mutated caller config")
 	}
 }

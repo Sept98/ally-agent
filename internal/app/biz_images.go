@@ -2,7 +2,6 @@
 package app
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -10,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,11 +21,12 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-const generatedImageHistoryMarker = "Generated image: "
+const generatedImageHistoryMarker = "// image | ref="
 
 var imageRefPattern = regexp.MustCompile(`^[a-f0-9]{64}/[a-f0-9]{32}$`)
 
 func isGeneratedImageHistory(content string) bool {
+	content = normalizeGeneratedImageHistory(content)
 	if len(content) > 2048 || !strings.HasPrefix(content, generatedImageHistoryMarker+"image:") {
 		return false
 	}
@@ -130,69 +129,35 @@ func (a *App) readGeneratedImage(ref string) ([]byte, GeneratedImage, error) {
 		return nil, meta, errors.New("invalid stored image MIME type")
 	}
 	path := filepath.FromSlash(key)
+	legacy := false
 	f, err := root.Open(path + ext)
 	if errors.Is(err, os.ErrNotExist) {
 		f, err = root.Open(path + ".img")
+		legacy = err == nil
 		if errors.Is(err, os.ErrNotExist) {
-			// Startup migration may have renamed it between the two opens.
+			// Another reader may have migrated it between the two opens.
 			f, err = root.Open(path + ext)
 		}
 	}
 	if err != nil {
 		return nil, meta, err
 	}
-	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, imagegen.MaxImageBytes+1))
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
 	if err == nil {
 		_, _, _, err = imagegen.Inspect(data)
 	}
+	// The current filename is the migration marker. Convert only originals
+	// actually opened; never overwrite another file or scan the entire library.
+	if err == nil && legacy {
+		if linkErr := root.Link(path+".img", path+ext); linkErr == nil {
+			_ = root.Remove(path + ".img")
+		}
+	}
 	return data, meta, err
-}
-
-// Migrate outside the startup critical path. Link-before-unlink never replaces
-// an existing original; interruption leaves at least one complete copy. Older
-// or read-only libraries remain readable through readGeneratedImage's fallback.
-func (a *App) migrateLegacyImageFiles(ctx context.Context) error {
-	root, err := os.OpenRoot(a.imagesDir())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	return fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if walkErr != nil {
-			return walkErr
-		}
-		key := strings.TrimSuffix(path, ".img")
-		if !entry.Type().IsRegular() || key == path || !imageRefPattern.MatchString(key) {
-			return nil
-		}
-		data, meta, err := a.readGeneratedImage("image:" + key)
-		if err != nil {
-			return nil // Leave incomplete or invalid legacy records untouched.
-		}
-		mime, _, _, err := imagegen.Inspect(data)
-		if err != nil || mime != meta.Mime {
-			return nil
-		}
-		source := filepath.FromSlash(path)
-		target := filepath.FromSlash(key) + generatedImageExtension(mime)
-		if err := root.Link(source, target); err != nil {
-			if !errors.Is(err, os.ErrExist) {
-				a.logAppError("image filename migration failed", "ref", "image:"+key, "error", err.Error())
-			}
-			return nil
-		}
-		if err := root.Remove(source); err != nil {
-			a.logAppError("legacy image filename cleanup failed", "ref", "image:"+key, "error", err.Error())
-		}
-		return nil
-	})
 }
 
 func (a *App) latestGeneratedImage(sessionID string) (string, error) {
@@ -372,7 +337,7 @@ func (a *App) restoreGeneratedImageAttachments(snapshot *SessionSnapshot, histor
 		if message.Role != openai.ChatMessageRoleTool || !isGeneratedImageHistory(message.Content) {
 			continue
 		}
-		ref := strings.Fields(strings.TrimPrefix(message.Content, generatedImageHistoryMarker))[0]
+		ref := strings.Fields(strings.TrimPrefix(normalizeGeneratedImageHistory(message.Content), generatedImageHistoryMarker))[0]
 		owner := owners[ref]
 		card := cards[message.ToolCallID]
 		if owner.message != nil && owner.message["role"] == "tool_call" {
@@ -417,4 +382,11 @@ func (a *App) restoreGeneratedImageAttachments(snapshot *SessionSnapshot, histor
 		card["attachments"] = append(attachments, attachment)
 		owners[ref] = imageOwner{card, attachment}
 	}
+}
+
+func normalizeGeneratedImageHistory(content string) string {
+	if strings.HasPrefix(content, "Generated image: ") {
+		return generatedImageHistoryMarker + strings.TrimPrefix(content, "Generated image: ")
+	}
+	return content
 }

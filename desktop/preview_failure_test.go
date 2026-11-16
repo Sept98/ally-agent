@@ -61,6 +61,58 @@ func pumpPreview(t *testing.T, queue chan func(), done func() bool) {
 	}
 }
 
+func TestImageReplacementDropsLateResultsWithoutNavigation(t *testing.T) {
+	type evaluation struct {
+		ctx   context.Context
+		reply chan error
+	}
+	calls := make(chan evaluation, 2)
+	b := &fakePreviewBrowser{eval: func(ctx context.Context, _ string) (any, error) {
+		call := evaluation{ctx: ctx, reply: make(chan error, 1)}
+		calls <- call
+		return true, <-call.reply
+	}}
+	p, queue := queuedPreview(t, b)
+	p.state.ready, p.imageDocument = true, true
+	nextCall := func() evaluation {
+		select {
+		case call := <-calls:
+			return call
+		case <-time.After(time.Second):
+			t.Fatal("image replacement did not reach the browser")
+			return evaluation{}
+		}
+	}
+	p.replaceImage(workspaceMediaOptions{Source: "first.png", Token: "first"})
+	first := nextCall()
+	p.replaceImage(workspaceMediaOptions{Source: "second.png", Token: "second"})
+	second := nextCall()
+	if first.ctx.Err() == nil {
+		t.Fatal("previous image evaluation was not canceled")
+	}
+	first.reply <- errors.New("late decode failure")
+	second.reply <- nil
+	pumpPreview(t, queue, func() bool { return p.probeCancel == nil })
+	if p.state.err != nil || !p.state.ready || !p.imageDocument || b.url != "" || b.destroys != 0 {
+		t.Fatal("replacement navigated, cleared the frame or accepted a stale failure")
+	}
+}
+
+func TestImageReplacementReportsDecodeFailure(t *testing.T) {
+	b := &fakePreviewBrowser{eval: func(context.Context, string) (any, error) {
+		return nil, errors.New("invalid image")
+	}}
+	p, queue := queuedPreview(t, b)
+	p.state.ready, p.imageDocument = true, true
+	p.replaceImage(workspaceMediaOptions{Source: "corrupt.png", Token: "corrupt"})
+	called := 0
+	p.onFailure = func(error) { called++ }
+	pumpPreview(t, queue, func() bool { return p.state.err != nil })
+	if called != 1 || p.state.ready || p.imageDocument || b.destroys != 0 || b.url != "about:blank" {
+		t.Fatal("decode failure did not retire the failed content and report its error")
+	}
+}
+
 func TestPreviewFailureStopsContentAndRetainsHealthySlot(t *testing.T) {
 	b := &fakePreviewBrowser{}
 	p, queue := queuedPreview(t, b)
@@ -178,44 +230,26 @@ func TestPreviewResetCancelsProbeAndDestroyIsIdempotent(t *testing.T) {
 
 func TestWorkspacePreviewFailurePublishesOnlyToCurrentFile(t *testing.T) {
 	root := t.TempDir()
-	file := &workspaceFile{Path: "one.mp4"}
+	file := &workspaceFile{Path: "one.mp3"}
 	b := &fakePreviewBrowser{}
 	p, _ := queuedPreview(t, b)
 	a := &desktop{tabs: []*conversation{{Workspace: root}}, workspaceFiles: map[string]*workspaceFile{workspaceKey(root): file}}
 	key := a.workspaceFilePreviewKey(file)
-	a.workspacePreview.mounted = &mountedWorkspacePreview{key: key, surface: p}
+	a.workspacePreview.mounted = map[string]*mountedWorkspacePreview{workspaceKey(root): {key: key, surface: p}}
 	a.watchWorkspacePreviewFailure(p, file, key)
 	old := p.onFailure
-	a.media.playing, a.media.autoplay = true, true
+	media := a.workspaceMedia()
+	media.playing, media.autoplay = true, true
 	p.failContent(p.state.generation, errors.New("renderer failed"), true)
-	if file.PreviewError == "" || a.media.playing || a.media.autoplay {
+	if file.PreviewError == "" || media.playing || media.autoplay {
 		t.Fatal("file failure remained blank/playing")
 	}
-	replacement := &workspaceFile{Path: "two.mp4"}
+	replacement := &workspaceFile{Path: "two.mp3"}
 	a.workspaceFiles[workspaceKey(root)] = replacement
 	file.PreviewError = ""
 	old(errors.New("late failure"))
 	if replacement.PreviewError != "" || file.PreviewError != "" {
 		t.Fatal("retired file callback modified current state")
-	}
-}
-
-func TestMemoryTidyRetiredCallbackKeepsReplacementTimer(t *testing.T) {
-	a := &desktop{memoryTidyGeneration: 1, memoryTidyTimer: time.NewTimer(time.Hour)}
-	old := a.memoryTidyGeneration
-	a.cancelMemoryTidy()
-	a.memoryTidyGeneration++
-	replacement := time.NewTimer(time.Hour)
-	defer replacement.Stop()
-	a.memoryTidyTimer = replacement
-	a.runMemoryTidy(old)
-	if a.memoryTidyTimer != replacement {
-		t.Fatal("stale tidy removed new timer")
-	}
-	a.cancelMemoryTidy()
-	a.runMemoryTidy(old)
-	if a.memoryTidyTimer != nil {
-		t.Fatal("canceled callback resurrected a timer")
 	}
 }
 

@@ -4,7 +4,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"ally-dev/internal/tools/read"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -158,7 +156,7 @@ func TestTinyReadReceiptSavesContext(t *testing.T) {
 	}
 	cache := newSessionReadCache()
 	req := BatchReadRequest{Files: []BatchReadFileRequest{{Path: "tiny.txt"}}}
-	first, err := cache.read(a, a.config, req)
+	_, err := cache.read(a, a.config, req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,8 +164,8 @@ func TestTinyReadReceiptSavesContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !second.Files[0].Reused || len(renderReadResultForModel(*second)) >= len(renderReadResultForModel(*first)) {
-		t.Fatal("deduplication grew the model payload")
+	if !second.Files[0].Reused || second.Files[0].Content != "" || second.Files[0].StartLine != 1 || second.Files[0].EndLine != 1 {
+		t.Fatalf("reused result must retain its range without repeating content: %+v", second.Files[0])
 	}
 }
 
@@ -205,7 +203,7 @@ func TestLargeLogTailLocalAndRemoteShareReadOnlyContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script, err := buildRemoteScript(map[string]any{"op": "read", "workspaceRoot": a.config.Workspace, "path": "big.log", "maxBytes": maxReadFileBytes, "tailLines": 10})
+	script, err := buildRemoteScript(map[string]any{"op": "read", "path": remoteFixturePath(a.config.Workspace, "big.log"), "maxBytes": maxReadFileBytes, "tailLines": 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,8 +235,9 @@ func TestMissingReadBlocksDependentStageAndCancellationIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if toolStageSucceeded(toolResult{OK: true, Data: r}) || !strings.Contains(renderReadResultForModel(*r), "E_PATH_NOT_FOUND") {
-		t.Fatal("missing input reported successful")
+	rendered := renderReadResultForModel(*r)
+	if toolStageSucceeded(toolResult{OK: true, Data: r}) || !strings.Contains(rendered, "E_PATH_NOT_FOUND") || !strings.Contains(rendered, "list_files") {
+		t.Fatalf("missing input lost its next step: %q", rendered)
 	}
 	for i := 0; i < cap(a.fileReadSlots); i++ {
 		a.fileReadSlots <- struct{}{}
@@ -273,46 +272,6 @@ func TestCommandLogFailureKeepsTailAndReportsPartial(t *testing.T) {
 	}
 }
 
-func TestRemoteWriteChecksRawSnapshotBeforeCommit(t *testing.T) {
-	t.Parallel()
-	a := newIsolatedToolTestApp(t)
-	py := pickRemoteHelperPython(t)
-	p := filepath.Join(a.config.Workspace, "sample.txt")
-	before := []byte{0xff, 0xfe, 'a', 0, '\r', 0, '\n', 0}
-	after, err := read.EncodeLike(before, "b\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, changed := range []bool{true, false} {
-		current := before
-		if changed {
-			current = []byte("external edit\n")
-		}
-		if err := os.WriteFile(p, current, 0600); err != nil {
-			t.Fatal(err)
-		}
-		script, err := buildRemoteScript(map[string]any{"op": "write", "workspaceRoot": a.config.Workspace, "path": "sample.txt", "overwrite": true, "expectedSHA256": read.HashBytes(before), "dataBase64": base64.StdEncoding.EncodeToString(after)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp, err := runRemoteHelperScript(t, py, script)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := os.ReadFile(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if changed {
-			if resp.OK || toolErrorCode(remoteHelperError(resp)) != "E_VERSION_MISMATCH" || !bytes.Equal(got, current) {
-				t.Fatalf("remote overwrote concurrent edit: %#v %x", resp, got)
-			}
-		} else if !resp.OK || !bytes.Equal(got, after) {
-			t.Fatalf("remote UTF16 commit: %#v %x", resp, got)
-		}
-	}
-}
-
 func TestRemoteReadRejectsNonAdvancingBatch(t *testing.T) {
 	t.Parallel()
 	a := newIsolatedToolTestApp(t)
@@ -321,7 +280,7 @@ func TestRemoteReadRejectsNonAdvancingBatch(t *testing.T) {
 		attempts++
 		return nil, paths, nil
 	}
-	r, err := a.remoteReadFile(context.Background(), RemoteReadFileRequest{Target: "example.invalid:/srv/app", Files: []BatchReadFileRequest{{Path: "a.txt"}, {Path: "b.txt"}}})
+	r, err := a.remoteReadFile(context.Background(), RemoteReadFileRequest{Alias: "example.invalid", Files: []BatchReadFileRequest{{Path: "/srv/app/a.txt"}, {Path: "/srv/app/b.txt"}}})
 	if err != nil || attempts != 1 || len(r.Files) != 2 {
 		t.Fatalf("non-advancing batch retried: calls=%d result=%#v err=%v", attempts, r, err)
 	}
@@ -340,7 +299,7 @@ func TestRemoteCommandSavesRecoverableLog(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		command = "echo BEGIN & (for /L %i in (1,1,1400) do @echo " + strings.Repeat("x", 100) + ") & echo FINAL_ERROR"
 	}
-	script, err := buildRemoteScript(map[string]any{"op": "run", "workspaceRoot": a.config.Workspace, "command": command, "maxOutput": maxToolOutput, "timeoutSeconds": 10, "modelOutputBytes": maxModelToolOutput})
+	script, err := buildRemoteScript(map[string]any{"op": "run", "command": command, "maxOutput": maxToolOutput, "timeoutSeconds": 10, "modelOutputBytes": maxModelToolOutput, "cwd": a.config.Workspace})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +314,7 @@ func TestRemoteCommandSavesRecoverableLog(t *testing.T) {
 	if r.ExitCode != 0 || r.OutputFilePath == "" || r.OutputFileIncomplete {
 		t.Fatalf("no usable full log: %#v", r)
 	}
-	log, err := os.ReadFile(filepath.Join(a.config.Workspace, filepath.FromSlash(r.OutputFilePath)))
+	log, err := os.ReadFile(filepath.FromSlash(r.OutputFilePath))
 	if err != nil {
 		t.Fatal(err)
 	}

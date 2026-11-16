@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,7 +64,7 @@ func normalizeSSHGroup(group string) string {
 }
 
 // normalizeSSHAuthType keeps the credential interpretation tied to the node's
-// declared mode. Legacy nodes without authType infer it from their credentials.
+// declared mode. Legacy inference is confined to configuration loading.
 func normalizeSSHAuthType(node SSHServerNode) string {
 	switch strings.ToLower(strings.TrimSpace(node.AuthType)) {
 	case sshAuthTypeAgent:
@@ -73,14 +74,21 @@ func normalizeSSHAuthType(node SSHServerNode) string {
 	case sshAuthTypePassword:
 		return sshAuthTypePassword
 	default:
-		if strings.TrimSpace(node.KeyPath) != "" {
-			return sshAuthTypeKey
-		}
-		if node.Password != "" {
-			return sshAuthTypePassword
-		}
 		return sshAuthTypeAgent
 	}
+}
+
+// NormalizeSSHImportNode migrates credential mode at the import/load boundary.
+func NormalizeSSHImportNode(node SSHServerNode) SSHServerNode {
+	if strings.TrimSpace(node.AuthType) == "" {
+		node.AuthType = sshAuthTypeAgent
+		if node.KeyPath != "" {
+			node.AuthType = sshAuthTypeKey
+		} else if node.Password != "" {
+			node.AuthType = sshAuthTypePassword
+		}
+	}
+	return normalizeSSHServerNode(node)
 }
 
 // normalizeSSHServerNode makes stored secrets match the declared auth mode.
@@ -222,7 +230,11 @@ func (a *App) loadSSHClusters() error {
 	}
 	migrated := store.Version < 2
 	for _, s := range store.Servers {
-		s = normalizeSSHServerNode(s)
+		original := s
+		s = NormalizeSSHImportNode(s)
+		if original.AuthType != s.AuthType || original.Password != s.Password || original.KeyPath != s.KeyPath {
+			migrated = true
+		}
 		alias := strings.ToLower(strings.TrimSpace(s.Alias))
 		if alias == "" {
 			continue
@@ -411,16 +423,6 @@ func (a *App) sshServerByAliasLocked(alias string) (SSHServerNode, bool) {
 	return SSHServerNode{}, false
 }
 
-// UI calls use IDs. Accept aliases for older callers and model tools, but
-// canonicalize them at the boundary; never store aliases as grants again.
-func (a *App) sshServerByRefLocked(ref string) (SSHServerNode, bool) {
-	ref = strings.TrimSpace(ref)
-	if node, ok := a.sshClusters[ref]; ok {
-		return node, true
-	}
-	return a.sshServerByAliasLocked(ref)
-}
-
 // SaveSSHServer creates or updates a server node in the cluster.
 func (a *App) SaveSSHServer(node SSHServerNode) error {
 	return a.saveSSHServer(node, "")
@@ -440,37 +442,64 @@ func (a *App) SaveSSHServerForWorkspace(node SSHServerNode, workspace string) er
 	return a.saveSSHServer(node, normWS)
 }
 
-func (a *App) saveSSHServer(node SSHServerNode, authorizeWorkspace string) error {
+var errSSHServerChanged = errors.New("SSH server changed; reload the server list and retry")
+
+// An explicit nil snapshot
+// expects a create; a nonnil snapshot expects exactly that stored node.
+func (a *App) saveSSHServer(node SSHServerNode, authorizeWorkspace string, expected ...*SSHServerNode) error {
+	_, err := a.saveSSHServerSnapshot(node, authorizeWorkspace, expected...)
+	return err
+}
+
+// saveSSHServerSnapshot returns the committed value captured by storage, even
+// if another caller changes or deletes the node before this function returns.
+func (a *App) saveSSHServerSnapshot(node SSHServerNode, authorizeWorkspace string, expected ...*SSHServerNode) (SSHServerNode, error) {
 	alias := strings.ToLower(strings.TrimSpace(node.Alias))
 	if alias == "" {
-		return errors.New("server alias is required")
+		return SSHServerNode{}, errors.New("server alias is required")
 	}
 	if strings.TrimSpace(node.Host) == "" {
-		return errors.New("server host is required")
+		return SSHServerNode{}, errors.New("server host is required")
 	}
 	if strings.TrimSpace(node.Username) == "" {
-		return errors.New("server username is required")
+		return SSHServerNode{}, errors.New("server username is required")
 	}
 	if strings.TrimSpace(node.Description) == "" {
-		return errors.New("server description is required")
+		return SSHServerNode{}, errors.New("server description is required")
 	}
 	node.Description = strings.TrimSpace(node.Description)
 	node.Alias = strings.TrimSpace(node.Alias)
+	mode := strings.ToLower(strings.TrimSpace(node.AuthType))
+	switch mode {
+	case sshAuthTypeAgent, sshAuthTypeKey, sshAuthTypePassword:
+	case "":
+		if node.Password != "" || node.KeyPath != "" {
+			return SSHServerNode{}, errors.New("authType is required when credentials are supplied")
+		}
+	default:
+		return SSHServerNode{}, errors.New("authType must be agent, key, or password")
+	}
 	node = normalizeSSHServerNode(node)
 	if node.Port <= 0 {
 		node.Port = 22
 	}
-	if err := a.storeSSHServerLocked(alias, node, authorizeWorkspace); err != nil {
-		return err
+	saved, err := a.storeSSHServerSnapshotLocked(alias, node, authorizeWorkspace, expected...)
+	if err != nil {
+		return SSHServerNode{}, err
 	}
 	a.emitSSHClustersChanged()
-	return nil
+	return saved, nil
 }
 
 // storeSSHServerLocked 落盘一份节点和可选的工作区授权，并失效被它改掉的凭据槽位。
 // authorizeWorkspace 非空时只允许创建新别名，避免审批期间的并发新增被模型 upsert 覆盖。
 // 调用方不得持有锁。
-func (a *App) storeSSHServerLocked(alias string, node SSHServerNode, authorizeWorkspace string) error {
+func (a *App) storeSSHServerLocked(alias string, node SSHServerNode, authorizeWorkspace string, expected ...*SSHServerNode) error {
+	_, err := a.storeSSHServerSnapshotLocked(alias, node, authorizeWorkspace, expected...)
+	return err
+}
+
+func (a *App) storeSSHServerSnapshotLocked(alias string, node SSHServerNode, authorizeWorkspace string, expected ...*SSHServerNode) (SSHServerNode, error) {
 	a.sshClustersMu.Lock()
 	defer a.sshClustersMu.Unlock()
 	if a.sshClusters == nil {
@@ -479,18 +508,32 @@ func (a *App) storeSSHServerLocked(alias string, node SSHServerNode, authorizeWo
 	node.ID = strings.TrimSpace(node.ID)
 	previous, updating := a.sshClusters[node.ID]
 	if node.ID != "" && !updating {
-		return errors.New("server no longer exists; reload the server list")
+		if len(expected) > 0 {
+			return SSHServerNode{}, errSSHServerChanged
+		}
+		return SSHServerNode{}, errors.New("server no longer exists; reload the server list")
 	}
 	if sameAlias, exists := a.sshServerByAliasLocked(alias); exists {
 		if authorizeWorkspace != "" {
-			return fmt.Errorf("server alias %q is already in use; reload the server list", node.Alias)
+			return SSHServerNode{}, fmt.Errorf("server alias %q is already in use; reload the server list", node.Alias)
 		}
 		if node.ID != "" && node.ID != sameAlias.ID {
-			return fmt.Errorf("server alias %q is already in use", node.Alias)
+			return SSHServerNode{}, fmt.Errorf("server alias %q is already in use", node.Alias)
 		}
-		// Legacy callers and imports upsert by alias without changing identity.
-		previous, updating = sameAlias, true
-		node.ID = sameAlias.ID
+		if node.ID == "" {
+			if len(expected) > 0 {
+				return SSHServerNode{}, errSSHServerChanged
+			}
+			return SSHServerNode{}, fmt.Errorf("server alias %q is already in use; update by ID", node.Alias)
+		}
+
+	}
+	if len(expected) > 0 {
+		snapshot := expected[0]
+		if (snapshot == nil && updating) ||
+			(snapshot != nil && (!updating || !reflect.DeepEqual(previous, *snapshot))) {
+			return SSHServerNode{}, errSSHServerChanged
+		}
 	}
 	if node.ID == "" {
 		for {
@@ -555,14 +598,14 @@ func (a *App) storeSSHServerLocked(alias string, node SSHServerNode, authorizeWo
 			}
 			a.sshWorkspaceAllowedMu.Unlock()
 		}
-		return err
+		return SSHServerNode{}, err
 	}
 	// Invalidate both endpoints, including when the nickname was changed.
 	if updating {
 		a.sshCredentials.purgeHost(nodeSSHHost(previous))
 	}
 	a.sshCredentials.purgeHost(nodeSSHHost(node))
-	return nil
+	return node, nil
 }
 
 // emitSSHClustersChanged 通知 UI 集群清单/工作区授权变了（模型也能改这份清单），
@@ -572,7 +615,7 @@ func (a *App) emitSSHClustersChanged() {
 	a.emit("ssh:clusters-changed", map[string]any{})
 }
 
-// DeleteSSHServer removes a server node by ID (legacy aliases also accepted).
+// DeleteSSHServer removes a server node by stable ID.
 func (a *App) DeleteSSHServer(ref string) error {
 	if err := a.deleteSSHServerLocked(ref); err != nil {
 		return err
@@ -585,7 +628,7 @@ func (a *App) DeleteSSHServer(ref string) error {
 func (a *App) deleteSSHServerLocked(ref string) error {
 	a.sshClustersMu.Lock()
 	defer a.sshClustersMu.Unlock()
-	previous, ok := a.sshServerByRefLocked(ref)
+	previous, ok := a.sshClusters[strings.TrimSpace(ref)]
 	if !ok {
 		return nil
 	}
@@ -628,7 +671,7 @@ func (a *App) deleteSSHServerLocked(ref string) error {
 	return nil
 }
 
-// AuthorizeServerForWorkspace grants access by ID (legacy aliases accepted).
+// AuthorizeServerForWorkspace grants access by stable ID.
 func (a *App) AuthorizeServerForWorkspace(workspace, alias string) error {
 	normWS := normalizeWorkspaceKey(workspace)
 	alias = strings.TrimSpace(alias)
@@ -649,7 +692,7 @@ func (a *App) AuthorizeServerForWorkspace(workspace, alias string) error {
 func (a *App) authorizeServerForWorkspaceLocked(normWS, alias string) error {
 	a.sshClustersMu.Lock()
 	defer a.sshClustersMu.Unlock()
-	node, exists := a.sshServerByRefLocked(alias)
+	node, exists := a.sshClusters[strings.TrimSpace(alias)]
 	if !exists {
 		return errors.New("server no longer exists; reload the server list")
 	}
@@ -694,7 +737,7 @@ func (a *App) authorizeServerForWorkspaceLocked(normWS, alias string) error {
 }
 
 // SetWorkspaceAllowedServers replaces a workspace's grants with canonical IDs.
-// Legacy aliases are accepted and resolved once at this boundary.
+// Unknown IDs are rejected before any grant is changed.
 func (a *App) SetWorkspaceAllowedServers(workspace string, aliases []string) error {
 	normWS := normalizeWorkspaceKey(workspace)
 	if normWS == "" {
@@ -714,10 +757,13 @@ func (a *App) setWorkspaceAllowedServersLocked(normWS string, aliases []string) 
 
 	m := make(map[string]bool, len(aliases))
 	for _, ref := range aliases {
-		if node, exists := a.sshServerByRefLocked(ref); exists {
-			m[node.ID] = true
+		node, exists := a.sshClusters[strings.TrimSpace(ref)]
+		if !exists {
+			return fmt.Errorf("unknown SSH server ID %q", ref)
 		}
+		m[node.ID] = true
 	}
+
 	a.sshWorkspaceAllowedMu.Lock()
 	if a.sshWorkspaceAllowed == nil {
 		a.sshWorkspaceAllowed = make(map[string]map[string]bool)
@@ -765,13 +811,13 @@ func (a *App) GetWorkspaceAllowedServers(workspace string) []string {
 	return res
 }
 
-// IsServerAuthorizedForWorkspace checks a node's ID (legacy aliases accepted).
+// IsServerAuthorizedForWorkspace checks a stable node ID.
 func (a *App) IsServerAuthorizedForWorkspace(workspace, alias string) bool {
 	normWS := normalizeWorkspaceKey(workspace)
 	alias = strings.TrimSpace(alias)
 	a.sshClustersMu.RLock()
 	defer a.sshClustersMu.RUnlock()
-	node, exists := a.sshServerByRefLocked(alias)
+	node, exists := a.sshClusters[strings.TrimSpace(alias)]
 	if !exists {
 		return false
 	}
@@ -794,19 +840,16 @@ type SSHTestResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// TestSSHServer tests basic SSH connectivity and authentication for a server node.
-// If node.Host is empty and node.Alias is specified, the node is loaded from storage.
+// TestSSHServer tests supplied connection details or a stored node by ID.
 func (a *App) TestSSHServer(node SSHServerNode) SSHTestResult {
-	if strings.TrimSpace(node.Host) == "" && strings.TrimSpace(node.Alias) != "" {
-		saved, ok := a.GetSSHServer(node.Alias)
+	if strings.TrimSpace(node.Host) == "" && strings.TrimSpace(node.ID) != "" {
+		a.sshClustersMu.RLock()
+		saved, ok := a.sshClusters[node.ID]
+		a.sshClustersMu.RUnlock()
 		if !ok {
-			return SSHTestResult{OK: false, Error: fmt.Sprintf("server %q not found", node.Alias)}
+			return SSHTestResult{OK: false, Error: "SSH server not found"}
 		}
 		node = saved
-	} else if strings.TrimSpace(node.Alias) != "" && node.Password == "" {
-		if saved, ok := a.GetSSHServer(node.Alias); ok && saved.Password != "" {
-			node.Password = saved.Password
-		}
 	}
 
 	node = normalizeSSHServerNode(node)
@@ -836,7 +879,8 @@ func (a *App) TestSSHServer(node SSHServerNode) SSHTestResult {
 	if a.ctx != nil {
 		ctx = a.ctx
 	}
-	testCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Allow the transport's separate TCP and handshake budgets to run in full.
+	testCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
 	// 指纹记录与服务器不一致时同样是直接换记录再连一次（与远程工具口径一致，

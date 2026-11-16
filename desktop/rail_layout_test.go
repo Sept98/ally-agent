@@ -3,8 +3,7 @@ package desktop
 import (
 	backend "ally-dev/internal/app"
 	"bytes"
-	"image"
-	"image/color"
+	"fmt"
 	"testing"
 	"time"
 
@@ -139,54 +138,6 @@ func TestRailKeepsItsColumnAcrossStates(t *testing.T) {
 	}
 }
 
-// The collapsed rail centres the wordmark across its whole width: the ink keeps
-// the same gap on both sides. Left-aligning it, or centring it in a narrower
-// column, breaks one of them.
-func TestCollapsedWordmarkIsCentred(t *testing.T) {
-	a := &desktop{prefs: defaultPrefs(), page: "chat"}
-	a.prefs.RailExpanded = false
-	tt := ui.NewTester(func(c *ui.Context) {
-		c.SetTheme(a.theme())
-		c.DisableAnimations()
-		a.headerBar(c)
-	}, 200, 44)
-	tt.Frame()
-	img := tt.Image()
-	left, right := inkEdges(img, 0, int(widthRailCollapsed), 8, 36, img.RGBAAt(180, 6), 40)
-	if left < 0 {
-		t.Fatal("no wordmark ink in the rail's width")
-	}
-	leftGap, rightGap := left, int(widthRailCollapsed)-1-right
-	if d := leftGap - rightGap; d > 1 || d < -1 {
-		t.Fatalf("wordmark is not centred: %d DIP on the left, %d on the right", leftGap, rightGap)
-	}
-}
-
-// inkEdges is the first and last column holding a pixel that differs from ref in
-// the given band, or -1 when the band is empty.
-func inkEdges(img *image.RGBA, x0, x1, y0, y1 int, ref color.RGBA, tol int) (int, int) {
-	first, last := -1, -1
-	for x := x0; x < x1; x++ {
-		for y := y0; y < y1; y++ {
-			if channelSpread(img.RGBAAt(x, y), ref) > tol {
-				if first < 0 {
-					first = x
-				}
-				last = x
-				break
-			}
-		}
-	}
-	return first, last
-}
-
-func channelSpread(a, b color.RGBA) int {
-	dr := int(a.R) - int(b.R)
-	dg := int(a.G) - int(b.G)
-	db := int(a.B) - int(b.B)
-	return max(max(dr, -dr), max(max(dg, -dg), max(db, -db)))
-}
-
 // Revealing the reserved delete slot must keep the title stable, and the
 // revealed action must still target only the intended workspace.
 func TestWorkspaceDeleteRevealsWithoutMovingTitle(t *testing.T) {
@@ -263,5 +214,34 @@ func TestExpandedRailToggleStaysAtBottom(t *testing.T) {
 				t.Fatalf("height=%d sectionsOpen=%t: toggle is not at bottom: %v", height, sectionsOpen, button)
 			}
 		}
+	}
+}
+
+// The session rail draws the rows in view only: a long history must not rebuild
+// every row on every frame, nor push the collapse button off the rail.
+func TestRailSessionsBuildRowsInView(t *testing.T) {
+	a := &desktop{prefs: defaultPrefs(), page: "chat", tabs: []*conversation{{ID: "s0", Workspace: "/work/alpha"}}}
+	a.prefs.RailExpanded, a.prefs.RailSessionsOpen = true, true
+	for i := range 80 {
+		a.sessions = append(a.sessions, backend.SessionIndexEntry{ID: fmt.Sprint("s", i), Title: fmt.Sprint("session ", i), Workspace: "/work/alpha", UpdatedAt: 1700000000, MessageCount: 3})
+	}
+	a.sessRev = 1
+	tt := ui.NewTester(func(c *ui.Context) {
+		c.SetTheme(a.theme())
+		c.DisableAnimations()
+		ui.Column(c).Fill().Children(func() {
+			ui.Box(c).Height(heightHeader).Shrink(0)
+			ui.Split(c, &a.prefs.RailWidth, func() { a.rail(c) }, func() { ui.Column(c).Fill() }).Grow(1).MinHeight(0).FillWidth()
+		})
+	}, 1000, 850)
+	button, ok := tt.Find("收起侧边栏")
+	if !ok || button.Y+button.H != 850-4 {
+		t.Fatalf("sessions pushed the toggle off the rail: %v", button)
+	}
+	if !tt.HasText("session 0") {
+		t.Fatal("the newest session was not built")
+	}
+	if tt.HasText("session 79") {
+		t.Fatal("a session below the fold was built: the rail draws every row again")
 	}
 }

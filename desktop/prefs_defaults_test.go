@@ -1,9 +1,13 @@
 package desktop
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/egoist/mygo"
 )
 
 func TestInitialAppearanceAndAvatar(t *testing.T) {
@@ -19,6 +23,12 @@ func TestInitialAppearanceAndAvatar(t *testing.T) {
 	saved := readPrefs(path)
 	if saved.Appearance != "light" || saved.Palette != 5 || saved.Avatar != "bot" {
 		t.Fatalf("saved choice overwritten: %+v", saved)
+	}
+	if err := os.WriteFile(path, []byte(`{"avatar":"image"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPrefs(path).Avatar; got != "glm" {
+		t.Fatalf("old avatar was not converted at load: %q", got)
 	}
 	if err := os.WriteFile(path, []byte(`{"avatar":""}`), 0600); err != nil {
 		t.Fatal(err)
@@ -69,19 +79,52 @@ func TestVoiceInputPreferencesDefaultAndRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHistoryPageSizePreference(t *testing.T) {
+func TestCloseToTrayPreferenceDefaultsOnAndPersistsTheOptOut(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "native-ui.json")
-	for _, tc := range []struct {
-		data string
-		want int
-	}{
-		{`{}`, 80}, {`{"historyPageSize":20}`, 20}, {`{"historyPageSize":140}`, 140}, {`{"historyPageSize":999999}`, 80},
-	} {
-		if err := os.WriteFile(path, []byte(tc.data), 0600); err != nil {
-			t.Fatal(err)
-		}
-		if got := readPrefs(path).HistoryPageSize; got != tc.want {
-			t.Fatalf("%s: %d", tc.data, got)
-		}
+	// A record written before the preference existed must keep the documented
+	// close-to-tray behavior, not flip it off through the zero value.
+	if err := os.WriteFile(path, []byte(`{"avatar":"bot"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPrefs(path); !got.CloseToTray {
+		t.Fatalf("missing closeToTray must default on: %+v", got)
+	}
+	if err := os.WriteFile(path, []byte(`{"closeToTray":false}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	off := readPrefs(path)
+	if off.CloseToTray {
+		t.Fatalf("an explicit opt-out was overwritten: %+v", off)
+	}
+	// Writing it back must keep the opt-out: with omitempty the false would
+	// vanish and the next read would restore the default.
+	data, err := json.MarshalIndent(off, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"closeToTray": false`) {
+		t.Fatalf("the opt-out must be written out, not omitted: %s", data)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPrefs(path); got.CloseToTray {
+		t.Fatalf("the opt-out did not survive a save: %+v", got)
+	}
+}
+
+func TestCloseButtonQuitsWithoutATrayOrAnOptOut(t *testing.T) {
+	// No tray means no way back into a hidden window, so the close button quits
+	// even with the preference on.
+	if (&desktop{prefs: defaultPrefs()}).closeHidesToTray() {
+		t.Fatal("no tray must quit")
+	}
+	saved := defaultPrefs()
+	saved.CloseToTray = false
+	if (&desktop{prefs: saved, tray: &mygo.Tray{}}).closeHidesToTray() {
+		t.Fatal("the opt-out must quit even with a tray")
+	}
+	if !(&desktop{prefs: defaultPrefs(), tray: &mygo.Tray{}}).closeHidesToTray() {
+		t.Fatal("tray plus the default preference must hide")
 	}
 }

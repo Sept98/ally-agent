@@ -72,61 +72,65 @@ type remotePythonResponse struct {
 func parseRemoteTarget(raw string) (remoteTarget, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return remoteTarget{}, errors.New("target is required")
+		return remoteTarget{}, errors.New("alias is required")
 	}
-	if strings.HasPrefix(raw, "ssh://") {
-		u, err := url.Parse(raw)
-		if err != nil {
-			return remoteTarget{}, fmt.Errorf("invalid ssh target: %w", err)
+	endpoint := raw
+	if !strings.HasPrefix(endpoint, "ssh://") {
+		if strings.Contains(endpoint, "://") {
+			return remoteTarget{}, errors.New("target URL must use ssh://")
 		}
-		if u.Hostname() == "" || u.Path == "" {
-			return remoteTarget{}, errors.New("ssh target must include host and absolute workspace path")
+		if strings.Contains(endpoint, "/") {
+			return remoteTarget{}, errors.New("target selects only an SSH server; pass file paths separately")
 		}
-		host := u.Hostname()
-		if u.User != nil {
-			host = u.User.String() + "@" + host
+		endpoint = "ssh://" + endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return remoteTarget{}, fmt.Errorf("invalid ssh target: %w", err)
+	}
+	if u.Hostname() == "" || strings.HasSuffix(u.Host, ":") || u.RawQuery != "" || u.Fragment != "" || strings.ContainsAny(u.Hostname(), " \t\r\n") {
+		return remoteTarget{}, errors.New("target must select an SSH server alias or [user@]host[:port]")
+	}
+	if u.Path != "" {
+		return remoteTarget{}, errors.New("alias selects only an SSH server; pass absolute file paths separately")
+	}
+	if u.Port() != "" {
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return remoteTarget{}, errors.New("target port must be between 1 and 65535")
 		}
-		root := path.Clean(u.Path)
-		if root == "." || !strings.HasPrefix(root, "/") || root == "/" {
-			return remoteTarget{}, errors.New("remote workspaceRoot must be an absolute non-root path")
+	}
+	host := u.Hostname()
+	if u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			return remoteTarget{}, errors.New("target must not include a password")
 		}
-		return remoteTarget{Raw: raw, Host: host, Port: u.Port(), WorkspaceRoot: root}, nil
+		host = u.User.Username() + "@" + host
 	}
-	idx := strings.LastIndex(raw, ":")
-	if idx <= 0 || idx == len(raw)-1 {
-		return remoteTarget{}, errors.New("target must be formatted as host:/absolute/workspace")
-	}
-	host := strings.TrimSpace(raw[:idx])
-	root := strings.TrimSpace(raw[idx+1:])
-	if host == "" {
-		return remoteTarget{}, errors.New("target host is required")
-	}
-	root = path.Clean(filepath.ToSlash(root))
-	if root == "." || !strings.HasPrefix(root, "/") || root == "/" {
-		return remoteTarget{}, errors.New("remote workspaceRoot must be an absolute non-root path")
-	}
-	return remoteTarget{Raw: raw, Host: host, WorkspaceRoot: root}, nil
+	return remoteTarget{Raw: raw, Host: host, Port: u.Port()}, nil
 }
 
 // resolveAndAuthorizeRemoteTarget parses raw and resolves any cluster alias.
 // In interactive agent sessions (sessionID != ""), it enforces Tab-level isolation
 // without per-operation confirmation prompts.
 func (a *App) resolveAndAuthorizeRemoteTarget(ctx context.Context, raw string) (remoteTarget, error) {
-	rt, err := parseRemoteTarget(raw)
-	if err != nil {
-		return remoteTarget{}, err
+	// Nicknames are opaque values, not URLs: resolve them before parsing the
+	// endpoint syntax so spaces, Chinese, and punctuation remain valid.
+	serverNode, isRegistered := a.GetSSHServer(raw)
+	rt := remoteTarget{Raw: raw}
+	if !isRegistered {
+		var err error
+		rt, err = parseRemoteTarget(raw)
+		if err != nil {
+			return remoteTarget{}, err
+		}
+		serverNode, isRegistered = a.GetSSHServer(rt.Host)
 	}
 
-	// 已登记节点有两种写法：别名，或真实端点（user@host[:port]）——用户给模型的
-	// 多半是后者。两者是同一个身份：认到节点就照它的人名/端口/凭据走，并沿用它的
-	// 工作区白名单；只认别名会让已授权、已存密码的节点换个写法又变成陌生主机。
-	serverKey := strings.ToLower(strings.TrimSpace(rt.Host))
-	serverNode, isRegistered := a.GetSSHServer(serverKey)
+	// Preserve endpoint matching for existing sessions and direct callers;
+	// registered endpoints still use the node's credentials and grants.
 	if !isRegistered {
 		serverNode, isRegistered = a.findSSHServerByEndpoint(rt.Host, rt.Port)
-		if isRegistered {
-			serverKey = strings.ToLower(strings.TrimSpace(serverNode.Alias))
-		}
 	}
 
 	// 本轮请求的工作区决定隔离范围：聊天、子代理和计划任务都会在执行入口
@@ -144,8 +148,9 @@ func (a *App) resolveAndAuthorizeRemoteTarget(ctx context.Context, raw string) (
 
 	if isRegistered {
 		rt.Host = nodeSSHHost(serverNode)
-		if serverNode.Port > 0 && serverNode.Port != 22 {
-			rt.Port = strconv.Itoa(serverNode.Port)
+		rt.Port = strconv.Itoa(serverNode.Port)
+		if serverNode.Port <= 0 {
+			rt.Port = "22"
 		}
 	}
 
@@ -155,83 +160,38 @@ func (a *App) resolveAndAuthorizeRemoteTarget(ctx context.Context, raw string) (
 	// in another workspace.
 	if isRegistered && workspace != "" && !a.IsServerAuthorizedForWorkspace(workspace, serverNode.ID) {
 		return remoteTarget{}, codedToolError("E_SERVER_UNAUTHORIZED",
-			fmt.Errorf("server %q is not authorized for current workspace tab; please authorize it in the tab footer or request access via ssh_cluster", serverKey))
+			fmt.Errorf("server %q is not authorized for current workspace tab; please authorize it in the workspace footer", serverNode.Alias))
 	}
 
-	// 工作区授权通过后才缓存节点凭据。
-	// 槽位由解析后的端点决定，invokeRemotePython 按同一端点读取凭据。
-	if isRegistered && (serverNode.Password != "" || serverNode.KeyPath != "") {
-		a.sshCredentials.store(sshCredentialKey(rt.Host, rt.Port), normalizeSSHAuthType(serverNode), serverNode.Password, serverNode.KeyPath)
+	// 工作区授权通过后将凭据绑定到本次解析结果，避免同端点节点互相覆盖。
+	if isRegistered {
+		rt.credential = &sshCredentialEntry{authType: normalizeSSHAuthType(serverNode), password: serverNode.Password, keyPath: serverNode.KeyPath}
 	}
 
 	return rt, nil
 }
 
-// validateRemoteWorkspacePath validates a path (or cwd) against the remote
-// workspace root. Relative paths pass through as before. Absolute paths are
-// rebased when they point inside the root: the root itself maps to "." and
-// deeper paths to their relative remainder — a caller that already knows the
-// absolute location (e.g. cwd="/srv/app" with target root "/srv/app") is not
-// punished for spelling it absolutely. Absolute paths outside the root are
-// rejected with an error that names the boundary, mirroring the local
-// E_PATH_OUTSIDE contract.
-func validateRemoteWorkspacePath(p, root string, allowRoot bool) (string, error) {
+// validateRemotePath accepts only absolute remote paths.
+func validateRemotePath(p string, allowRoot bool) (string, error) {
 	p = strings.TrimSpace(filepath.ToSlash(p))
-	if strings.HasPrefix(p, "/") {
-		root = path.Clean(filepath.ToSlash(root))
-		if p == root {
-			if !allowRoot {
-				return "", errors.New("path is required")
-			}
-			return ".", nil
-		}
-		if strings.HasPrefix(p, root+"/") {
-			p = strings.TrimPrefix(p, root+"/")
-		} else {
-			return "", fmt.Errorf("absolute path %s is outside the remote workspaceRoot %s; use a path relative to the root (empty means the root itself)", p, root)
-		}
-	}
-	return validateRemoteRelativePath(p, allowRoot)
-}
-
-// validateRemoteRelativePath validates a path already known to be relative
-// against the remote workspace root: no NUL bytes, no leading "/", no ".."
-// traversal, and path.Clean'd. Empty or "." resolves to the root itself when
-// allowRoot is set (used for remote_run_command cwd).
-func validateRemoteRelativePath(p string, allowRoot bool) (string, error) {
-	p = strings.TrimSpace(filepath.ToSlash(p))
-	if p == "" || p == "." {
-		if allowRoot {
-			return ".", nil
-		}
+	if p == "" {
 		return "", errors.New("path is required")
 	}
 	if strings.ContainsRune(p, 0) {
 		return "", errors.New("path contains NUL byte")
 	}
-	if strings.HasPrefix(p, "/") {
-		return "", errors.New("path must be relative to remote workspaceRoot")
-	}
-	for _, part := range strings.Split(p, "/") {
-		if part == ".." {
-			return "", errors.New("path must not contain '..'")
-		}
+	if !path.IsAbs(p) {
+		return "", errors.New("remote path must be absolute, e.g. /srv/app/main.go")
 	}
 	clean := path.Clean(p)
-	if clean == "." {
-		if allowRoot {
-			return ".", nil
-		}
-		return "", errors.New("path is required")
+	if clean == "/" && !allowRoot {
+		return "", errors.New("refusing to target the remote filesystem root")
 	}
 	return clean, nil
 }
 
-func remotePayload(rt remoteTarget, op string, extra map[string]any) map[string]any {
-	payload := map[string]any{
-		"op":            op,
-		"workspaceRoot": rt.WorkspaceRoot,
-	}
+func remotePayload(op string, extra map[string]any) map[string]any {
+	payload := map[string]any{"op": op}
 	for k, v := range extra {
 		payload[k] = v
 	}
@@ -262,7 +222,7 @@ func buildRemoteScript(payload map[string]any) (string, error) {
 	return strings.Replace(remoteScriptTemplateOnce.script, "__PAYLOAD_B64__", encoded, 1), nil
 }
 
-// remoteHelperError 把 Python helper 的错误映射为 Go 侧错误。E_PATH_OUTSIDE
+// remoteHelperError 把 Python helper 的错误映射为 Go 侧错误。错误码
 // 前缀错误转成结构化错误码，供模型侧恢复提示使用。
 func remoteHelperError(resp remotePythonResponse) error {
 	if resp.Error == "" {
@@ -275,48 +235,6 @@ func remoteHelperError(resp remotePythonResponse) error {
 		return codedToolError(code, errors.New(strings.TrimSpace(msg)))
 	}
 	return errors.New(resp.Error)
-}
-
-// remoteWriteTargets 提取命令中可静态解析的字面写入目标（与本地
-// command 共用 command.LiteralWriteTargets 同一份提取逻辑），
-// 交给远端 Python helper 做文件系统事实检查。
-func remoteWriteTargets(commandLine string) []string {
-	all := command.LiteralWriteTargets(commandLine)
-	targets := make([]string, 0, len(all))
-	for _, t := range all {
-		targets = append(targets, t.Path)
-	}
-	return targets
-}
-
-// remoteVCSMetadataWrite 拒绝把版本控制元数据当写目标的远端路径。规则与本地写
-// 路径、删除路径、命令目标同源（pathutil.VCSMetadataReason），新增一个远端写入口
-// 只要过这一关就不会漏。这一层只能判字面路径：真实路径要在 SSH 另一头解析，工作
-// 区内的符号链接能把干净的字面路径接到 .git 上（`ln -s .git gh` 之后写
-// `gh/hooks/pre-commit`），那一步由 helper 用远端事实复判（op_write 的
-// contains_vcs）。
-func remoteVCSMetadataWrite(cleanPath string) error {
-	if blocked, reason := pathutil.VCSMetadataReason(cleanPath); blocked {
-		return codedToolError("E_PROTECTED_PATH", errors.New(reason))
-	}
-	return nil
-}
-
-// remoteCommandVCSMetadataTarget 报出远端命令行里第一个落在版本控制元数据内的字面
-// 写入目标，workingDir 用来解析相对目标（远端命令的 cwd）。与本地
-// firstVCSMetadataMutationTarget 的差别只有一处：本地还会用 evalExistingPrefix 把
-// 符号链接解析后复判，远端解析不了，那一步留给 helper 的 check_write_targets。
-func remoteCommandVCSMetadataTarget(commandLine, workingDir string) string {
-	for _, target := range command.LiteralWriteTargets(commandLine) {
-		p, ok := command.ResolveCommandLiteralPath(target.Path, workingDir)
-		if !ok {
-			continue
-		}
-		if blocked, _ := pathutil.VCSMetadataReason(p); blocked {
-			return filepath.ToSlash(p)
-		}
-	}
-	return ""
 }
 
 // toolSessionID 取出工具调用所属的会话 ID；后台任务与子代理调用可能没有会话。
@@ -385,6 +303,9 @@ func (a *App) invokeRemotePython(ctx context.Context, rt remoteTarget, payload m
 		return err
 	}
 	entry, _ := a.sshCredentials.lookup(sshCredentialKey(rt.Host, rt.Port))
+	if rt.credential != nil {
+		entry = *rt.credential
+	}
 	sshConfig := a.remoteSSHConfig(rt, entry)
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -429,6 +350,9 @@ func (a *App) invokeRemotePython(ctx context.Context, rt remoteTarget, payload m
 			strings.Contains(msg, "python2: command not found") || strings.Contains(msg, "python2: not found") ||
 			strings.Contains(msg, "python: command not found") || strings.Contains(msg, "python: not found") {
 			return fmt.Errorf("remote host %s has no python3/python2/python in PATH; remote_* tools need a python interpreter on the remote side (install python3, python2 or python, or add it to PATH): %s", rt.Host, msg)
+		}
+		if strings.Contains(msg, "no such host") {
+			return fmt.Errorf("ssh %s failed: %s; check the hostname and DNS; if %q was meant to be a server nickname, use ssh_cluster to check the exact alias", rt.Host, msg, rt.Raw)
 		}
 		return fmt.Errorf("ssh %s failed: %s", rt.Host, msg)
 	}
@@ -524,7 +448,7 @@ func (a *App) remoteReadRawBatch(ctx context.Context, rt remoteTarget, paths []s
 		Files     []remoteReadBatchItem `json:"files"`
 		Remaining []string              `json:"remaining"`
 	}
-	err := a.invokeRemotePython(ctx, rt, remotePayload(rt, "read_batch", map[string]any{
+	err := a.invokeRemotePython(ctx, rt, remotePayload("read_batch", map[string]any{
 		"paths":      paths,
 		"maxBytes":   maxReadFileBytes,
 		"totalBytes": maxRemoteReadBatchBytes,
@@ -543,7 +467,7 @@ func (a *App) remoteReadRawOne(ctx context.Context, rt remoteTarget, relPath str
 }
 
 func (a *App) remoteReadRawRange(ctx context.Context, rt remoteTarget, relPath string, tailLines int) (remoteTarget, remoteRawFile, error) {
-	cleanPath, err := validateRemoteWorkspacePath(relPath, rt.WorkspaceRoot, false)
+	cleanPath, err := validateRemotePath(relPath, false)
 	if err != nil {
 		return remoteTarget{}, remoteRawFile{}, err
 	}
@@ -555,7 +479,7 @@ func (a *App) remoteReadRawRange(ctx context.Context, rt remoteTarget, relPath s
 		ModTime    string `json:"modTime"`
 		Tail       bool   `json:"tail"`
 	}
-	err = a.invokeRemotePython(ctx, rt, remotePayload(rt, "read", map[string]any{"path": cleanPath, "maxBytes": maxReadFileBytes, "tailLines": tailLines}), 60*time.Second, &rawResp)
+	err = a.invokeRemotePython(ctx, rt, remotePayload("read", map[string]any{"path": cleanPath, "maxBytes": maxReadFileBytes, "tailLines": tailLines}), 60*time.Second, &rawResp)
 	if err != nil {
 		return remoteTarget{}, remoteRawFile{}, err
 	}
@@ -571,19 +495,14 @@ func (a *App) remoteWriteRaw(ctx context.Context, rt remoteTarget, relPath strin
 }
 
 func (a *App) remoteWriteRawExpected(ctx context.Context, rt remoteTarget, relPath string, data []byte, overwrite, mkdirs bool, expectedHash string) ([]string, error) {
-	cleanPath, err := validateRemoteWorkspacePath(relPath, rt.WorkspaceRoot, false)
+	cleanPath, err := validateRemotePath(relPath, false)
 	if err != nil {
-		return nil, err
-	}
-	// 远端写入（create / edit）与本地同一条围栏：.git/hooks 里的文件会在下次 git
-	// 命令时执行，覆盖 .git/index 或 ref 会损坏仓库。
-	if err := remoteVCSMetadataWrite(cleanPath); err != nil {
 		return nil, err
 	}
 	var outcome struct {
 		CreatedDirs []string `json:"createdDirs"`
 	}
-	err = a.invokeRemotePython(ctx, rt, remotePayload(rt, "write", map[string]any{
+	err = a.invokeRemotePython(ctx, rt, remotePayload("write", map[string]any{
 		"path":           cleanPath,
 		"dataBase64":     base64.StdEncoding.EncodeToString(data),
 		"overwrite":      overwrite,
@@ -597,19 +516,10 @@ func (a *App) remoteWriteRawExpected(ctx context.Context, rt remoteTarget, relPa
 }
 
 func (a *App) remoteReadFile(ctx context.Context, req RemoteReadFileRequest) (BatchReadResult, error) {
-	if strings.TrimSpace(req.Target) == "" {
-		return BatchReadResult{}, errors.New("target is required")
+	if strings.TrimSpace(req.Alias) == "" {
+		return BatchReadResult{}, errors.New("alias is required")
 	}
 	fileRequests := req.Files
-	if len(fileRequests) == 0 && strings.TrimSpace(req.Path) != "" {
-		fileRequests = []BatchReadFileRequest{
-			{
-				Path:      req.Path,
-				StartLine: req.StartLine,
-				EndLine:   req.EndLine,
-			},
-		}
-	}
 	if len(fileRequests) == 0 {
 		return BatchReadResult{}, errors.New("remote_read requires at least one file in files")
 	}
@@ -621,7 +531,7 @@ func (a *App) remoteReadFile(ctx context.Context, req RemoteReadFileRequest) (Ba
 			return BatchReadResult{}, err
 		}
 	}
-	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Target)
+	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Alias)
 	if err != nil {
 		return BatchReadResult{}, err
 	}
@@ -642,8 +552,8 @@ func (a *App) remoteReadFile(ctx context.Context, req RemoteReadFileRequest) (Ba
 		return BatchReadResult{Files: []BatchReadResultItem{item}}, nil
 	}
 	results := make([]BatchReadResultItem, len(fileRequests))
-	// 先逐槽位做与单文件路径相同的清洗校验（root 内绝对路径 rebase 成相
-	// 对拼写），非法槽位直接落错误，不进会话；再按清洗后路径去重排序，
+	// 先逐槽位做与单文件相同的绝对路径校验，非法槽位直接落错误；
+	// 再按清洗后路径去重，
 	// 同一物理文件只传一次。重复路径的每个槽位各自渲染自己的行区间，
 	// 与旧逐文件实现语义一致。
 	slotsOf := make(map[string][]int, len(fileRequests))
@@ -651,7 +561,7 @@ func (a *App) remoteReadFile(ctx context.Context, req RemoteReadFileRequest) (Ba
 	pending := make([]string, 0, len(fileRequests))
 	tails := map[string]int{}
 	for i, f := range fileRequests {
-		clean, err := validateRemoteWorkspacePath(f.Path, rt.WorkspaceRoot, false)
+		clean, err := validateRemotePath(f.Path, false)
 		if err != nil {
 			results[i] = BatchReadResultItem{Path: f.Path, Error: err.Error()}
 			continue
@@ -758,8 +668,8 @@ func (a *App) remoteReadFileCached(ctx context.Context, req RemoteReadFileReques
 		return result, err
 	}
 	if cache, ok := ctx.Value(sessionReadCacheContextKey{}).(*sessionReadCache); ok {
-		// 远端条目的路径已是目标机工作区内清洗过的相对路径（绝对写法会被
-		// rebase），键里不再带 target：两台机器上的同名文件只有内容逐字节相
+		// 远端条目的路径是目标机上的绝对路径。键里不带 target：
+		// 两台机器上的同名文件只有内容逐字节相
 		// 同时才会互相命中，而那时省略的正是模型已经收到过的内容。
 		cache.dedupeResult(&result, func(item *BatchReadResultItem) string { return item.Path })
 	}
@@ -799,14 +709,14 @@ func buildRemoteReadResultItem(rawFile remoteRawFile, f BatchReadFileRequest) (B
 // version, applies the whole batch in memory, and writes once, so the file is
 // either fully updated or untouched.
 func (a *App) remoteEdit(ctx context.Context, req RemoteEditRequest) (MultiEditResult, error) {
-	if strings.TrimSpace(req.Target) == "" {
-		return MultiEditResult{}, errors.New("target is required")
+	if strings.TrimSpace(req.Alias) == "" {
+		return MultiEditResult{}, errors.New("alias is required")
 	}
 	file := req.file()
 	if err := validateModelEditToolRequest([]FileTextEdits{file}); err != nil {
 		return MultiEditResult{}, err
 	}
-	rt, original, err := a.remoteReadRaw(ctx, req.Target, file.Path)
+	rt, original, err := a.remoteReadRaw(ctx, req.Alias, file.Path)
 	if err != nil {
 		return MultiEditResult{}, err
 	}
@@ -901,7 +811,7 @@ func (a *App) remoteStatPath(ctx context.Context, rt remoteTarget, relPath strin
 		IsDir  bool  `json:"isDir"`
 		Size   int64 `json:"size"`
 	}
-	err := a.invokeRemotePython(ctx, rt, remotePayload(rt, "stat", map[string]any{"path": relPath}), 60*time.Second, &resp)
+	err := a.invokeRemotePython(ctx, rt, remotePayload("stat", map[string]any{"path": relPath}), 60*time.Second, &resp)
 	if err != nil {
 		return remoteStat{}, err
 	}
@@ -909,11 +819,11 @@ func (a *App) remoteStatPath(ctx context.Context, rt remoteTarget, relPath strin
 }
 
 func (a *App) remoteCreateFile(ctx context.Context, req RemoteCreateFileRequest) (EditResult, error) {
-	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Target)
+	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Alias)
 	if err != nil {
 		return EditResult{}, err
 	}
-	cleanPath, err := validateRemoteWorkspacePath(req.Path, rt.WorkspaceRoot, false)
+	cleanPath, err := validateRemotePath(req.Path, false)
 	if err != nil {
 		return EditResult{}, err
 	}
@@ -932,7 +842,7 @@ func (a *App) remoteCreateFile(ctx context.Context, req RemoteCreateFileRequest)
 	beforeVersion := ""
 	// Best-effort read supplies the diff and version; stat determines existence.
 	if stat.Exists {
-		if _, existing, readErr := a.remoteReadRaw(ctx, req.Target, cleanPath); readErr == nil {
+		if _, existing, readErr := a.remoteReadRaw(ctx, req.Alias, cleanPath); readErr == nil {
 			before = existing.Data
 			beforeHash, beforeVersion = hashBytesAndVersion(existing.Data)
 		}
@@ -957,14 +867,14 @@ func (a *App) remoteCreateFile(ctx context.Context, req RemoteCreateFileRequest)
 }
 
 // remoteDeletePath 删除远端一次调用里的全部路径，与本地 delete 同一套语义：
-// Go 侧先判路径形态（相对性、越界、工作区根、VCS 元数据），并把这一串路径归一成
+// Go 侧先判绝对路径与文件系统根，并把这一串路径归一成
 // 「去重 + 深的先删」的执行计划（planDeleteExecution）；只有远端才知道的事实
 // （是否目录、是否系统敏感目标）由
 // helper 在动手之前逐条判完——任一条不通过，整批一条都不删。
 // 执行阶段仍是逐条隔离：单条失败只写自己的结果槽；本来就不存在的路径报 absent
 // 槽（既不成功也不失败），同批其它路径照删。
 func (a *App) remoteDeletePath(ctx context.Context, req RemoteDeletePathRequest) (DeletePathsResult, error) {
-	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Target)
+	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Alias)
 	if err != nil {
 		return DeletePathsResult{}, err
 	}
@@ -975,23 +885,19 @@ func (a *App) remoteDeletePath(ctx context.Context, req RemoteDeletePathRequest)
 	clean := make([]string, 0, len(candidates))
 	targets := make([]fileMutationTarget, 0, len(candidates))
 	for _, candidate := range candidates {
-		// allowRoot=true maps the workspace root to "." so the dedicated refusal
-		// below reports the root, instead of the generic "path is required" that
-		// allowRoot=false raises first (which made that branch dead code).
-		cleanPath, err := validateRemoteWorkspacePath(candidate, rt.WorkspaceRoot, true)
+		// Keep filesystem-root deletion refusal explicit.
+		cleanPath, err := validateRemotePath(candidate, true)
 		if err != nil {
 			return DeletePathsResult{}, err
 		}
-		if cleanPath == "." {
-			return DeletePathsResult{}, codedToolError("E_DELETE_BLOCKED", errors.New("refusing to delete remote workspace root"))
+		if isVCSDeleteName(path.Base(cleanPath)) {
+			return DeletePathsResult{}, codedToolError("E_DELETE_BLOCKED", errors.New("refusing to delete version control directory"))
 		}
-		for _, part := range strings.Split(cleanPath, "/") {
-			if part == ".git" || part == ".svn" || part == ".hg" {
-				return DeletePathsResult{}, codedToolError("E_DELETE_BLOCKED", fmt.Errorf("refusing to delete VCS metadata (%s in %s)", part, cleanPath))
-			}
+		if cleanPath == "/" {
+			return DeletePathsResult{}, codedToolError("E_DELETE_BLOCKED", errors.New("refusing to delete remote filesystem root"))
 		}
 		clean = append(clean, cleanPath)
-		targets = append(targets, fileMutationTarget{remoteMutationKey(req.Target, cleanPath), cleanPath})
+		targets = append(targets, fileMutationTarget{remoteMutationKey(req.Alias, cleanPath), cleanPath})
 	}
 	// 重复与包含不再整批拒：只把代表项发给 helper（同一身份删一次），并按计划顺序送——
 	// 深的先删，父目录与它里面的路径同时列出时两条都能真删掉，而不是让结果取决于顺序。
@@ -1016,7 +922,7 @@ func (a *App) remoteDeletePath(ctx context.Context, req RemoteDeletePathRequest)
 	if timeout > 5*time.Minute {
 		timeout = 5 * time.Minute
 	}
-	if err := a.invokeRemotePython(ctx, rt, remotePayload(rt, "delete_batch", map[string]any{"paths": execPaths, "recursive": req.Recursive}), timeout, &resp); err != nil {
+	if err := a.invokeRemotePython(ctx, rt, remotePayload("delete_batch", map[string]any{"paths": execPaths, "recursive": req.Recursive}), timeout, &resp); err != nil {
 		return DeletePathsResult{}, err
 	}
 	// 槽位与发出去的路径一一对应：数目不对就是 helper 契约破了，宁可报错也不要拿零值
@@ -1054,21 +960,9 @@ func (a *App) remoteRunCommand(ctx context.Context, req RemoteRunCommandRequest)
 	if err := validateRemoteCommandSafety(req.Command); err != nil {
 		return CommandResult{}, err
 	}
-	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Target)
+	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Alias)
 	if err != nil {
 		return CommandResult{}, err
-	}
-	// cwd 先校验并归一；算出来的
-	// 远端绝对路径同时是下面版本控制元数据判定的解析基准。
-	cwd, err := validateRemoteWorkspacePath(req.Cwd, rt.WorkspaceRoot, true)
-	if err != nil {
-		return CommandResult{}, err
-	}
-	// 版本控制元数据：本地那条判定即便在内核接管、围栏 stand down 时也保留，远端
-	// 没有内核兜底，更必须有等价的一份，否则远端命令能写 .git/hooks（下次 git 即
-	// 执行代码）。字面目标里出现 .git 段即拒；解析后的复判在 helper 侧。
-	if risk := remoteCommandVCSMetadataTarget(req.Command, path.Join(rt.WorkspaceRoot, cwd)); risk != "" {
-		return CommandResult{}, codedToolError("E_PROTECTED_PATH", fmt.Errorf("安全围栏已拦截：远端命令的写入目标是版本控制元数据内的路径。\n原因：创建或覆盖 .git/.svn/.hg 的元数据会损坏仓库，写入 hooks 更会在下次 git 命令时执行代码。\n检测到的目标：%s\n处理方式：版本控制状态请手动在服务器上变更。", risk))
 	}
 
 	timeout := req.Timeout
@@ -1091,19 +985,13 @@ func (a *App) remoteRunCommand(ctx context.Context, req RemoteRunCommandRequest)
 			return CommandResult{}, codedToolError("E_BAD_SHELL", fmt.Errorf("unsupported shell %q: only bash, sh, zsh are allowed", shell))
 		}
 	}
-	// 镜像本地 command 的 E_PATH_OUTSIDE 检查：只把"可静态解析的字面写
-	// 目标"传给远端做事实检查；动态目标（变量/glob/命令替换）与 null 设备
-	// 在本地同样放行，因此不传。
-	writeTargets := remoteWriteTargets(req.Command)
 	var result CommandResult
-	err = a.invokeRemotePython(ctx, rt, remotePayload(rt, "run", map[string]any{
+	err = a.invokeRemotePython(ctx, rt, remotePayload("run", map[string]any{
 		"command":          req.Command,
-		"cwd":              cwd,
 		"timeoutSeconds":   timeout,
 		"shell":            shell,
 		"maxOutput":        maxToolOutput,
 		"modelOutputBytes": maxModelToolOutput,
-		"targets":          writeTargets,
 	}), time.Duration(timeout+20)*time.Second, &result)
 	return result, err
 }
@@ -1114,7 +1002,7 @@ const remoteTransferMarker = "ALLY_REMOTE_TRANSFER_JSON:"
 var remoteTransferPythonScript = strings.Replace(strings.Replace(remotePythonScript, "TRANSFER_MODE = False", "TRANSFER_MODE = True", 1), "__DELETE_SENSITIVE_TARGETS__", "[]", 1)
 
 type RemoteTransferRequest struct {
-	Target     string `json:"target"`
+	Alias      string `json:"alias"`
 	Action     string `json:"action"` // "upload" or "download"
 	LocalPath  string `json:"localPath"`
 	RemotePath string `json:"remotePath"`
@@ -1124,7 +1012,7 @@ type RemoteTransferRequest struct {
 type RemoteTransferResult struct {
 	OK         bool   `json:"ok"`
 	Action     string `json:"action"`
-	Target     string `json:"target"`
+	Alias      string `json:"alias"`
 	LocalPath  string `json:"localPath"`
 	RemotePath string `json:"remotePath"`
 	TotalBytes int64  `json:"totalBytes"`
@@ -1207,8 +1095,8 @@ func (a *App) executeRemoteTransfer(ctx context.Context, req RemoteTransferReque
 	if action != "upload" && action != "download" {
 		return RemoteTransferResult{}, codedToolError("E_BAD_ARGS", fmt.Errorf("action must be 'upload' or 'download', got %q", req.Action))
 	}
-	if strings.TrimSpace(req.Target) == "" {
-		return RemoteTransferResult{}, codedToolError("E_BAD_ARGS", errors.New("target is required"))
+	if strings.TrimSpace(req.Alias) == "" {
+		return RemoteTransferResult{}, codedToolError("E_BAD_ARGS", errors.New("alias is required"))
 	}
 	if strings.TrimSpace(req.LocalPath) == "" {
 		return RemoteTransferResult{}, codedToolError("E_BAD_ARGS", errors.New("localPath is required"))
@@ -1218,21 +1106,14 @@ func (a *App) executeRemoteTransfer(ctx context.Context, req RemoteTransferReque
 	}
 
 	// 1. Resolve target, workspace authorization and credentials
-	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Target)
+	rt, err := a.resolveAndAuthorizeRemoteTarget(ctx, req.Alias)
 	if err != nil {
 		return RemoteTransferResult{}, err
 	}
 
-	// 2. Validate remote path against workspace root
-	cleanRemotePath, err := validateRemoteWorkspacePath(req.RemotePath, rt.WorkspaceRoot, false)
+	// 2. Validate the absolute remote path; no remote workspace boundary.
+	cleanRemotePath, err := validateRemotePath(req.RemotePath, false)
 	if err != nil {
-		return RemoteTransferResult{}, err
-	}
-	if cleanRemotePath == "." {
-		return RemoteTransferResult{}, codedToolError("E_PATH_OUTSIDE", errors.New("refusing transfer directly targeting remote workspace root without subpath"))
-	}
-	// VCS metadata check for remote path
-	if err := remoteVCSMetadataWrite(cleanRemotePath); err != nil {
 		return RemoteTransferResult{}, err
 	}
 
@@ -1271,8 +1152,12 @@ func (a *App) executeRemoteTransfer(ctx context.Context, req RemoteTransferReque
 	if localClean == "." {
 		return RemoteTransferResult{}, codedToolError("E_PATH_OUTSIDE", errors.New("refusing transfer directly targeting local workspace root without subpath"))
 	}
-	if blocked, reason := pathutil.VCSMetadataReason(localAbs); blocked {
-		return RemoteTransferResult{}, codedToolError("E_PROTECTED_PATH", errors.New(reason))
+
+	// Resolve existing ancestors before opening the workspace handle. Keep the
+	// leaf name so uploads still preserve symlinks instead of dereferencing them.
+	workspace, localAbs, err = resolveLocalTransferPath(workspace, localAbs)
+	if err != nil {
+		return RemoteTransferResult{}, err
 	}
 
 	// 4. Action-specific validation
@@ -1314,13 +1199,17 @@ func (a *App) executeRemoteTransfer(ctx context.Context, req RemoteTransferReque
 	}
 
 	// 5. Execute raw stream transfer via Python Bridge
-	result, err := a.runRemoteTransferStream(ctx, rt, action, localAbs, cleanRemotePath, req.Overwrite)
+	result, err := a.runRemoteTransferStream(ctx, rt, action, workspace, localAbs, cleanRemotePath, req.Overwrite)
 	if err != nil {
-		return RemoteTransferResult{}, err
+		destination := localClean
+		if action == "upload" {
+			destination = req.Alias + ":" + cleanRemotePath
+		}
+		return RemoteTransferResult{}, fmt.Errorf("transfer failed: %w; destination %q may have been partially modified, including overwritten files; inspect it before retrying", err, destination)
 	}
 
 	result.Action = action
-	result.Target = req.Target
+	result.Alias = req.Alias
 	result.LocalPath = localClean
 	result.RemotePath = cleanRemotePath
 	result.OK = true
@@ -1348,17 +1237,50 @@ func getRemoteTransferCompressedScript() string {
 	return remoteTransferCompressedScriptOnce.encoded
 }
 
-func (a *App) runRemoteTransferStream(ctx context.Context, rt remoteTarget, action, localAbs, cleanRemotePath string, overwrite bool) (RemoteTransferResult, error) {
+// resolveLocalTransferPath checks both lexical and resolved forms, including
+// missing destinations beneath an existing symlinked parent.
+func resolveLocalTransferPath(workspace, localAbs string) (string, string, error) {
+	root, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return "", "", err
+	}
+	parent, err := evalExistingPrefix(filepath.Dir(localAbs))
+	if err != nil {
+		return "", "", err
+	}
+	if !pathutil.InsideRoot(root, parent) {
+		return "", "", codedToolError("E_PATH_OUTSIDE", errors.New("local transfer parent resolves outside workspace"))
+	}
+	// Do not dereference the leaf: atomic download replacement must also work
+	// for dangling symlinks, and uploads serialize the link rather than its data.
+	parentRel, err := filepath.Rel(root, parent)
+	if err != nil {
+		return "", "", err
+	}
+	// Retain the workspace spelling for credential fences (for example a HOME
+	// beneath /var on macOS); the relative path no longer traverses user links.
+	return workspace, filepath.Join(workspace, parentRel, filepath.Base(localAbs)), nil
+}
+
+func (a *App) runRemoteTransferStream(ctx context.Context, rt remoteTarget, action, workspace, localAbs, cleanRemotePath string, overwrite bool) (RemoteTransferResult, error) {
+	root, err := os.OpenRoot(workspace)
+	if err != nil {
+		return RemoteTransferResult{}, err
+	}
+	defer root.Close()
+	localRel, err := filepath.Rel(workspace, localAbs)
+	if err != nil {
+		return RemoteTransferResult{}, err
+	}
 	arcRootName := path.Base(cleanRemotePath)
 	if action == "download" {
 		arcRootName = filepath.Base(localAbs)
 	}
 	payload := map[string]any{
-		"action":        action,
-		"workspaceRoot": rt.WorkspaceRoot,
-		"remotePath":    cleanRemotePath,
-		"arcRootName":   arcRootName,
-		"overwrite":     overwrite,
+		"action":      action,
+		"remotePath":  cleanRemotePath,
+		"arcRootName": arcRootName,
+		"overwrite":   overwrite,
 	}
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
@@ -1370,6 +1292,9 @@ func (a *App) runRemoteTransferStream(ctx context.Context, rt remoteTarget, acti
 	remoteCmd := fmt.Sprintf(`sh -c 'boot="import base64, sys, zlib; code = zlib.decompress(base64.b64decode(sys.argv.pop(1))); exec(compile(code, \"<ally-transfer>\", \"exec\"))"; command -v python3 >/dev/null 2>&1 && exec python3 -u -c "$boot" "$@" ; command -v python2 >/dev/null 2>&1 && exec python2 -u -c "$boot" "$@" ; exec python -u -c "$boot" "$@"' -- %s %s`, b64Script, b64Payload)
 
 	entry, _ := a.sshCredentials.lookup(sshCredentialKey(rt.Host, rt.Port))
+	if rt.credential != nil {
+		entry = *rt.credential
+	}
 	sshConfig := a.remoteSSHConfig(rt, entry)
 
 	var outcome struct {
@@ -1393,7 +1318,7 @@ func (a *App) runRemoteTransferStream(ctx context.Context, rt remoteTarget, acti
 					}
 					packErrCh <- pErr
 				}()
-				packed, pErr = streamarchive.PackWithFilter(localAbs, arcRootName, pw, func(current string, isDir bool) error {
+				packed, pErr = streamarchive.PackRoot(root, localRel, arcRootName, pw, func(current string, isDir bool) error {
 					if blocked, reason := blockedSensitiveRead(current); blocked {
 						return codedToolError("E_PROTECTED_PATH", fmt.Errorf("upload rejected: %s", reason))
 					}
@@ -1451,7 +1376,7 @@ func (a *App) runRemoteTransferStream(ctx context.Context, rt remoteTarget, acti
 					}
 					unpackCh <- uRes
 				}()
-				uRes.stats, uRes.err = streamarchive.UnpackTarget(pr, localAbs, overwrite)
+				uRes.stats, uRes.err = streamarchive.UnpackRoot(pr, root, localRel, overwrite)
 				if uRes.err == nil {
 					_, _ = io.Copy(io.Discard, pr)
 				}

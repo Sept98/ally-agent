@@ -22,9 +22,75 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+func TestRenameSessionPersistsIndexAndSnapshot(t *testing.T) {
+	t.Parallel()
+	app := newIsolatedChatTestApp(t)
+	original := SessionSnapshot{ID: "rename-me", Title: "Original", Workspace: app.config.Workspace, Messages: []map[string]any{{"role": "user", "content": "keep this"}}}
+	if err := app.SaveSession(original); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.RenameSession(original.ID, "  New   title "); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := app.ListSessionIndex()
+	if err != nil || len(entries) != 1 || entries[0].Title != "New title" {
+		t.Fatalf("index title not renamed: %+v, %v", entries, err)
+	}
+	loaded, err := app.LoadSession(original.ID)
+	if err != nil || loaded.Title != "New title" || len(loaded.Messages) != 1 || loaded.Messages[0]["content"] != "keep this" {
+		t.Fatalf("snapshot rename damaged session: %+v, %v", loaded, err)
+	}
+	if _, err := app.repairSessionIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = app.ListSessionIndex()
+	if err != nil || len(entries) != 1 || entries[0].Title != "New title" {
+		t.Fatalf("repair reverted rename: %+v, %v", entries, err)
+	}
+	if err := app.RenameSession(original.ID, "   "); err == nil {
+		t.Fatal("empty title was accepted")
+	}
+	if err := app.RenameSession("missing", "Title"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing session error = %v", err)
+	}
+}
+
+func TestCommitSessionRenameRollsBackOnIndexWriteFailure(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	snapshotPath := filepath.Join(dir, "session.json.gz")
+	indexPath := filepath.Join(dir, "index.json")
+	oldJSON := []byte(`{"id":"session-1","title":"Before"}`)
+	newJSON := []byte(`{"id":"session-1","title":"After"}`)
+	if err := writeCompressedJSONAtomic(snapshotPath, oldJSON); err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldIndex := []byte("[{\"id\":\"session-1\",\"title\":\"Before\"}]")
+	if err := os.WriteFile(indexPath, oldIndex, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("simulated index write failure")
+	err = commitSessionRename(snapshotPath, newJSON, oldSnapshot, true, indexPath, oldIndex, true, func() error { return writeErr })
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("commit error = %v", err)
+	}
+	afterSnapshot, err := os.ReadFile(snapshotPath)
+	if err != nil || !bytes.Equal(oldSnapshot, afterSnapshot) {
+		t.Fatalf("snapshot was not rolled back: %v", err)
+	}
+	afterIndex, err := os.ReadFile(indexPath)
+	if err != nil || !bytes.Equal(oldIndex, afterIndex) {
+		t.Fatalf("index changed after failed commit: %v", err)
+	}
+}
+
 func TestStartupSessionIndexDoesNotScanOrphanedSnapshots(t *testing.T) {
 	t.Parallel()
-	app := newApiTestApp(t)
+	app := newIsolatedChatTestApp(t)
 	snapshot := SessionSnapshot{ID: "orphan", Title: "Recovered", Messages: []map[string]any{{"role": "user", "content": "recover me"}}}
 	if err := writeCompressedJSONAtomic(app.sessionSnapshotPath(snapshot.ID), mustJSON(snapshot)); err != nil {
 		t.Fatal(err)
@@ -49,7 +115,7 @@ func TestSessionIndexRepairRejectsConcurrentEditsAndDeletes(t *testing.T) {
 	t.Parallel()
 	for _, action := range []string{"rename", "delete"} {
 		t.Run(action, func(t *testing.T) {
-			app := newApiTestApp(t)
+			app := newIsolatedChatTestApp(t)
 			snapshot := SessionSnapshot{ID: "session", Title: "Original", Workspace: app.config.Workspace,
 				Messages: []map[string]any{{"role": "user", "content": "hello"}}}
 			if err := app.SaveSession(snapshot); err != nil {
@@ -97,7 +163,7 @@ func TestSessionIndexRepairRejectsConcurrentEditsAndDeletes(t *testing.T) {
 
 func TestSessionRepairCancellationDoesNotWriteIndex(t *testing.T) {
 	t.Parallel()
-	app := newApiTestApp(t)
+	app := newIsolatedChatTestApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := app.repairSessionIndex(ctx); !errors.Is(err, context.Canceled) {
@@ -109,7 +175,8 @@ func TestSessionRepairCancellationDoesNotWriteIndex(t *testing.T) {
 }
 
 func TestSessionFilesUseIndexAndOnDemandSnapshot(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -186,7 +253,8 @@ func TestSessionFilesUseIndexAndOnDemandSnapshot(t *testing.T) {
 }
 
 func TestListSessionsRecoversSnapshotWhenIndexIsMissing(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -212,7 +280,8 @@ func TestListSessionsRecoversSnapshotWhenIndexIsMissing(t *testing.T) {
 }
 
 func TestHistoryLoadRepairsTruncatedToolCallArguments(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -252,7 +321,8 @@ func TestHistoryLoadRepairsTruncatedToolCallArguments(t *testing.T) {
 }
 
 func TestHistoryLoadCollapsesRepeatedToolCallNames(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -296,7 +366,8 @@ func TestHistoryLoadCollapsesRepeatedToolCallNames(t *testing.T) {
 }
 
 func TestHistoryLoadDropsUnknownToolCallNames(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -341,7 +412,8 @@ func TestHistoryLoadDropsUnknownToolCallNames(t *testing.T) {
 }
 
 func TestHistoryLoadDropsTruncatedArgsMarker(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -386,7 +458,8 @@ func TestHistoryLoadDropsTruncatedArgsMarker(t *testing.T) {
 }
 
 func TestHistoryLoadRepairsDanglingToolCalls(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -442,7 +515,8 @@ func TestHistoryLoadRepairsDanglingToolCalls(t *testing.T) {
 }
 
 func TestSessionIndexUnreadableDegradesToEmpty(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	app.initialized = true
 	app.sessionsDir = t.TempDir()
 	app.historiesDir = t.TempDir()
@@ -495,6 +569,7 @@ func TestSessionIndexUnreadableDegradesToEmpty(t *testing.T) {
 }
 
 func TestNormalizeSessionIndexEntryClampsFirstPrompt(t *testing.T) {
+	t.Parallel()
 	longPrompt := strings.Repeat("很长的提问字符", 200) // > maxSessionIndexFirstPromptChars runes
 	entry := normalizeSessionIndexEntry(SessionIndexEntry{
 		ID:          "prompt-clamp",
@@ -530,6 +605,7 @@ func mustJSON(value any) []byte {
 // reasoning text and the tool output, while the in-memory profile keeps both
 // verbatim (a running session replays it as-is).
 func TestDiskProfileDropsReasoningAndToolOutput(t *testing.T) {
+	t.Parallel()
 	bigOutput := strings.Repeat("file contents ", 400)
 	// Tool arguments must stay valid JSON: anything else is treated as a
 	// truncated call and stripped by the repair pass.
@@ -575,6 +651,7 @@ func TestDiskProfileDropsReasoningAndToolOutput(t *testing.T) {
 // TestDiskProfileKeepsToolPairing: dropping tool output must not orphan the tool
 // call, otherwise the restored history would be repaired by deleting the call.
 func TestDiskProfileKeepsToolPairing(t *testing.T) {
+	t.Parallel()
 	commandArgs := string(mustJSON(map[string]string{"command": "echo hi"}))
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleUser, Content: "run"},
@@ -591,5 +668,63 @@ func TestDiskProfileKeepsToolPairing(t *testing.T) {
 	}
 	if len(disk[1].ToolCalls) != 1 || disk[2].Role != openai.ChatMessageRoleTool {
 		t.Fatalf("pairing broken by the disk profile: %+v", disk)
+	}
+}
+
+func TestLegacyHistoryIsMaterializedAsSnapshotOnce(t *testing.T) {
+	t.Parallel()
+	a := newIsolatedTestApp(t)
+	if err := a.ensureInitialized(); err != nil {
+		t.Fatal(err)
+	}
+	const id = "legacy-migrate-on-read"
+	history := []openai.ChatCompletionMessage{{Role: "user", Content: "keep my question"}, {Role: "assistant", Content: "keep my answer"}}
+	path := a.historyDiskPaths(id)[0]
+	if err := writeCompressedHistoryPayload(path, history); err != nil {
+		t.Fatal(err)
+	}
+	first, err := a.LoadSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, err := readCompressedSessionSnapshot(a.sessionSnapshotPath(id))
+	if err != nil || !disk.HasSnapshot || len(disk.Messages) != 2 {
+		t.Fatalf("snapshot not saved: %+v %v", disk, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	reopened := newAppState(a.AppDataDir())
+	second, err := reopened.LoadSession(id)
+	if err != nil || !second.HasSnapshot || len(second.Messages) != len(first.Messages) || second.Messages[1]["content"] != "keep my answer" {
+		t.Fatalf("reopened legacy session: %+v %v", second, err)
+	}
+}
+
+func TestHistorySyncUpdatesPreviouslyMaterializedSnapshot(t *testing.T) {
+	t.Parallel()
+	a := newIsolatedChatTestApp(t)
+	const id = "headless-follow-up"
+	history := []openai.ChatCompletionMessage{{Role: "user", Content: "first"}, {Role: "assistant", Content: "answer one"}}
+	a.saveHistory(id, history)
+	if err := a.syncSessionIndexFromHistory(id); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := a.LoadSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Messages = append(snapshot.Messages, map[string]any{"role": "tool_call", "name": "read", "result": "original"})
+	if err := a.SaveSession(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	history = append(history, openai.ChatCompletionMessage{Role: "user", Content: "next"}, openai.ChatCompletionMessage{Role: "assistant", Content: "answer two"})
+	a.saveHistory(id, history)
+	if err := a.syncSessionIndexFromHistory(id); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = a.LoadSession(id)
+	if err != nil || len(snapshot.Messages) != 5 || snapshot.Messages[2]["name"] != "read" || snapshot.Messages[4]["content"] != "answer two" {
+		t.Fatalf("history sync lost existing records or new messages: %+v, %v", snapshot, err)
 	}
 }

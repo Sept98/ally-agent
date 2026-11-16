@@ -534,7 +534,8 @@ func TestMcpServerConfigEqualIgnoresDisabledTools(t *testing.T) {
 // MCP 工具不入参数闸门（没有内置声明可校验），所以一个拼错或多传的参数只能
 // 靠这条警告露面；声明里没有 properties 的工具则保持安静，否则每个参数都会被点名。
 func TestMcpUnknownArgWarningsNamesUndeclaredArguments(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	manager := NewMcpManager(t.TempDir(), nil)
 	manager.clients = map[string]*McpClientHandle{
 		"fs": {
@@ -1569,5 +1570,16 @@ func TestMcpToolResultTextStructuredOnlyServerIsNotEmpty(t *testing.T) {
 	got := mcpToolResultText(result)
 	if got != `structured output: {"status":"ok"}` {
 		t.Fatalf("structured-only result = %q", got)
+	}
+}
+
+func TestMCPFunctionNamesRequireRegisteredLookup(t *testing.T) {
+	m := &McpManager{toolLookup: map[string]mcpToolRef{"mcp__opaque": {ServerName: "server__name", ToolName: "tool__name"}}}
+	if _, ok := m.DescribeFunctionTool("mcp__server__tool"); ok {
+		t.Fatal("unregistered legacy name accepted")
+	}
+	ref, ok := m.DescribeFunctionTool("mcp__opaque")
+	if !ok || ref.ServerName != "server__name" || ref.ToolName != "tool__name" {
+		t.Fatalf("registered lookup lost original names: %+v", ref)
 	}
 }

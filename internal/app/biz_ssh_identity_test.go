@@ -87,7 +87,7 @@ func TestSSHIdentityLegacySelectionSurvivesRenameAndReload(t *testing.T) {
 	assertSelection(a, "ws1", node.ID)
 	assertSelection(a, "ws2", node.ID, other.ID)
 	// Migration must be durable without requiring a later edit or selection.
-	b := NewApp()
+	b := newAppState(a.AppDataDir())
 	b.configPath = a.configPath
 	if err := b.loadSSHClusters(); err != nil {
 		t.Fatal(err)
@@ -105,12 +105,12 @@ func TestSSHIdentityLegacySelectionSurvivesRenameAndReload(t *testing.T) {
 		t.Fatal("rename left a duplicate node under the old nickname")
 	}
 	assertSelection(a, "ws1", node.ID)
-	if !a.IsServerAuthorizedForWorkspace("ws1", " RENAMED ") {
+	if !a.IsServerAuthorizedForWorkspace("ws1", apiSSHTestNode(t, a, " RENAMED ").ID) {
 		t.Fatal("legacy alias callers cannot resolve renamed server")
 	}
 	// Import/old clients still upsert by alias, retaining ID and creation data.
 	imported := node
-	imported.ID, imported.CreatedAtMS, imported.CreatedBy = "", 0, "agent"
+	imported.ID, imported.CreatedAtMS, imported.CreatedBy = node.ID, 0, "agent"
 	if err := a.SaveSSHServer(imported); err != nil {
 		t.Fatal(err)
 	}

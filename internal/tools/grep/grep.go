@@ -278,7 +278,7 @@ func Search(ctx context.Context, rgPath, root, searchRoot string, req Request) (
 		NextOffset:      nextOffset,
 		Offset:          max(0, req.Offset),
 		OffsetExhausted: offsetExhausted,
-		Skipped:         searchSkipNotices(req),
+		Skipped:         searchSkipNotices(req, searchRoot),
 		Warnings:        warnings,
 	}
 	if mode == OutputModeCountMatches {
@@ -407,7 +407,7 @@ func baseArgs(req Request, maxDepth int) []string {
 	// 依赖/产物目录的排除与上面的「大文件放宽」是两件事，判据也不同：这里问的是
 	// 「调用方是不是指进了这些目录里面」（指进 node_modules/lodash 放行，指父目录
 	// frontend 不放行），大文件放宽问的仍是「有没有指名目标」。
-	if !req.PathInsideExcludedDir {
+	if !req.PathInsideExcludedDir && !req.IncludeIgnored {
 		args = append(args, excludedGlobArgs...)
 	}
 	// Windows reserved filenames (nul, con, prn, aux, com1-9, lpt1-9) cause
@@ -432,7 +432,7 @@ func grepThreads() int {
 	return cores
 }
 
-func searchSkipNotices(req Request) []string {
+func searchSkipNotices(req Request, searchRoot string) []string {
 	skipped := []string{}
 	if strings.TrimSpace(req.Path) == "" {
 		// 这两条描述的是整棵工作区搜索的策略，指名目标的搜索不适用。
@@ -441,8 +441,19 @@ func searchSkipNotices(req Request) []string {
 			skipped = append(skipped, "ignored_by_ignore_files")
 		}
 	}
-	// 目录排除按实际有没有生效来报：指进依赖目录里面时它没生效，就不能说跳过了。
-	if !req.PathInsideExcludedDir {
+	// rg 只在遍历目录时跳过点开头的条目；指名到文件本身时它照搜，所以这里按
+	// 「搜索根是不是目录」来报。不报的话，隐藏文件里的命中会变成一句干巴巴的
+	// matched="0"，看上去像搜过了没有。
+	isDir := false
+	if info, err := os.Stat(searchRoot); err == nil {
+		isDir = info.IsDir()
+	}
+	if isDir {
+		skipped = append(skipped, "hidden_entries")
+	}
+	// 目录排除按实际有没有生效来报：指进依赖目录里面时它没生效，就不能说跳过了；
+	// 指名到单个文件时根本不遍历目录，同样不算跳过，否则每次搜单文件都白带一长串名单。
+	if isDir && !req.PathInsideExcludedDir && !req.IncludeIgnored {
 		skipped = append(skipped, "directories:"+strings.Join(ExcludedDirs(), ","))
 	}
 	return skipped
@@ -598,8 +609,10 @@ func sampleMatches(ctx context.Context, rgPath, root, searchRoot string, req Req
 		}
 	}
 
-	waitErr := cmd.Wait()
+	// Drain stderr before Wait: Wait closes the pipe and can drop the bytes that
+	// explain the failure, turning "regex parse error" into a bare "exit status 2".
 	errWG.Wait()
+	waitErr := cmd.Wait()
 	if parseErr != nil {
 		return nil, nil, 0, nil, false, false, nil, parseErr
 	}
@@ -645,6 +658,9 @@ func sampleMatches(ctx context.Context, rgPath, root, searchRoot string, req Req
 	var resultCounts []FileCount
 	if mode == OutputModeCountMatches {
 		sortedCounts = fileCounts.Items()
+		if stats.FilesWithMatches > len(sortedCounts) {
+			warnings = append(warnings, fmt.Sprintf("Only the top %d matching files are available; narrow the search path to inspect the rest.", len(sortedCounts)))
+		}
 		start := req.Offset
 		if start < 0 {
 			start = 0
@@ -1001,8 +1017,9 @@ func sanitizeLineText(s string) string {
 // 返回的是新建切片，调用方 append 不会串改。
 func ExcludedDirs() []string {
 	return []string{
-		".git",
 		"node_modules",
+		".pnpm-store",
+		"jars",
 		"vendor",
 		"dist",
 		"target",
@@ -1049,24 +1066,25 @@ var excludedDirNameSet = func() map[string]struct{} {
 func PointIntoExcludedDir(workspaceRoot, searchRoot string) bool {
 	rel, err := filepath.Rel(workspaceRoot, searchRoot)
 	if err != nil {
-		return excludedDirName(filepath.Base(searchRoot))
+		return IsExcludedDir(filepath.Base(searchRoot))
 	}
 	rel = strings.TrimSpace(rel)
 	if rel == "" || rel == "." {
 		return false
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return excludedDirName(filepath.Base(searchRoot))
+		return IsExcludedDir(filepath.Base(searchRoot))
 	}
 	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		if excludedDirName(part) {
+		if IsExcludedDir(part) {
 			return true
 		}
 	}
 	return false
 }
 
-func excludedDirName(name string) bool {
+// IsExcludedDir is the shared default dependency/build-directory policy.
+func IsExcludedDir(name string) bool {
 	_, ok := excludedDirNameSet[strings.ToLower(name)]
 	return ok
 }

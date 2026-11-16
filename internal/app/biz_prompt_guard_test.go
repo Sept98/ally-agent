@@ -43,7 +43,7 @@ var promptNonToolTokens = map[string]bool{
 	// runtime / library names
 	"echarts": true, "python": true,
 	// plan request fields and statuses named in guidance
-	"changes": true, "done": true, "files": true, "finish": true,
+	"alias": true, "changes": true, "done": true, "files": true, "finish": true,
 	"in_progress": true, "next": true, "offset": true, "path": true, "step_limit": true,
 	"pending": true, "steps": true, "stage": true, "validation": true, "version": true,
 	// frontmatter fields and IO nouns named in guidance
@@ -72,10 +72,8 @@ func TestSystemPromptToolReferencesExist(t *testing.T) {
 	redirectAppStateDir(t)
 	app := NewApp()
 	registry := builtinToolNames(t)
-	kbRoot := t.TempDir()
 	prompts := map[string]string{
-		"main":      joinSystemPromptParts(app.buildSystemPromptParts(nil, "", nil, "", "", "")),
-		"main-kb":   joinSystemPromptParts(app.buildSystemPromptParts(nil, kbRoot, nil, "", "", kbRoot)),
+		"main":      joinSystemPromptParts(app.buildSystemPromptParts(nil, "", nil, "", "", nil)),
 		"sub-agent": subagentSystemPrompt(""),
 	}
 	unknown := map[string]bool{}

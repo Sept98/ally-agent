@@ -3,6 +3,7 @@ package desktop
 
 import (
 	"fmt"
+	"sync"
 
 	"ally-dev/resources"
 
@@ -11,7 +12,7 @@ import (
 
 var originalRailIcons = func() map[string]*ui.SVG {
 	result := map[string]*ui.SVG{}
-	for _, name := range []string{"chat", "kb", "skills", "mcp", "models", "ssh", "tasks", "stats", "plugins", "settings", "history", "github", "folderopen"} {
+	for _, name := range []string{"chat", "skills", "mcp", "models", "ssh", "tasks", "stats", "plugins", "settings", "history", "github", "folderopen"} {
 		directory := "antd"
 		switch name {
 		case "skills", "models", "tasks", "plugins", "folderopen":
@@ -28,17 +29,37 @@ var originalRailIcons = func() map[string]*ui.SVG {
 	return result
 }()
 
-func normalizedAvatarStyle(style string) string {
-	if style == "image" {
-		return "glm"
+// The support artwork is decoded the first time the settings page needs it, so
+// a session that never opens that tab carries no extra bitmap.
+var (
+	supportOnce                         sync.Once
+	githubStarIllustration, wechatPayQR *ui.Bitmap
+)
+
+func loadSupportImages() {
+	supportOnce.Do(func() {
+		githubStarIllustration = decodeEmbeddedBitmap("support/github-star.png")
+		wechatPayQR = decodeEmbeddedBitmap("support/wechat-pay.jpg")
+	})
+}
+
+// decodeEmbeddedBitmap decodes artwork from the embedded assets; a missing or
+// broken file just leaves the picture out instead of failing the page.
+func decodeEmbeddedBitmap(name string) *ui.Bitmap {
+	data, err := resources.Assets.ReadFile(name)
+	if err != nil {
+		return nil
 	}
-	return style
+	image, err := ui.DecodeBitmap(data)
+	if err != nil {
+		return nil
+	}
+	return image
 }
 
 // Only the selected character is decoded; the compressed embedded artwork
 // remains available for a later selection without retaining every bitmap.
 func decodeAvatarStyle(style string) map[string]*ui.Bitmap {
-	style = normalizedAvatarStyle(style)
 	result := map[string]*ui.Bitmap{}
 	if style == "eye" || style == "custom" {
 		return result
@@ -91,7 +112,7 @@ func (a *desktop) selectAvatarStyle(style string) {
 	a.avatarLoadID++
 	id := a.avatarLoadID
 	releaseAvatarPoses(a.avatarPoses)
-	a.avatarStyle, a.avatarPoses = normalizedAvatarStyle(style), nil
+	a.avatarStyle, a.avatarPoses = style, nil
 	a.resetAvatarMotion()
 	if style == "custom" && a.customAvatar == nil && a.win != nil {
 		go func() {

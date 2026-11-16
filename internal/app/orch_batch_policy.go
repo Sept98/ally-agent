@@ -104,7 +104,7 @@ func goalUpdateOwnsBatch(call openai.ToolCall) bool {
 	return normalizeToolName(call.Function.Name) == "goal_update"
 }
 
-func detectToolBatchConflicts(cfg ConfigState, calls []openai.ToolCall) map[int]error {
+func detectToolBatchConflicts(cfg ConfigState, calls []openai.ToolCall, purposeFields ...map[string]string) map[int]error {
 	conflicts := detectWriteBatchConflicts(cfg, calls)
 	if len(calls) <= 1 {
 		return conflicts
@@ -190,6 +190,23 @@ func detectToolBatchConflicts(cfg ConfigState, calls []openai.ToolCall) map[int]
 			continue
 		}
 		args := call.Function.Arguments
+		field := ""
+		if toolshared.IsBuiltinTool(normalizeToolName(call.Function.Name)) {
+			field = "purpose"
+		}
+		if len(purposeFields) > 0 {
+			if injected := purposeFields[0][normalizeToolName(call.Function.Name)]; injected != "" {
+				field = injected
+			}
+		}
+		if field != "" {
+			var object map[string]json.RawMessage
+			if json.Unmarshal([]byte(args), &object) == nil && object != nil {
+				delete(object, field)
+				encoded, _ := json.Marshal(object)
+				args = string(encoded)
+			}
+		}
 		if stage, err := toolCallStage(call); err == nil && toolshared.IsBuiltinTool(normalizeToolName(call.Function.Name)) {
 			// Omitted stage and explicit 0 are the same scheduling intent.
 			// This canonical copy is only a key; execution keeps the original JSON.
@@ -283,7 +300,7 @@ func fileMutationTargets(cfg ConfigState, name, arguments string) []fileMutation
 	}
 	if name == "remote_transfer" {
 		var transArgs struct {
-			Target     string `json:"target"`
+			Alias      string `json:"alias"`
 			Action     string `json:"action"`
 			LocalPath  string `json:"localPath"`
 			RemotePath string `json:"remotePath"`
@@ -294,7 +311,7 @@ func fileMutationTargets(cfg ConfigState, name, arguments string) []fileMutation
 		action := strings.ToLower(strings.TrimSpace(transArgs.Action))
 		switch action {
 		case "upload":
-			target := strings.TrimSpace(transArgs.Target)
+			target := strings.TrimSpace(transArgs.Alias)
 			cleanPath := path.Clean(strings.ReplaceAll(strings.TrimSpace(transArgs.RemotePath), "\\", "/"))
 			if cleanPath != "" && cleanPath != "." {
 				return []fileMutationTarget{{
@@ -317,9 +334,9 @@ func fileMutationTargets(cfg ConfigState, name, arguments string) []fileMutation
 	// lists two overlapping paths is normalised inside the call itself, see
 	// planDeleteExecution).
 	var args struct {
-		Target string   `json:"target"`
-		Path   string   `json:"path"`
-		Paths  []string `json:"paths"`
+		Alias string   `json:"alias"`
+		Path  string   `json:"path"`
+		Paths []string `json:"paths"`
 	}
 	if json.Unmarshal([]byte(arguments), &args) != nil {
 		return nil
@@ -336,7 +353,7 @@ func fileMutationTargets(cfg ConfigState, name, arguments string) []fileMutation
 	}
 	targets := make([]fileMutationTarget, 0, len(paths))
 	if strings.HasPrefix(name, "remote_") {
-		target := strings.TrimSpace(args.Target)
+		target := strings.TrimSpace(args.Alias)
 		for _, p := range paths {
 			cleanPath := path.Clean(strings.ReplaceAll(strings.TrimSpace(p), "\\", "/"))
 			targets = append(targets, fileMutationTarget{remoteMutationKey(target, cleanPath), target + " · " + cleanPath})
@@ -373,9 +390,17 @@ func dedupeMutationTargets(targets []fileMutationTarget) []fileMutationTarget {
 
 // remoteMutationKey 是远端变更目标的唯一键：批次写冲突判定与一次远端删除调用
 // 内部的重复/包含归一（planDeleteExecution）共用它，所以两个判据认的是同一个身份。
-func remoteMutationKey(target, relPath string) string {
-	cleanPath := path.Clean(strings.ReplaceAll(strings.TrimSpace(relPath), "\\", "/"))
-	return "remote:" + strings.TrimSpace(target) + ":" + cleanPath
+func remoteMutationKey(target, remotePath string) string {
+	server := strings.TrimSpace(target)
+	cleanPath := path.Clean(strings.ReplaceAll(strings.TrimSpace(remotePath), "\\", "/"))
+	if rt, err := parseRemoteTarget(server); err == nil {
+		// Equivalent server endpoints and absolute paths must conflict.
+		server = sshCredentialKey(rt.Host, rt.Port)
+		if absolute, err := validateRemotePath(remotePath, true); err == nil {
+			cleanPath = absolute
+		}
+	}
+	return "remote:" + server + ":" + cleanPath
 }
 
 // mutationArgumentPaths 枚举「这次调用会动哪些路径」，供上面的写冲突判定使用：

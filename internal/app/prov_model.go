@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -838,7 +837,6 @@ func (a *App) streamModelTextWithUsage(ctx context.Context, cfg ConfigState, mod
 	if content == "" {
 		details := fmt.Sprintf("result.Content=%q, builder=%q, reasoning=%q, rBuilder=%q, stopReason=%q, toolCalls=%d",
 			result.Content, contentBuilder.String(), result.Reasoning, reasoningBuilder.String(), result.StopReason, len(result.ToolCalls))
-		log.Printf("[compaction] debug: empty summary! %s", details)
 		return "", nil, fmt.Errorf("compaction returned empty summary (%s)", details)
 	}
 	return content, result.Usage, nil
@@ -2224,6 +2222,12 @@ const (
 	apiFormatOpenAIChat        = "openai_chat"
 	apiFormatOpenAIResponses   = "openai_responses"
 	apiFormatAnthropicMessages = "anthropic_messages"
+
+	// The desktop lists the stored values as select options, so what it shows
+	// and writes must be these, not one of the aliases normalizeAPIFormat takes.
+	APIFormatOpenAIChat        = apiFormatOpenAIChat
+	APIFormatOpenAIResponses   = apiFormatOpenAIResponses
+	APIFormatAnthropicMessages = apiFormatAnthropicMessages
 	// openAIOfficialAPIBaseURL is the single source of truth for the official
 	// OpenAI endpoint: both adapters gate their OpenAI-only request fields on it
 	// (see isOfficialOpenAIEndpoint).
@@ -2441,12 +2445,10 @@ func reasoningOffTravelsAsEffort(cfg ConfigState, apiFormat string) bool {
 }
 
 func normalizeTokenParam(value string) string {
-	v := strings.ToLower(strings.TrimSpace(value))
-	v = separatorToUnderscoreReplacer.Replace(v)
-	switch v {
-	case tokenParamMaxCompletionTokens, "max_completion_token", "completion_tokens", "completion":
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case tokenParamMaxCompletionTokens:
 		return tokenParamMaxCompletionTokens
-	case tokenParamMaxTokens, "max_token", "tokens", "legacy":
+	case tokenParamMaxTokens:
 		return tokenParamMaxTokens
 	default:
 		return tokenParamAuto

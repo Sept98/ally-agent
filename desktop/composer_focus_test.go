@@ -2,10 +2,194 @@
 package desktop
 
 import (
+	"fmt"
 	"testing"
 
+	backend "ally-dev/internal/app"
 	"github.com/egoist/mygo/ui"
 )
+
+func TestComposerPickersRevealSelectionWithoutMovingChat(t *testing.T) {
+	for _, picker := range []string{"sessions", "commands", "mentions"} {
+		t.Run(picker, func(t *testing.T) {
+			root := t.TempDir()
+			conv := &conversation{ID: "session-25", Workspace: root, Messages: restoredHistory(60)}
+			a := &desktop{page: "chat", prefs: defaultPrefs(), tabs: []*conversation{conv}}
+			st := conv.uiState()
+			for i := 0; i < 30; i++ {
+				id := fmt.Sprintf("session-%d", i)
+				a.sessions = append(a.sessions, backend.SessionIndexEntry{ID: id, Workspace: root, Title: id})
+				st.Mention.Entries = append(st.Mention.Entries, backend.WorkspacePathEntry{Path: fmt.Sprintf("file-%d.go", i)})
+			}
+			tester := ui.NewTester(func(c *ui.Context) {
+				c.DisableAnimations()
+				c.SetTheme(a.theme())
+				width, _ := c.Size()
+				a.chatColumn(c, width)
+			}, 900, 360)
+			st.Follow = false
+			conv.Scroll.Y = conv.Scroll.MaxY / 2
+			tester.Frame()
+			before, _ := tester.Find("消息输入框")
+			y, maxY := conv.Scroll.Y, conv.Scroll.MaxY
+			var listLabel, selectedLabel string
+			open := func() {
+				a.composerFocus = conv.ID
+				switch picker {
+				case "sessions":
+					a.openSessionsMenu(conv)
+					listLabel, selectedLabel = "历史会话列表", "session-25"
+				case "commands":
+					conv.Draft = "/"
+					st.CmdOpen = true
+					listLabel, selectedLabel = "指令列表", "/push"
+				case "mentions":
+					conv.Draft = "@"
+					st.Mention.Open = true
+					st.Mention.Index = 25
+					listLabel, selectedLabel = "文件引用列表", "file-25.go"
+				}
+				tester.Frame()
+			}
+			unchanged := func() {
+				t.Helper()
+				if after, _ := tester.Find("消息输入框"); after != before || conv.Scroll.Y != y || conv.Scroll.MaxY != maxY || st.Follow {
+					t.Fatal("picker displaced the input or transcript")
+				}
+			}
+			visible := func() {
+				t.Helper()
+				list, _ := tester.Find(listLabel)
+				row, ok := tester.Find(selectedLabel)
+				if !ok || row.H <= 0 || row.Y < list.Y || row.Y+row.H > list.Y+list.H {
+					t.Fatalf("selection not visible: row=%+v list=%+v", row, list)
+				}
+			}
+			open()
+			if picker == "commands" {
+				for range 10 {
+					tester.Key(0, ui.KeyDown)
+				}
+			}
+			visible()
+			unchanged()
+			tester.Key(0, ui.KeyDown)
+			if picker == "sessions" {
+				selectedLabel = "session-26"
+			} else if picker == "mentions" {
+				selectedLabel = "file-26.go"
+			}
+			visible()
+			list, _ := tester.Find(listLabel)
+			tester.Scroll(list.X+list.W/2, list.Y+list.H/2, 0, -2000)
+			manual, _ := tester.Find(selectedLabel)
+			for range 3 {
+				tester.Frame()
+			}
+			if after, _ := tester.Find(selectedLabel); after != manual {
+				t.Fatal("ordinary redraw stole manual list scrolling")
+			}
+			tester.Key(0, ui.KeyUp)
+			if picker == "sessions" {
+				selectedLabel = "session-25"
+			} else if picker == "mentions" {
+				selectedLabel = "file-25.go"
+			} else {
+				selectedLabel = "/compact-fast"
+			}
+			visible()
+			tester.Key(0, ui.KeyEscape)
+			if st.SessionsOpen || st.CmdOpen || st.Mention.Open {
+				t.Fatal("Escape did not close the picker")
+			}
+			unchanged()
+		})
+	}
+}
+
+func TestSessionsPickerOwnsComposerMenus(t *testing.T) {
+	conv := &conversation{ID: "current", Workspace: t.TempDir(), Draft: "/"}
+	a := &desktop{tabs: []*conversation{conv}}
+	st := conv.uiState()
+	st.CmdOpen, st.Mention.Open = true, true
+	a.openSessionsMenu(conv)
+	for _, draft := range []string{"/", "/sessions", "@file"} {
+		conv.Draft = draft
+		a.updateComposerMenus(conv)
+		if !st.SessionsOpen || st.CmdOpen || st.Mention.Open {
+			t.Fatal("another picker took keyboard ownership from history")
+		}
+	}
+}
+
+func TestSessionsTriggerClosesOnSecondClick(t *testing.T) {
+	root := t.TempDir()
+	conv := &conversation{ID: "current", Workspace: root}
+	a := &desktop{page: "chat", prefs: defaultPrefs(), tabs: []*conversation{conv}, sessions: []backend.SessionIndexEntry{
+		{ID: "newest", Workspace: root, Title: "newest"}, {ID: conv.ID, Workspace: root, Title: "current"},
+	}}
+	st := conv.uiState()
+	tester := ui.NewTester(func(c *ui.Context) {
+		c.DisableAnimations()
+		ui.Column(c).Fill().Children(func() {
+			ui.Button(c, "outside")
+			ui.Spacer(c)
+			a.composer(c, conv)
+		})
+	}, 1000, 600)
+	for range 3 {
+		if err := tester.Click("查看和切换历史会话"); err != nil {
+			t.Fatal(err)
+		}
+		if !st.SessionsOpen || st.SessionsIndex != 1 {
+			t.Fatal("picker did not open with the current session selected")
+		}
+		bounds, _ := tester.Find("查看和切换历史会话")
+		x, y := bounds.X+bounds.W/2, bounds.Y+bounds.H/2
+		tester.Press(x, y)
+		if !st.SessionsOpen {
+			t.Fatal("trigger was treated as an outside press")
+		}
+		tester.Release(x, y)
+		if st.SessionsOpen {
+			t.Fatal("second click reopened the picker")
+		}
+	}
+	if err := tester.Click("查看和切换历史会话"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tester.Click("outside"); err != nil {
+		t.Fatal(err)
+	}
+	if st.SessionsOpen {
+		t.Fatal("outside click did not close the picker")
+	}
+	if err := tester.Click("查看和切换历史会话"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Key(0, ui.KeyEscape)
+	if st.SessionsOpen {
+		t.Fatal("Escape did not close the picker")
+	}
+	if err := tester.Click("查看和切换历史会话"); err != nil {
+		t.Fatal(err)
+	}
+	if !tester.Focused("消息输入框") {
+		t.Fatal("history picker lost composer focus")
+	}
+	tester.Key(0, ui.KeyUp)
+	if st.SessionsIndex != 0 {
+		t.Fatal("up arrow did not select the previous session")
+	}
+	tester.Key(0, ui.KeyDown)
+	if st.SessionsIndex != 1 {
+		t.Fatal("down arrow did not select the next session")
+	}
+	tester.Key(0, ui.KeyEnter)
+	if st.SessionsOpen || a.current() != conv || !tester.Focused("消息输入框") {
+		t.Fatal("choosing the current session did not close history and preserve composer focus")
+	}
+}
 
 func TestNewConversationFocusesComposer(t *testing.T) {
 	for _, create := range []string{"session", "workspace"} {

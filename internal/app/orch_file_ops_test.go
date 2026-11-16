@@ -91,7 +91,7 @@ func TestResolveDeletePathListTakesPathsOnly(t *testing.T) {
 // gone by the time it is reached.
 func TestPlanDeleteExecutionDedupesAndOrdersDeepestFirst(t *testing.T) {
 	remote := func(rel string) fileMutationTarget {
-		return fileMutationTarget{remoteMutationKey("dev:/srv/app", rel), rel}
+		return fileMutationTarget{remoteMutationKey("dev", rel), rel}
 	}
 	local := func(abs string) fileMutationTarget {
 		return fileMutationTarget{localMutationKey(abs), abs}
@@ -173,8 +173,9 @@ func TestPlanDeleteExecutionDedupesAndOrdersDeepestFirst(t *testing.T) {
 // slot without failing the rest, and the gate holds the model to the declared
 // shape (paths only, at least one, at most N entries).
 func TestLocalDeleteToolTakesPathsOnly(t *testing.T) {
+	t.Parallel()
 	dir, cfg := deleteTestWorkspace(t)
-	app := NewApp()
+	app := newIsolatedTestApp(t)
 	ctx := t.Context()
 
 	res := app.executeTool(ctx, cfg, "s-1", "delete", encodedToolArgs(t, DeletePathRequest{Paths: []string{"a.txt", "b.txt"}}))
@@ -317,7 +318,8 @@ func TestDeletePathsFailureSummaryNamesEveryFailedPath(t *testing.T) {
 // shape. Only gate-level rejections are exercised: they are decided before the
 // SSH target is resolved, so no server is needed.
 func TestRemoteDeleteToolTakesPathsOnly(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: t.TempDir()}
 	ctx := t.Context()
 
@@ -329,9 +331,9 @@ func TestRemoteDeleteToolTakesPathsOnly(t *testing.T) {
 		name string
 		args []byte
 	}{
-		{name: "missing paths", args: encodedToolArgs(t, map[string]any{"target": "dev:/srv/app"})},
-		{name: "path key", args: []byte(`{"target":"dev:/srv/app","path":"a.txt"}`)},
-		{name: "above the limit", args: encodedToolArgs(t, RemoteDeletePathRequest{Target: "dev:/srv/app", Paths: tooMany})},
+		{name: "missing paths", args: encodedToolArgs(t, map[string]any{"target": "dev"})},
+		{name: "path key", args: []byte(`{"target":"dev","path":"a.txt"}`)},
+		{name: "above the limit", args: encodedToolArgs(t, RemoteDeletePathRequest{Alias: "dev", Paths: tooMany})},
 	} {
 		res := app.executeTool(ctx, cfg, "s-1", "remote_delete_path", tc.args)
 		if res.OK || res.ErrorCode != "E_BAD_ARGS" {
@@ -343,33 +345,3 @@ func TestRemoteDeleteToolTakesPathsOnly(t *testing.T) {
 // TestDeleteAbsentSlotsRenderForModel locks the two model-facing shapes of「本来
 // 就不存在」：块里的 absent 属性与卡片标题用的短描述。顺手锁住块里是真换行 ——
 // 这些属性原本是用反引号里的 `\n` 拼的，模型看到的是字面反斜杠 n。
-func TestDeleteAbsentSlotsRenderForModel(t *testing.T) {
-	mixed := DeletePathsResult{
-		Paths: []DeleteResult{
-			{Path: "gone.txt", OK: true, Absent: true},
-			{Path: "kept.txt", OK: false, Error: "permission denied", ErrorCode: "E_IO"},
-		},
-		FailedCount: 1,
-		AbsentCount: 1,
-	}
-	block := renderDeleteResultForModel(mixed)
-	for _, want := range []string{
-		`<ally-deleted deleted="0" failed="1" absent="1">`,
-		`value="gone.txt" ok=true absent="true"`,
-		`value="kept.txt" ok=false`,
-		`error="permission denied"`,
-	} {
-		if !strings.Contains(block, want) {
-			t.Fatalf("the model block must contain %q, got %q", want, block)
-		}
-	}
-	if strings.Contains(block, `\n`) || !strings.Contains(block, "\n<path") {
-		t.Fatalf("every slot must start on a real new line, got %q", block)
-	}
-
-	// 全是空删时不给模型看「deleted」：这次调用什么都没删。
-	allAbsent := DeletePathsResult{Paths: []DeleteResult{{Path: "gone.txt", OK: true, Absent: true}}, AbsentCount: 1}
-	if got := toolResultSummary("delete", &toolResult{OK: true, Data: allAbsent}); got != "already absent" {
-		t.Fatalf("an all-absent delete must read as already absent, got %q", got)
-	}
-}

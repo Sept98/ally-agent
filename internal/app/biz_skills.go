@@ -66,7 +66,7 @@ func (a *App) ListSkills() ([]SkillDefinition, error) {
 	if err != nil {
 		return nil, err
 	}
-	return a.listSkillsForConfig(cfg)
+	return a.listSkillsForConfig(a.runtimeConfig(cfg))
 }
 
 func (a *App) listSkillsForConfig(cfg ConfigState) ([]SkillDefinition, error) {
@@ -396,7 +396,7 @@ func (a *App) handleSkillToolCall(cfg ConfigState, sessionID, skillName, skillAr
 			}, nil
 		}
 	}
-	return nil, fmt.Errorf("skill %q is disabled or not found in the current skill listing", skillName)
+	return nil, fmt.Errorf("skill %q is disabled or not found in the current skill listing; check the exact name in the Available skills section of the system prompt, and that the skill is enabled", skillName)
 }
 
 const (
@@ -456,35 +456,13 @@ func buildSkillDirTree(dir, loadedPath string) string {
 	return "<!-- skill dir tree (up to two levels, use read to read any of these) -->\n" + strings.Join(lines, "\n")
 }
 
-// renderSkillLoadedBlock builds <skill-loaded name="..." source="..." dir="..." args="...">
+// renderSkillLoadedBlock keeps metadata on one line and preserves the skill body.
 func renderSkillLoadedBlock(skillName, source, dir, args, content string) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("<skill-loaded name=\"%s\"", xmlEscape(skillName)))
-	if source != "" {
-		b.WriteString(fmt.Sprintf(" source=\"%s\"", xmlEscape(source)))
-	}
-	if dir != "" {
-		b.WriteString(fmt.Sprintf(" dir=\"%s\"", xmlEscape(dir)))
-	}
+	header := fmt.Sprintf("// skill | name=%q | source=%q | dir=%q", skillName, source, dir)
 	if args != "" {
-		b.WriteString(fmt.Sprintf(" args=\"%s\"", xmlEscape(args)))
+		header += fmt.Sprintf(" | args=%q", args)
 	}
-	b.WriteString(">\n")
-	b.WriteString(escapeClosingMarker(content, "</skill-loaded"))
-	if !strings.HasSuffix(content, "\n") {
-		b.WriteString("\n")
-	}
-	b.WriteString("</skill-loaded>")
-	return b.String()
-}
-
-func xmlEscape(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "'", "&apos;")
-	return s
+	return modelResultBody(header, content)
 }
 
 func scanSkillDir(dir string, source string, skills *[]SkillDefinition, seen, seenDirs map[string]bool) {
@@ -777,11 +755,50 @@ func (a *App) SaveSkill(draft SkillDraft) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("failed to create skill directory: %w", err)
 	}
-	if err := writeAtomicBytes(path, fileContent, 0o644); err != nil {
+	if err := writeNewSkillFile(path, fileContent); err != nil {
 		return "", fmt.Errorf("failed to write skill: %w", err)
 	}
 	a.clearSkillListCache()
 	return path, nil
+}
+
+// writeNewSkillFile publishes complete bytes without replacing an existing file.
+// A hard link is atomic; a filesystem without them falls back to an exclusive
+// create, which still refuses to overwrite.
+func writeNewSkillFile(path string, data []byte) error {
+	err := linkNewFile(path, data)
+	if err == nil || errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	return f.Close()
+}
+
+// linkNewFile writes the bytes to a temporary sibling and links it into place.
+func linkNewFile(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".skill-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err = f.Chmod(0o644); err == nil {
+		_, err = f.Write(data)
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Link(f.Name(), path)
 }
 
 // skillWriteRoot resolves the directory a new skill is written into. An empty

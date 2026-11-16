@@ -113,6 +113,8 @@ func (t reasoningTurn) empty() bool {
 // provider prompt cache. Compaction clears the ledger with the old history.
 // Responses native items can also be restored from protected model history.
 type sessionReasoningPayload struct {
+	toolResults     map[string]bool
+	toolMetadata    map[string]toolHistoryMetadata
 	turns           []reasoningTurn
 	responsesNative map[string][]json.RawMessage
 }
@@ -384,6 +386,15 @@ func (s *reasoningStash) clearSession(sessionID string) {
 // instead. An empty scope is a no-op: those keys belong to stateless callers that
 // share the default bucket, not to whoever called clear.
 func (s *reasoningStash) clearScope(scope string) {
+	s.clearScopePayloads(scope, false)
+}
+
+// Model switches and signature recovery invalidate reasoning, not tool execution.
+func (s *reasoningStash) clearReasoningScope(scope string) {
+	s.clearScopePayloads(scope, true)
+}
+
+func (s *reasoningStash) clearScopePayloads(scope string, preserveToolStatus bool) {
 	if s == nil {
 		return
 	}
@@ -395,6 +406,9 @@ func (s *reasoningStash) clearScope(scope string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key := range s.entries {
+		if preserveToolStatus && key == toolStatusScope(scope) {
+			continue
+		}
 		if strings.HasPrefix(key, prefix) {
 			delete(s.entries, key)
 		}
@@ -517,6 +531,10 @@ var (
 	jsonEmptyString = jsonStringValue("")
 	// jsonBoolFalse is the explicit false written for `store`.
 	jsonBoolFalse = json.RawMessage("false")
+	// A cleared tool_calls field serializes to one of these; compared as bytes so
+	// the check never copies the call arguments. See chatMessageHasToolCalls.
+	jsonNullBytes       = []byte("null")
+	jsonEmptyArrayBytes = []byte("[]")
 	// jsonThinkingDisabled is the stop-thinking field written for the "off" level.
 	// It is DeepSeek's documented spelling for the OpenAI wire — their sample passes
 	// `{"thinking": {"type": "disabled"}}` through extra_body, because the OpenAI
@@ -1110,8 +1128,8 @@ func chatMessageHasToolCalls(m map[string]json.RawMessage) bool {
 	if !ok {
 		return false
 	}
-	trimmed := strings.TrimSpace(string(raw))
-	return trimmed != "" && trimmed != "null" && trimmed != "[]"
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, jsonNullBytes) && !bytes.Equal(trimmed, jsonEmptyArrayBytes)
 }
 
 func chatMessageHasReasoningKey(m map[string]json.RawMessage) bool {

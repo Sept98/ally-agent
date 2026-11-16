@@ -2,6 +2,7 @@
 package desktop
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -231,6 +232,29 @@ func TestChatSearchRescansOnlyTheGrowingTail(t *testing.T) {
 	}
 }
 
+func TestChatSearchToolAppendsKeepResultsAndBudget(t *testing.T) {
+	conv := searchTranscript(searchMessage("user", "needle"))
+	a := &desktop{}
+	s := &conv.uiState().Search
+	s.Query = "needle"
+	if len(a.chatSearchMatches(conv)) != 1 {
+		t.Fatal("initial match missing")
+	}
+	for i := 0; i < 3; i++ {
+		a.applyToolEvent(conv, "tool:start", map[string]any{"toolCallId": fmt.Sprintf("tool-%d", i), "name": "read"})
+	}
+	s.lastCompute = time.Now().Add(-chatSearchRestream)
+	if len(a.chatSearchMatches(conv)) != 1 || s.scanCount != len(conv.Messages) || s.scanPrefix != len("needle") {
+		t.Fatal("tool appends lost the search cache or its byte accounting")
+	}
+	conv.Messages = append(conv.Messages, searchMessage("assistant", "needle again"))
+	invalidateChatSearch(conv)
+	s.lastCompute = time.Now().Add(-chatSearchRestream)
+	if len(a.chatSearchMatches(conv)) != 2 {
+		t.Fatal("new searchable text was missed")
+	}
+}
+
 func TestChatSearchStateWithoutQueryOrRegexp(t *testing.T) {
 	conv := searchTranscript(searchMessage("user", "hello"))
 	a := &desktop{ready: true, page: "chat", tabs: []*conversation{conv}}
@@ -255,6 +279,7 @@ func TestChatSearchHighlightsMatchedBlocks(t *testing.T) {
 	src := "plain paragraph\n\n# a needle heading\n\n```go\nneedle := 1\n```\n"
 	doc := parser.Parse(src)
 	s := &chatSearch{Open: true, Query: "needle"}
+	s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", src)), s)
 	var drawn []int
 	for i := 0; i < doc.Len(); i++ {
 		if text, spans, base, ok := chatSearchBlockSpans(doc, i, 0, s); ok {
@@ -286,12 +311,35 @@ func TestChatSearchHighlightsMatchedBlocks(t *testing.T) {
 	}
 }
 
+func TestChatSearchHighlightsMentionsAndReferences(t *testing.T) {
+	for _, query := range []string{"@alice", "#123", "needle"} {
+		t.Run(query, func(t *testing.T) {
+			src := "hello @alice, see #123 and needle"
+			doc := parser.Parse(src)
+			s := &chatSearch{Open: true, Query: query}
+			s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", src)), s)
+			for i := 0; i < doc.Len(); i++ {
+				text, spans, base, ok := chatSearchBlockSpans(doc, i, 0, s)
+				if !ok {
+					continue
+				}
+				if len(spans) != 1 || text[spans[0][0]:spans[0][1]] != query || base+spans[0][0] != strings.Index(src, query) {
+					t.Fatalf("highlight %q: text=%q spans=%v base=%d", query, text, spans, base)
+				}
+				return
+			}
+			t.Fatalf("no highlighted block for %q", query)
+		})
+	}
+}
+
 // List items and quotes hold paragraphs, so their text is marked too while the
 // list's own marker and indentation stay in place.
 func TestChatSearchHighlightsListAndQuoteText(t *testing.T) {
 	src := "- a needle item\n\n> quoted needle\n"
 	doc := parser.Parse(src)
 	s := &chatSearch{Open: true, Query: "needle"}
+	s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", src)), s)
 	marked := 0
 	for i := 0; i < doc.Len(); i++ {
 		text, spans, base, ok := chatSearchBlockSpans(doc, i, 0, s)
@@ -317,6 +365,7 @@ func TestChatSearchBlockSpansCarryTheirMessageOffset(t *testing.T) {
 	src := "intro \n\nneedle here"
 	doc := parser.Parse(src)
 	s := &chatSearch{Open: true, Query: "needle"}
+	s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", src)), s)
 	found := false
 	for i := 0; i < doc.Len(); i++ {
 		text, spans, base, ok := chatSearchBlockSpans(doc, i, 0, s)
@@ -396,6 +445,7 @@ func TestChatSearchBlockBaseSkipsTheSameSpace(t *testing.T) {
 	src := "\u00a0needle here"
 	doc := parser.Parse(src)
 	s := &chatSearch{Query: "needle"}
+	s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", src)), s)
 	for i := 0; i < doc.Len(); i++ {
 		text, spans, base, ok := chatSearchBlockSpans(doc, i, 0, s)
 		if !ok {
@@ -456,7 +506,7 @@ func TestCloseChatSearchReleasesItsCaches(t *testing.T) {
 	}
 	a.closeChatSearch(conv)
 	st := &conv.uiState().Search
-	if st.cache != nil || st.byMessage != nil || st.spanCache != nil || st.codeCache != nil {
+	if st.cache != nil || st.byMessage != nil || st.spanCache != nil || st.codeCache != nil || st.pattern != nil || st.literal != nil || st.literalPrefix != nil || st.literalStarts != nil {
 		t.Fatalf("closing kept caches: %+v", st)
 	}
 	st.Open = true
@@ -601,9 +651,8 @@ func TestChatSearchCodeLinesDeclinesWhatItCannotDraw(t *testing.T) {
 	}
 }
 
-// Past the cap on highlighted runs the block must still be drawn whole: stopping
-// the scan early would hide every line after the last marked one.
-func TestChatSearchCodeLinesKeepsLinesPastTheRunCap(t *testing.T) {
+// Beyond the highlight cap the original renderer must keep the whole block.
+func TestChatSearchCodeLinesFallsBackPastTheRunCap(t *testing.T) {
 	var src strings.Builder
 	src.WriteString("```\n")
 	for i := 0; i < chatSearchCodeMaxSpans+20; i++ {
@@ -612,24 +661,9 @@ func TestChatSearchCodeLinesKeepsLinesPastTheRunCap(t *testing.T) {
 	src.WriteString("```\n")
 	doc := parser.Parse(src.String())
 	s := &chatSearch{Open: true, Query: "a", frameDoc: doc}
-	s.cache = []chatSearchMatch{{Message: 0, Start: 4, End: 5}}
-	lines, _, spans, ok := chatSearchCodeLines(s, 0, &markdown.CodeBlockView{Index: 1})
-	if !ok {
-		t.Fatal("a block of short lines must be drawn")
-	}
-	if len(lines) != chatSearchCodeMaxSpans+20 {
-		t.Fatalf("drew %d of %d lines: the block was truncated", len(lines), chatSearchCodeMaxSpans+20)
-	}
-	count := 0
-	for _, found := range spans {
-		count += len(found)
-	}
-	if count != chatSearchCodeMaxSpans {
-		t.Fatalf("marked %d runs, want the cap %d", count, chatSearchCodeMaxSpans)
-	}
-	// The second frame of an unchanged transcript must answer from the memo.
-	if again, _, _, _ := chatSearchCodeLines(s, 0, &markdown.CodeBlockView{Index: 1}); &again[0] != &lines[0] {
-		t.Fatal("the second frame rescanned the block instead of reusing the memo")
+	s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", src.String())), s)
+	if _, _, _, ok := chatSearchCodeLines(s, 0, &markdown.CodeBlockView{Index: 1}); ok {
+		t.Fatal("a block past the highlight cap must keep its native renderer")
 	}
 }
 
@@ -734,6 +768,7 @@ func TestChatSearchBlockSpansCacheIsPerMessage(t *testing.T) {
 	s := &chatSearch{Query: "needle"}
 	first := parser.Parse("needle")
 	second := parser.Parse("needle and a longer tail")
+	s.cache = chatSearchCompute(searchTranscript(searchMessage("assistant", first.Source()), searchMessage("assistant", second.Source())), s)
 	for i := 0; i < first.Len(); i++ {
 		if _, _, _, ok := chatSearchBlockSpans(first, i, 0, s); ok {
 			break

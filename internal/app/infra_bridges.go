@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -297,7 +299,21 @@ func removeAllWithinBase(base, target string) error {
 	if !insideRoot(baseClean, targetClean) {
 		return fmt.Errorf("refusing to remove %q: it is outside %q", filepath.ToSlash(targetClean), filepath.ToSlash(baseClean))
 	}
-	return os.RemoveAll(targetClean)
+	rel, err := filepath.Rel(baseClean, targetClean)
+	if err != nil {
+		return err
+	}
+	// A lexical descendant can still escape through an intermediate symlink.
+	// Keep traversal confined by the OS, including concurrent link replacements.
+	root, err := os.OpenRoot(baseClean)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return root.RemoveAll(rel)
 }
 
 // removeTempTree deletes a tree this process created directly under the system
@@ -332,4 +348,75 @@ func atomicReplaceFile(tmp, dst string) error {
 	}
 	_ = os.Remove(backup)
 	return nil
+}
+
+// logBackgroundPanic records a crashed background task in the same error log
+// the rest of the app uses, with the stack that makes it actionable.
+func logBackgroundPanic(label string, r any, stack []byte) {
+	if globalErrorLogger != nil {
+		globalErrorLogger.Error(label+" panicked", "panic", fmt.Sprintf("%v", r), "stack", string(stack))
+		return
+	}
+	log.Printf("[error] %s panicked: %v\n%s", label, r, stack)
+}
+
+// recoverTask turns a background panic into one log line. Defer it inside the
+// goroutine it protects; the goroutine then ends instead of the process.
+func recoverTask(label string) {
+	if r := recover(); r != nil {
+		logBackgroundPanic(label, r, debug.Stack())
+	}
+}
+
+// GoSafe runs task on its own goroutine. A panic is logged instead of taking
+// the process down, so a failure in one background step cannot close the app
+// under the user's feet. Use it wherever a user action starts background work.
+//
+// When the task panics, the optional cleanup still runs before the goroutine
+// ends, so flags set before the task (busy markers, pending entries) are
+// released instead of staying stuck for the rest of the session.
+func GoSafe(label string, task func(), cleanup ...func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logBackgroundPanic(label, r, debug.Stack())
+				for _, fn := range cleanup {
+					runCleanup(fn)
+				}
+			}
+		}()
+		task()
+	}()
+}
+
+// runCleanup runs one cleanup step; a cleanup that panics must not hide the
+// original failure or take the process down.
+func runCleanup(fn func()) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			logBackgroundPanic("background cleanup", r, debug.Stack())
+		}
+	}()
+	fn()
+}
+
+// runParallel runs independent tasks concurrently and waits for all of them.
+// One task panicking is logged and does not stop the others: a failing
+// end-of-run step must not take the process down, and the caller still needs
+// the remaining steps to run.
+func runParallel(label string, tasks ...func()) {
+	var wg sync.WaitGroup
+	wg.Add(len(tasks))
+	for index, task := range tasks {
+		index, task := index, task
+		go func() {
+			defer wg.Done()
+			defer recoverTask(fmt.Sprintf("%s task %d", label, index))
+			task()
+		}()
+	}
+	wg.Wait()
 }

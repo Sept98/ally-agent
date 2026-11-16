@@ -3,6 +3,7 @@ package desktop
 
 import (
 	backend "ally-dev/internal/app"
+	"ally-dev/locales"
 	"strings"
 )
 
@@ -13,23 +14,17 @@ func (a *desktop) changePage(page string) {
 	if !a.ready {
 		return
 	}
-	// These pages are intentionally not connected to navigation yet.
-	if page == "kb" || page == "games" {
+	// Games are intentionally not connected to navigation yet.
+	if page == "games" {
 		return
 	}
 	if page != "chat" {
 		if a.page == "chat" {
 			a.resetFileExplorer()
 		}
-		a.releaseFilePreview()
+		a.hideFilePreview()
 	}
 	if a.page == "settings" && page != "settings" {
-		// A pending chord capture must not outlive the settings page: while it
-		// listens it owns the only keyboard hook, so the shortcut would look
-		// unbound until its timeout fired.
-		if a.voiceHotkeyCapturing {
-			a.finishVoiceHotkeyCapture("")
-		}
 		a.commitSettingsOnLeave()
 	}
 	if a.page == "models" && page != "models" {
@@ -38,6 +33,9 @@ func (a *desktop) changePage(page string) {
 	}
 	a.page = page
 	a.pageEpoch++
+	if page == "settings" {
+		a.beginSettings()
+	}
 	if page == "settings" && voiceInputSupported() && !a.voiceInputDevicesScanned {
 		// The scan is a COM enumeration, so it waits until someone opens the page that
 		// shows the device list instead of running on every start.
@@ -63,18 +61,16 @@ func (a *desktop) changePage(page string) {
 		return
 	}
 	epoch := a.pageEpoch
-	go func() {
-		a.win.Update(func() {
-			if a.pageEpoch != epoch {
-				return
-			}
-			a.refreshPage(page)
-		})
-	}()
+	a.win.Update(func() {
+		if a.pageEpoch != epoch {
+			return
+		}
+		a.refreshPage(page)
+	})
 }
 
 // refreshPage reloads the current page's data. It is called from the update
-// callback or from a goroutine that only publishes, never from the view.
+// callback, never from the view.
 func (a *desktop) refreshPage(page string) {
 	switch page {
 	case "settings":
@@ -117,7 +113,7 @@ func (a *desktop) saveConfig(cfg backend.ConfigState, notice ...string) {
 			if len(notice) > 0 {
 				a.notifySuccess(notice[0])
 			} else {
-				a.notifySuccess("设置已保存")
+				a.notifySuccess(locales.Text("设置已保存"))
 			}
 		})
 	}()

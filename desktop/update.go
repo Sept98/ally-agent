@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"ally-dev/locales"
 	"strings"
 	"time"
 
@@ -12,16 +13,16 @@ const updateCheckInterval = 2 * time.Hour
 
 func updateApplyLabel(goos string) string {
 	if goos == "windows" {
-		return "安装更新并退出"
+		return locales.Text("安装更新并退出")
 	}
-	return "立即重启更新"
+	return locales.Text("立即重启更新")
 }
 
 func updateReadyNote(goos string) string {
 	if goos == "windows" {
-		return "安装前保存会话、草稿与设置。安装后退出，请重新打开 Ally。"
+		return locales.Text("安装前保存会话、草稿与设置。安装后退出，请重新打开 Ally。")
 	}
-	return "安装前保存会话、草稿与设置，完成后自动重新打开 Ally。"
+	return locales.Text("安装前保存会话、草稿与设置，完成后自动重新打开 Ally。")
 }
 
 func (u *updateUI) installing() bool {
@@ -85,7 +86,7 @@ func (a *desktop) downloadUpdate(silent bool) {
 	a.upd.Progress, a.upd.BytesNow, a.upd.BytesTotal = 0, 0, 0
 	a.upd.Busy, a.upd.Silent, a.upd.Cancelling = true, silent, false
 	a.upd.RetryApply = false
-	go func() {
+	backend.GoSafe("update download", func() {
 		result := a.core.DownloadUpdate(tag)
 		a.win.Update(func() {
 			a.upd.Busy = false
@@ -99,7 +100,14 @@ func (a *desktop) downloadUpdate(silent bool) {
 			}
 			a.upd.State, a.upd.Progress, a.upd.Open = "ready", 100, true
 		})
-	}()
+	}, func() {
+		a.win.Update(func() {
+			a.upd.Busy = false
+			if a.upd.State == "downloading" {
+				a.upd.State = "idle"
+			}
+		})
+	})
 }
 
 func (a *desktop) updateFailed(message string) {
@@ -109,7 +117,7 @@ func (a *desktop) updateFailed(message string) {
 		a.upd.Open = true
 	}
 	if a.upd.Silent {
-		a.settings.UpdateNote = "更新失败：" + message
+		a.settings.UpdateNote = locales.Text("更新失败：") + message
 	}
 }
 
@@ -118,12 +126,12 @@ func (a *desktop) applyUpdate() {
 		return
 	}
 	if a.modelSaving || a.mcpF.Busy || a.sshF.Busy {
-		a.notify("配置正在保存，请稍后更新")
+		a.notify(locales.Text("配置正在保存，请稍后更新"))
 		return
 	}
 	for _, t := range a.tabs {
 		if t.AttachmentLoading || len(t.PendingAttachments) > 0 {
-			a.notify("请先发送或移除待发送附件，再安装更新")
+			a.notify(locales.Text("请先发送或移除待发送附件，再安装更新"))
 			return
 		}
 	}
@@ -142,7 +150,7 @@ func (a *desktop) applyUpdate() {
 			}
 			tag := a.upd.Tag // captured on the UI thread, never read by a worker
 			a.upd.State = "applying"
-			go func() {
+			backend.GoSafe("update apply", func() {
 				result := a.core.ApplyUpdate(tag)
 				a.win.Update(func() {
 					if !result.OK {
@@ -160,7 +168,12 @@ func (a *desktop) applyUpdate() {
 						a.quitAfterUpdate()
 					})
 				})
-			}()
+			}, func() {
+				a.win.Update(func() {
+					a.upd.State = "ready"
+					a.upd.Busy = false
+				})
+			})
 		})
 	}
 	if a.upd.Applied {
@@ -183,7 +196,7 @@ func (a *desktop) skipUpdate() {
 	}
 	tag := a.upd.Tag
 	a.upd.Busy, a.upd.Silent = true, false
-	go func() {
+	backend.GoSafe("update skip", func() {
 		result := a.core.SkipUpdate(tag)
 		a.win.Update(func() {
 			a.upd.Busy = false
@@ -195,7 +208,9 @@ func (a *desktop) skipUpdate() {
 			a.savePrefs()
 			a.upd.State, a.upd.Open = "available", false
 		})
-	}()
+	}, func() {
+		a.win.Update(func() { a.upd.Busy = false })
+	})
 }
 
 func (a *desktop) checkUpdates(silent bool) {
@@ -203,14 +218,14 @@ func (a *desktop) checkUpdates(silent bool) {
 		return
 	}
 	if !a.installedRelease() {
-		a.settings.UpdateNote = "开发构建请手动安装正式发行版"
+		a.settings.UpdateNote = locales.Text("开发构建请手动安装正式发行版")
 		return
 	}
 	a.upd.CheckBusy, a.settings.UpdateBusy = true, true
 	if !silent {
 		a.upd.State, a.upd.Open = "checking", true
 	}
-	go func() {
+	backend.GoSafe("update check", func() {
 		result := a.core.CheckForUpdates()
 		a.win.Update(func() {
 			a.upd.CheckBusy, a.settings.UpdateBusy = false, false
@@ -221,13 +236,17 @@ func (a *desktop) checkUpdates(silent bool) {
 				a.downloadUpdate(silent)
 			}
 		})
-	}()
+	}, func() {
+		a.win.Update(func() {
+			a.upd.CheckBusy, a.settings.UpdateBusy = false, false
+		})
+	})
 }
 
 // A single decision path for startup, periodic checks and the manual button.
 func (a *desktop) acceptUpdateCheck(result backend.CheckForUpdatesResult, current string, silent bool) bool {
 	if !result.OK {
-		a.settings.UpdateNote = "检查更新失败：" + result.Error
+		a.settings.UpdateNote = locales.Text("检查更新失败：") + result.Error
 		if !silent {
 			a.upd.Silent = false
 			a.updateFailed(result.Error)
@@ -236,7 +255,7 @@ func (a *desktop) acceptUpdateCheck(result backend.CheckForUpdatesResult, curren
 	}
 	if !newerStableRelease(result.Tag, current) {
 		a.upd.Tag, a.upd.State = "", "latest"
-		a.settings.UpdateNote = "已是最新版本"
+		a.settings.UpdateNote = locales.Text("已是最新版本")
 		return false
 	}
 	if a.upd.Tag != result.Tag {
@@ -244,7 +263,7 @@ func (a *desktop) acceptUpdateCheck(result backend.CheckForUpdatesResult, curren
 	}
 	a.upd.Tag, a.upd.CanAuto, a.upd.State = result.Tag, result.CanAutoUpdate, "available"
 	a.upd.Error = ""
-	a.settings.UpdateNote = "发现新版本 " + result.Tag
+	a.settings.UpdateNote = locales.Text("发现新版本 ") + result.Tag
 	skipped := result.Skipped || a.prefs.DismissedUpdateTag == result.Tag
 	if !silent {
 		a.upd.Open = true

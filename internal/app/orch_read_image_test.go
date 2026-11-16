@@ -190,13 +190,14 @@ func TestCompactReadResultOmittedDataURLFromModel(t *testing.T) {
 	if strings.Contains(compact, "data:image") {
 		t.Fatalf("model-facing read result must not carry the base64 data URL: %s", compact)
 	}
-	if !strings.Contains(compact, "sent as image input") {
+	if !strings.Contains(compact, "image=sent-as-image-input-in-following-message") {
 		t.Fatalf("model-facing read result should note the image injection: %s", compact)
 	}
 }
 
 func TestReusedReadResultClearsDataURL(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	dir := t.TempDir()
 	pngPath := filepath.Join(dir, "a.png")
 	if err := os.WriteFile(pngPath, []byte("\x89PNG\r\n\x1a\npayload"), 0o600); err != nil {
@@ -206,7 +207,7 @@ func TestReusedReadResultClearsDataURL(t *testing.T) {
 	cache := newSessionReadCache()
 
 	// First read
-	res1, err := cache.read(app, cfg, BatchReadRequest{Path: pngPath})
+	res1, err := cache.read(app, cfg, BatchReadRequest{Files: []BatchReadFileRequest{{Path: pngPath}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +216,7 @@ func TestReusedReadResultClearsDataURL(t *testing.T) {
 	}
 
 	// Second read (same content) -> reused, DataURL cleared
-	res2, err := cache.read(app, cfg, BatchReadRequest{Path: pngPath})
+	res2, err := cache.read(app, cfg, BatchReadRequest{Files: []BatchReadFileRequest{{Path: pngPath}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +230,8 @@ func TestReusedReadResultClearsDataURL(t *testing.T) {
 // hashed the text alone would call a replaced image — same name, same byte size —
 // unchanged and silently keep the new picture out of the request.
 func TestChangedImageWithIdenticalNoticeIsNotReused(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	dir := t.TempDir()
 	pngPath := filepath.Join(dir, "a.png")
 	first := []byte("\x89PNG\r\n\x1a\nAAAA")
@@ -243,7 +245,7 @@ func TestChangedImageWithIdenticalNoticeIsNotReused(t *testing.T) {
 	cfg := ConfigState{Workspace: dir}
 	cache := newSessionReadCache()
 
-	res1, err := cache.read(app, cfg, BatchReadRequest{Path: pngPath})
+	res1, err := cache.read(app, cfg, BatchReadRequest{Files: []BatchReadFileRequest{{Path: pngPath}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +256,7 @@ func TestChangedImageWithIdenticalNoticeIsNotReused(t *testing.T) {
 	if err := os.WriteFile(pngPath, second, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res2, err := cache.read(app, cfg, BatchReadRequest{Path: pngPath})
+	res2, err := cache.read(app, cfg, BatchReadRequest{Files: []BatchReadFileRequest{{Path: pngPath}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +269,8 @@ func TestChangedImageWithIdenticalNoticeIsNotReused(t *testing.T) {
 }
 
 func TestReadImageThroughExecuteTool(t *testing.T) {
-	app := NewApp()
+	t.Parallel()
+	app := newIsolatedTestApp(t)
 	dir := t.TempDir()
 	// Minimal PNG magic header is enough for detection; the tool only reads
 	// bytes, it does not decode the image.

@@ -17,6 +17,52 @@ import (
 	"testing"
 )
 
+func TestStreamArchiveFailedSymlinkPreservesDestination(t *testing.T) {
+	dest := t.TempDir()
+	target := filepath.Join(dest, "target")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "target", Typeflag: tar.TypeSymlink, Linkname: strings.Repeat("x", 8192)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnpackTarget(&archive, target, true); err == nil {
+		t.Fatal("expected oversized symlink creation to fail")
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "original" {
+		t.Fatalf("failed symlink replacement damaged original: %q, %v", got, err)
+	}
+	entries, err := os.ReadDir(dest)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("unexpected temporary files: %v, %v", entries, err)
+	}
+	if err := os.Symlink("other", filepath.Join(dest, "probe")); err != nil {
+		return // The failure-preservation check above also applies without link privileges.
+	}
+	if err := os.Remove(filepath.Join(dest, "probe")); err != nil {
+		t.Fatal(err)
+	}
+	archive.Reset()
+	tw = tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "target", Typeflag: tar.TypeSymlink, Linkname: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnpackTarget(&archive, target, true); err != nil {
+		t.Fatalf("valid link replacement failed: %v", err)
+	}
+	if got, err := os.Readlink(target); err != nil || got != "other" {
+		t.Fatalf("replacement link = %q, %v", got, err)
+	}
+}
+
 func TestStreamArchivePackAndUnpack(t *testing.T) {
 	tempDir := t.TempDir()
 	srcDir := filepath.Join(tempDir, "src")
@@ -31,7 +77,7 @@ func TestStreamArchivePackAndUnpack(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "sub", "child.txt"), []byte("child data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Create .git directory to ensure it is skipped
+	// Repository metadata is transferred with ordinary files.
 	gitDir := filepath.Join(srcDir, ".git")
 	_ = os.MkdirAll(gitDir, 0o755)
 	_ = os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main"), 0o644)
@@ -41,16 +87,16 @@ func TestStreamArchivePackAndUnpack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pack failed: %v", err)
 	}
-	if statsPack.FileCount != 2 {
-		t.Fatalf("expected 2 files packed, got %d", statsPack.FileCount)
+	if statsPack.FileCount != 3 {
+		t.Fatalf("expected 3 files packed, got %d", statsPack.FileCount)
 	}
 
 	statsUnpack, err := UnpackTarget(&buf, filepath.Join(destDir, "mybundle"), false)
 	if err != nil {
 		t.Fatalf("Unpack failed: %v", err)
 	}
-	if statsUnpack.FileCount != 2 {
-		t.Fatalf("expected 2 files unpacked, got %d", statsUnpack.FileCount)
+	if statsUnpack.FileCount != 3 {
+		t.Fatalf("expected 3 files unpacked, got %d", statsUnpack.FileCount)
 	}
 
 	// Verify unpacked files
@@ -62,10 +108,10 @@ func TestStreamArchivePackAndUnpack(t *testing.T) {
 	if err != nil || string(content2) != "child data" {
 		t.Fatalf("unexpected content for child.txt: %s, err: %v", string(content2), err)
 	}
-	// Verify .git was NOT packed/unpacked
-	if _, err := os.Stat(filepath.Join(destDir, "mybundle", ".git")); !os.IsNotExist(err) {
-		t.Fatalf(".git was expected not to exist")
+	if content, err := os.ReadFile(filepath.Join(destDir, "mybundle", ".git", "HEAD")); err != nil || string(content) != "ref: refs/heads/main" {
+		t.Fatalf("metadata round trip: %q, %v", content, err)
 	}
+
 }
 
 func TestStreamArchiveSingleFile(t *testing.T) {
@@ -121,7 +167,7 @@ func TestStreamArchiveTarSlipProtection(t *testing.T) {
 	}
 }
 
-func TestStreamArchiveVCSRejection(t *testing.T) {
+func TestStreamArchiveMetadataPaths(t *testing.T) {
 	names := []string{"sub/.git/hooks/pre-commit"}
 	if runtime.GOOS == "windows" {
 		names = append(names, "sub/.Git/hooks/pre-commit", "sub/.SVN/entries", "sub/.HG/config")
@@ -133,8 +179,12 @@ func TestStreamArchiveVCSRejection(t *testing.T) {
 			_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0o755, Size: 4, Typeflag: tar.TypeReg})
 			_, _ = tw.Write([]byte("evil"))
 			_ = tw.Close()
-			if _, err := UnpackTarget(&buf, filepath.Join(t.TempDir(), "sub"), false); err == nil {
-				t.Fatal("expected VCS path unpack to be rejected")
+			dest := t.TempDir()
+			if _, err := UnpackTarget(&buf, filepath.Join(dest, "sub"), false); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(filepath.Join(dest, filepath.FromSlash(name))); err != nil || string(data) != "evil" {
+				t.Fatalf("metadata content=%q, %v", data, err)
 			}
 		})
 	}
@@ -181,7 +231,7 @@ func TestStreamArchiveOverwrite(t *testing.T) {
 		t.Fatalf("unexpected content after overwrite: %s, %v", string(content), err)
 	}
 
-	// 4. Overwrite file with directory
+	// 4. A directory transfer must not delete an existing file to make room.
 	var dirBuf bytes.Buffer
 	dirTw := tar.NewWriter(&dirBuf)
 	dirHdr := &tar.Header{
@@ -201,22 +251,60 @@ func TestStreamArchiveOverwrite(t *testing.T) {
 	_ = dirTw.Close()
 
 	_, err = UnpackTarget(bytes.NewReader(dirBuf.Bytes()), filepath.Join(destDir, "target.txt"), true)
-	if err != nil {
-		t.Fatalf("overwrite file with directory failed: %v", err)
+	if err == nil {
+		t.Fatal("accepted replacing a file with a directory")
+	}
+	if got, err := os.ReadFile(filepath.Join(destDir, "target.txt")); err != nil || string(got) != "new content" {
+		t.Fatalf("existing file damaged: %q, %v", got, err)
+	}
+	// Prepare a fresh directory for the inverse conflict.
+	if err := os.Remove(filepath.Join(destDir, "target.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnpackTarget(bytes.NewReader(dirBuf.Bytes()), filepath.Join(destDir, "target.txt"), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. A file must never replace an existing directory, even with overwrite.
+	_, err = UnpackTarget(bytes.NewReader(tarBytes), filepath.Join(destDir, "target.txt"), true)
+	if err == nil {
+		t.Fatal("accepted replacing a directory with a file")
 	}
 	fi, err := os.Stat(filepath.Join(destDir, "target.txt"))
 	if err != nil || !fi.IsDir() {
-		t.Fatalf("expected target.txt to be a directory now: %v", err)
+		t.Fatalf("existing directory was replaced: %v", err)
 	}
+	if content, err := os.ReadFile(filepath.Join(destDir, "target.txt", "child.txt")); err != nil || string(content) != "child" {
+		t.Fatalf("existing directory contents changed: %q, %v", content, err)
+	}
+}
 
-	// 5. Overwrite directory with file
-	_, err = UnpackTarget(bytes.NewReader(tarBytes), filepath.Join(destDir, "target.txt"), true)
-	if err != nil {
-		t.Fatalf("overwrite directory with file failed: %v", err)
+func TestStreamArchiveOverwritePreservesNestedDirectory(t *testing.T) {
+	dest := t.TempDir()
+	target := filepath.Join(dest, "target")
+	metadata := filepath.Join(target, "nested", ".git", "config")
+	if err := os.MkdirAll(filepath.Dir(metadata), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	fi, err = os.Stat(filepath.Join(destDir, "target.txt"))
-	if err != nil || fi.IsDir() {
-		t.Fatalf("expected target.txt to be a file now: %v", err)
+	if err := os.WriteFile(metadata, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{Name: "target/nested", Typeflag: tar.TypeReg, Mode: 0o644, Size: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnpackTarget(&buf, target, true); err == nil {
+		t.Fatal("accepted replacing a nested directory with a file")
+	}
+	if data, err := os.ReadFile(metadata); err != nil || string(data) != "original" {
+		t.Fatalf("existing directory contents changed: %q, %v", data, err)
 	}
 }
 
@@ -423,5 +511,170 @@ func TestStreamArchivePrivateModePreserved(t *testing.T) {
 	}
 	if hdr.Mode != 0o600 {
 		t.Fatalf("private permissions broadened to %o", hdr.Mode)
+	}
+}
+
+func TestStreamArchiveWorkspaceRootRejectsOutsideParent(t *testing.T) {
+	ws, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(ws, "link")); err != nil {
+		t.Skip(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "source"), []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	var packed bytes.Buffer
+	if _, err := PackRoot(root, "link/source", "file", &packed, nil); err == nil {
+		t.Fatal("packed file outside workspace")
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "file", Typeflag: tar.TypeReg, Size: 4, Mode: 0600}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte("evil"))
+	_ = tw.Close()
+	if _, err := UnpackRoot(&archive, root, "link/new/file", true); err == nil {
+		t.Fatal("unpacked outside workspace")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new")); !os.IsNotExist(err) {
+		t.Fatalf("created outside parent: %v", err)
+	}
+}
+
+func TestStreamArchiveReadOnlyDirectory(t *testing.T) {
+	dest := t.TempDir()
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(dest, "pkg"), 0700)
+		_ = os.Chmod(filepath.Join(dest, "pkg", "sub"), 0700)
+	})
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	for _, h := range []*tar.Header{
+		{Name: "pkg", Typeflag: tar.TypeDir, Mode: 0555},
+		{Name: "pkg/sub", Typeflag: tar.TypeDir, Mode: 0500},
+		{Name: "pkg/sub/file", Typeflag: tar.TypeReg, Mode: 0600, Size: 4},
+	} {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Typeflag == tar.TypeReg {
+			_, _ = tw.Write([]byte("data"))
+		}
+	}
+	_ = tw.Close()
+	if _, err := UnpackTarget(&archive, filepath.Join(dest, "pkg"), false); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dest, "pkg", "sub", "file")); err != nil || string(data) != "data" {
+		t.Fatalf("file=%q, %v", data, err)
+	}
+	if runtime.GOOS != "windows" {
+		for path, mode := range map[string]os.FileMode{"pkg": 0555, "pkg/sub": 0500} {
+			info, err := os.Stat(filepath.Join(dest, path))
+			if err != nil || info.Mode().Perm() != mode {
+				t.Fatalf("permissions %s = %v, %v", path, info, err)
+			}
+		}
+	}
+}
+
+func TestStreamArchiveInternalParentSymlink(t *testing.T) {
+	dest := t.TempDir()
+	for _, tc := range []struct {
+		link  string
+		valid bool
+	}{{"../data", true}, {"../../outside", false}} {
+		t.Run(tc.link, func(t *testing.T) {
+			var archive bytes.Buffer
+			tw := tar.NewWriter(&archive)
+			_ = tw.WriteHeader(&tar.Header{Name: "pkg/data", Typeflag: tar.TypeReg, Mode: 0600, Size: 4})
+			_, _ = tw.Write([]byte("data"))
+			_ = tw.WriteHeader(&tar.Header{Name: "pkg/sub/link", Typeflag: tar.TypeSymlink, Linkname: tc.link})
+			_ = tw.Close()
+			_, err := UnpackTarget(&archive, filepath.Join(dest, "pkg"), true)
+			if !tc.valid {
+				if err == nil {
+					t.Fatal("accepted escaping symlink")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(filepath.Join(dest, "pkg", "sub", "link")); err != nil || string(data) != "data" {
+				t.Fatalf("link content=%q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestStreamArchiveFailedReadOnlyDirectoryRestoresMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix directory permissions")
+	}
+	dest := t.TempDir()
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dest, "pkg"), 0700) })
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "pkg", Typeflag: tar.TypeDir, Mode: 0555}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "pkg/file", Typeflag: tar.TypeReg, Mode: 0600, Size: 4096}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte("incomplete"))
+	if _, err := UnpackTarget(&archive, filepath.Join(dest, "pkg"), false); err == nil {
+		t.Fatal("accepted truncated archive")
+	}
+	if info, err := os.Stat(filepath.Join(dest, "pkg")); err != nil || info.Mode().Perm() != 0555 {
+		t.Fatalf("failed extraction directory mode: %v, %v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "pkg", "file")); !os.IsNotExist(err) {
+		t.Fatalf("published incomplete file: %v", err)
+	}
+}
+
+func TestStreamArchiveWorkspaceNestedRoundTrip(t *testing.T) {
+	ws := t.TempDir()
+	source := filepath.Join(ws, "src", "pkg", "file")
+	if err := os.MkdirAll(filepath.Dir(source), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	var archive bytes.Buffer
+	var filteredFile string
+	packed, err := PackRoot(root, "src/pkg", "renamed", &archive, func(path string, isDir bool) error {
+		if !isDir {
+			filteredFile = path
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filteredFile != source {
+		t.Fatalf("filter source=%s, want %s", filteredFile, source)
+	}
+	unpacked, err := UnpackRoot(&archive, root, filepath.Join("out", "renamed"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packed != unpacked || unpacked.FileCount != 1 {
+		t.Fatalf("statistics: packed=%+v unpacked=%+v", packed, unpacked)
+	}
+	if data, err := os.ReadFile(filepath.Join(ws, "out", "renamed", "file")); err != nil || string(data) != "content" {
+		t.Fatalf("download=%q, %v", data, err)
 	}
 }

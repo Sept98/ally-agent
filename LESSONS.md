@@ -68,7 +68,7 @@
 
 [render-small-allocations] 2026-10-30 中危 字段名表收口静态表，字段值每帧只格式化一次；累计分配不等于存活堆。@desktop/tool_resources.go
 
-[history-window] 2026-10-30 中危 页大小存 native-ui.json，默认 80、范围 20–200；分页、工具分组与跳转共用同一窗口值。@desktop/page_chat.go
+[chat-built-range] 2026-11-13 中危 帧内先重置 st.built 再让搜索揭示/提示跳转读它，它们永远当行没建，跳转卡死。@desktop/page_chat.go
 
 [tooltip-anchor-width] 2026-10-30 中危 Column 里 Text 可被拉成整行，Tooltip 按锚点定位会飘到页面中央；说明标签用 AlignSelf(Start)。@desktop/page_settings.go
 
@@ -126,7 +126,7 @@
 
 [settings-prefs-dirty] 2026-11-03 中危 设置页 dirty check 只比 ConfigState，存 prefs 的字段离开页面即丢。@desktop/page_settings.go
 
-[memory-tidy] 2026-11-04 中危 别在每帧或固定定时器里调 FreeOSMemory：STW 加缺页抖动，只在隐藏/最小化去抖后调。@desktop/memory_tidy.go
+[memory-tidy] 2026-11-04 中危 别在每帧或定时器里调 FreeOSMemory：STW 加缺页抖动；只低频用户动作触发，1 分钟节流。@desktop/memory_tidy.go
 
 [md-options-maps] 2026-11-06 高危 给会话加并列 map 只随 MD 初始化就写：新建会话已建 MD，nil map 写入首帧 panic 崩进程。@desktop/page_chat.go
 
@@ -140,3 +140,16 @@
 2026-11-07 中危 preview-reuse 换页须换 token，事件和异步命令都校验；Reset 清旧正文，否则误操作新文件。@desktop/workspace_media.go
 2026-11-07 高危 plugin-retire 异步卸载须返回 Promise；旧存储写回与安装/删除共锁并验版本，否则覆盖新数据。@desktop/pluginhost
 2026-11-07 中危 timer-dispatch Stop 撤不回已排队的 UI 回调；须验 generation，否则旧回调清掉新计时器并提前释放。@desktop/memory_tidy.go
+2026-11-07 中危 chat-wheel 滚轮缓动首帧位置未变，按贴底恢复 Follow 会取消滚动；只在实际下移到底恢复。@desktop/page_chat.go
+2026-11-07 中危 compact-outcome 裁剪重建工具卡时硬写 success 会把失败或取消伪装成成功；复用状态判定并保留结果元数据。@desktop/compact.go
+2026-11-09 中危 ui-enum-alias 下拉选项写别名或原始值而非后端规范值：编辑已有配置时字段消失、界面露出内部串。选项与判断统一用后端导出的常量。@desktop
+2026-11-11 中危 stdlib log.Printf 不进 error-*.log（GUI 无 stderr），排障易误判有记录；诊断走 logAppError。@internal/app/infra_log.go
+2026-11-12 中危 preview-copy-size 待发图只有 256px 芯片，预览拿缓存尺寸判断清晰度就永不补解码；按源解码，别放大。@desktop/image_preview.go
+2026-11-13 中危 hold-place 折叠保持位置要量元素真实 Y，滚动偏移变化不代表内容移动；st.Follow 须同步置 false。@desktop/page_chat.go
+2026-11-13 中危 follow-resume 只认滚轮意图：拖滚动条不恢复，流式增长又让滚轮永远到不了新底部；按实际下移或滚轮当时看到的底部恢复并补滚。@desktop/page_chat.go
+2026-11-13 中危 outline-children Outline 每帧问所有可见行的 children，在里读盘会预读未展开的目录；按 Open 集合驱动。@desktop/page_explorer.go
+2026-11-13 中危 outline-style Outline 行自带上下边距、8px 左距和 accent 选中填充；自绘缩进与箭头并用面板色盖住，否则整棵树变样。@desktop/page_explorer.go
+2026-11-13 中危 gui-path 访达启动的 App 只有 launchd PATH；新增工具链探测须走 lookupValidationTool，否则永远静默跳过。@orch_validation.go
+2026-11-14 中危 tool-error 报错只报目标、不给处理方式，模型就原地重试同一个调用；错误文案带编码+可执行下一步。@internal/app
+2026-11-14 中危 ask-key 问题 id 由后端补成 q1/q2，两次提问重复；控件 key 与表单状态只用问题 id 就继承上次勾选和文字，须带 askID。@desktop/page_chat.go
+2026-11-14 中危 explorer-toggle 文件树开关换了滚动列表的父级，旧像素偏移失效；须重置 Y 并按跟随回底。@desktop/page_chat.go

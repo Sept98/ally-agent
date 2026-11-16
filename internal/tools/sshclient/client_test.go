@@ -107,6 +107,42 @@ func TestSSHClientTestConnectivity(t *testing.T) {
 	}
 }
 
+func TestKeyboardInteractivePassword(t *testing.T) {
+	server := startTestServer(t, func(config *ssh.ServerConfig) {
+		config.KeyboardInteractiveCallback = func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			if _, err := challenge("notice", "welcome", nil, nil); err != nil {
+				return nil, err
+			}
+			answers, err := challenge("", "", []string{"Password: "}, []bool{false})
+			if err != nil || len(answers) != 1 || answers[0] != "secret" {
+				return nil, errors.New("bad password")
+			}
+			return nil, nil
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Test(ctx, Config{Host: "testuser@" + server.host, Port: server.port, AuthMode: AuthModePassword, Password: "secret", KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts")})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKeyboardInteractiveUnsupportedChallenge(t *testing.T) {
+	server := startTestServer(t, func(config *ssh.ServerConfig) {
+		config.KeyboardInteractiveCallback = func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			_, err := challenge("", "", []string{"Verification code: "}, []bool{false})
+			return nil, err
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Test(ctx, Config{Host: "testuser@" + server.host, Port: server.port, AuthMode: AuthModePassword, Password: "secret", KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts")})
+	if !errors.Is(err, ErrInteractiveChallenge) {
+		t.Fatalf("got %v, want unsupported interactive challenge", err)
+	}
+}
+
 func TestRunEncryptedPrivateKeyAuth(t *testing.T) {
 	clientKey := testPrivateKey(t)
 	clientSigner, err := ssh.NewSignerFromKey(clientKey)
@@ -483,7 +519,9 @@ func TestRunReportsAuthenticationTimeoutNotHandshakeFailure(t *testing.T) {
 	// 不能笼统报“握手失败”，否则会被误读成协议不兼容。
 	server := startTestServer(t, func(config *ssh.ServerConfig) {
 		config.PasswordCallback = func(_ ssh.ConnMetadata, _ []byte) (*ssh.Permissions, error) {
-			time.Sleep(5 * time.Second)
+			// 1 秒足够超过 200ms 的认证预算；写 5 秒只会让服务端的
+			// goroutine 在测试结束后还抱着连接很久。
+			time.Sleep(time.Second)
 			return nil, nil
 		}
 	})

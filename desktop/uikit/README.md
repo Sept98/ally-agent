@@ -43,7 +43,7 @@ uses the same popup with a quiet 28-DIP toolbar trigger; its locked argument pre
 opening or changing the value without dimming or moving the trigger. Tabs set
 pointer cursors on each interactive item and label.
 
-TabUnderline、TabInk、TabRadius 保留为旧接口；当前工作区标签使用 WorkspaceTab，页面内 Tabs 使用 tabs.go 的两套独立样式。
+工作区标签使用 WorkspaceTab，页面内 Tabs 使用 tabs.go 的两套独立样式。
 
 Values and focus belong to the host. Set `c.Key` before constructing dynamic
 controls. Never retain returned Elements/Parts between build passes. Attach
@@ -123,6 +123,7 @@ Use the standard inner layout; do not reimplement it to stretch the input.
 - 显隐退出期间保留稳定父容器；退出快照不能接收点击或焦点。通知使用原生 ToastViewportBase 管理生命周期。
 - 尊重系统 Preferences.ReduceMotion，原生动画 API 自动立即完成，不强制播放。
 - 复杂代码编辑器、diff 和长列表保持滚动、输入即时响应，不强制对内容重排添加高度动画。
+- 长清单或占据剩余空间的滚动区可用 `FadeReveal`：用只重绘的淡入淡出代替逐帧高度重排，关闭时立即停止交互，动效结束后释放内容；减少动态效果时立即收起。
 - 验证至少覆盖过渡中间帧、最终状态、减少动态效果，以及加载期间按钮位置／尺寸不变。
 
 回归测试：`motion_test.go`、`message_animation_test.go`、宿主的 `skill_card_layout_test.go`。
@@ -157,7 +158,31 @@ Tooltip 必须使用 `uikit.Tooltip(c, anchor, text)` 或侧栏的 `RightTooltip
 - `MenuOptions` 保留固定宽度、窗口限宽、高度上限、At/Self 对齐和间距；`MenuRow` 给自绘的 Git 状态行等内容提供同一份外观。信息面板仍用 PopoverBase，但其外观可复用 MenuPanel/MenuItemOn，不把信息列表变成可选菜单项。
 - MyGo v0.8.1 的 MenuBase 子菜单在 Esc 后离开并回到同一点时漏掉重新展开；模型菜单暂用局部 `HoverMenus` 管悬停归属，子菜单继续使用 ContextMenuBase。仅这一处使用兼容层，不修改依赖。框架修复后，经同点重入、跨供应商、最近使用、键盘选择回归再换回 SubmenuItem/Submenu。
 - HoverMenus、Element、MenuParts 和 Context 仅在当前构建使用，不能跨帧保存。模型元数据与悬停状态挂在弹出内容上，关闭即随内容释放；不保存模型凭据。
-- 系统托盘、桌宠菜单以及组件自带菜单保持现有策略，不全局切换 SetMenuPresentation。
+- Windows/macOS 托盘右键菜单用 `TrayMenu` + 按需 `NewFlyout` 自绘，保持中性浅色外观；Windows 以本次右键的鼠标位置为锚点，优先对齐菜单面板左下角（不含阴影），在鼠标所在显示器边缘翻边或避让；FitContent/DPI 尺寸变化后保持同一锚点。macOS 仍按托盘图标居中弹出并由平台避让。基础尺寸为 140 DIP 宽、28 DIP 行高、12 DIP 字号和 16 DIP 图标；显示 DPI 由平台缩放，系统大字体仍参与文字测量与 FitContent。圆角、边框、阴影只画一层，复用 ContextMenuBase 的导航与关闭。Linux AppIndicator 保留可靠系统菜单入口。左键仍唤回主窗口，不全局切换 SetMenuPresentation；桌宠菜单及组件自带菜单不变。
+
+## 可复用托盘菜单
+
+`TrayMenu` 只负责菜单外观和交互，不创建托盘或窗口，也不绑定业务动作。复制本目录到其他项目后，可这样放进透明 Flyout 的 `ui.View`：
+
+```go
+entries := []uikit.TrayMenuEntry{
+    {Key: "open", Label: "Open", Icon: openIcon},
+    {Key: "quit", Label: "Quit", Icon: quitIcon, SeparatorBefore: true},
+}
+width, height := uikit.TrayMenuInitialSize(len(entries), 1)
+// 用 width、height 创建 FitContent、Focusable 的 mygo.NewFlyout；
+// open 和窗口引用属于宿主，下面的代码在该窗口的 ui.View 内执行。
+c.SetTheme(uikit.TrayMenuTheme(fontFamily).WithPreferences(c.Preferences()))
+c.Root().Background(ui.Transparent)
+choice := uikit.TrayMenu(c.Key("tray-menu"), &open, "Application menu", entries)
+// choice >= 0 是所选 entries 下标，-1 表示没有选择。
+// 当选择或 !open 时，通过窗口 Update 延后销毁窗口并执行动作；
+// 用窗口身份和 pending 标记防止旧回调影响新窗口或重复执行。
+```
+
+最大宽度默认 `480 DIP`（不含阴影），可在最后传入 `uikit.TrayMenuOptions{MaxWidth: 640}` 调整；零值或非有限数使用默认值，正数最小为 `140 DIP`。实际宽度仍受窗口和屏幕空间限制，超长文字会省略。
+
+每项的 `Key` 必须稳定且唯一；`Icon` 可为空，`Disabled` 禁止选择，`SeparatorBefore` 在非首项前画分隔线。`TrayMenuInitialSize` 的第二个参数是实际分隔线数；真实尺寸按文字和系统字体缩放测量，Flyout 应启用 `FitContent`。菜单名由调用方提供给辅助技术。宿主负责平台定位、焦点和关闭生命周期；Windows 定位、macOS 托盘锚点及 Linux 系统菜单回退的完整接法可参考 `desktop/tray_menu*.go` 和 `desktop/tray.go`。自绘外观不等于跨平台实机验证。
 
 ## 页面 Tabs：A / C 两套样式
 
@@ -187,7 +212,7 @@ uikit.TabsWithOptions(c.Key("provider"), &state.Provider,
 
 `WorkspaceTab` 默认高 44 DIP，顶部留 6 DIP；活跃项使用 Theme.Background，与正文、左侧菜单、右侧资源管理器严格共用底色，顶部两角保留圆角，左右两侧平直并填满自身宽度、与下方衔接，底部不再外扩成弧脚，取消强调色下划线。非活跃项融入淡主题色标题栏，悬停显示圆角背景，右侧显示短分隔线。状态点和关闭按钮始终占据固定槽位，活跃项的关闭按钮常显，非活跃项在悬停或键盘焦点进入时显示；运行中的标签不可关闭。标题字重固定、底边始终预留空间，切换时文字不移动。标题只保留工作区目录名，悬停时 Tooltip 给出完整路径（运行中的标签在路径上一行标「运行中」），同名目录不会认错。页面内 Tabs 继续使用 C 紧凑分段，互不影响。
 
-Tooltip 身份绑定锚点自身的 Local 轻量标记，不用提示文字作为 identity；文字更新不得重播入场动画。提示正文 Unselectable + PassThrough，不抢锚点悬停。Painter.AnimationFrameRate 用于思考等持续装饰动画，不用 Context.Invalidate/Loop 反复重建整页。纯 reasoning token 事件只更新底部计数，不能设置 transcript FollowPending；只有可见正文增长才请求跟随滚动。
+Tooltip 身份绑定锚点自身的 Local 轻量标记，不用提示文字作为 identity；文字更新不得重播入场动画。提示正文 Unselectable + PassThrough，不抢锚点悬停。Painter.AnimationFrameRate 用于思考等持续装饰动画，不用 Context.Invalidate/Loop 反复重建整页。纯 reasoning token 事件只更新底部计数，不碰正文位置；跟随由听众滚轮意图和列表末尾决定。
 
 工作区标签宽度按名称自然测量（最小 64、最大 220 DIP），不等分剩余空间；只给溢出名称截断，短名称不占固定 100 DIP。顶栏历史菜单每次新建会话／标签，不复用已打开的同路径标签；历史项身份按完整路径区分，同名目录用 Tooltip 展示路径。菜单右边缘对齐触发按钮并向左展开，历史列表滚动，取消旧系统菜单 16 项截断。
 

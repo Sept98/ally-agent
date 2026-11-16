@@ -8,13 +8,13 @@
 
 | | 本地 | 远端 |
 |---|---|---|
-| 圈 = | 主工作区 + 本会话附加目录 + `~/.ally_agent`（兜底白名单，永远可写） | `target` 里那个目录（`别名:/绝对/路径`） |
-| 锚点由谁定 | **用户**在界面上选 | **调用方（模型）**每次声明主机、用户名、端口和根目录 |
-| 校验 | 圈外一律拒 | 只校验「绝对路径、不是 `/`」——**不校验是不是系统目录** |
+| 圈 = | 主工作区 + 本会话附加目录 + `~/.ally_agent`（兜底白名单，永远可写） | 无远端项目目录边界；文件操作使用绝对路径 |
+| 锚点由谁定 | **用户**在界面上选 | `alias` 仅选择服务器；命令通过 `cd /目录 && 命令` 选择执行目录 |
+| 校验 | 圈外一律拒 | 路径形态 + 删除保护；SSH 账号权限仍由远端执行 |
 
 - 代码：`workspaceRoots`（`orch_file_ops.go`）= 主工作区 + `ExtraRoots`；`~/.ally_agent` 由 `pathutil.InsideWriteRoot` 追加。
 - 附加目录的**当前**列表来自会话活记录（`biz_session_roots.go`：`StartChat` 播种、面板增删经 `SetSessionExtraRoots` 即时上报），run 内每个工具批次都按它重算，所以**运行中（含模型 `ask` 暂停期间）加/删当轮生效**；只靠“下次请求带新列表”会让当轮围栏一直按旧圈判（会话忙时会话索引不落盘，那条路根本带不动这个变更）。
-- `parseRemoteTarget`（`orch_remote.go`）只拒绝相对路径、`/` 本身。`resolveAndAuthorizeRemoteTarget` 对已登记节点检查当前会话工作区授权；未登记端点可直连，主机、用户名与根目录均由模型声明。
+- `parseRemoteTarget`（`orch_remote.go`）接受服务器别名、`[user@]host[:port]` 或 `ssh://user@host:port`。`resolveAndAuthorizeRemoteTarget` 对已登记节点检查请求所属本地工作区的授权，未登记端点仍按原有免密方式直连。不接受带目录的端点；文件路径必须独立传入绝对路径。
 
 **沙箱现状**：`internal/sandbox` 的 `attached = false`（三个平台都只走围栏）。因此「边界归谁管」`kernelOwnsBoundary()` 恒为 false：本地两条**靠猜写入落在哪**的检查（删除命令改道、圈外已存在目标）当前满血在岗；接回沙箱时它们让位给内核，只有「删工作区根」反过来变成由围栏说。
 
@@ -24,15 +24,15 @@
 flowchart TB
   subgraph L["本地"]
     direction TB
-    L1["写：圈内 → 软链 → VCS(两形态)"]:::core --> L2["删：圈内 → 圈根 → VCS → 数据目录 → 临时豁免 → 盘根/1级/2级 → 点名名单 → recursive"]:::ev
-    L2 --> L3["命令：六项（删圈根 / 裸删改道 / VCS 目标 / 凭据禁读 / 圈外已存在目标 / 高危语义）"]:::exec
+    L1["写：圈内 → 软链"]:::core --> L2["删：圈内 → 圈根 → 数据目录 → 临时豁免 → 盘根/1级/2级 → 点名名单 → recursive"]:::ev
+    L2 --> L3["命令：五项（删圈根 / 裸删改道 / 凭据禁读 / 圈外已存在目标 / 高危语义）"]:::exec
     L1 --> L4["读：路径解析 → 凭据 → 文档 → 二进制/大小/目录"]:::prov
   end
   subgraph R["远端"]
     direction TB
-    R1["目标解析（登记节点查工作区授权；未登记端点直连）"]:::llm --> R2["路径形态（相对、圈内绝对、禁 ..）"]:::core
-    R2 --> R3["工具特有：读≤20/budget；写 VCS+overwrite 开关；删圈根+VCS段+批内重复包含"]:::ev
-    R3 --> R4["SSH → helper（真身：根 / VCS / 名单+深度+临时豁免 / recursive / absent）"]:::risk
+    R1["目标解析（登记节点查工作区授权；未登记端点直连）"]:::llm --> R2["路径形态（仅绝对路径）"]:::core
+    R2 --> R3["工具特有：读≤20/budget；写 overwrite 开关；删文件系统根+批内重复包含"]:::ev
+    R3 --> R4["SSH → helper（真身：删除名单+深度+临时豁免 / recursive / absent）"]:::risk
   end
 ```
 
@@ -48,8 +48,8 @@ flowchart TB
 | 目标 | 结果 | 原因 |
 |---|---|---|
 | `frontend`（目录，recursive） | 允许 | 圈内、深层、不在名单 |
-| `.git` | 拒 `E_PROTECTED_PATH` | 版本控制元数据 |
-| `gh/hooks/pre-commit`（`gh` 软链到 `.git`） | 拒 `E_PROTECTED_PATH` | 解析后落进 `.git` |
+| `.git` | 允许 | 按普通目录处理，仍检查工作区范围和 recursive |
+| `gh/hooks/pre-commit`（`gh` 软链到 `.git`） | 允许 | 解析后仍须位于可写范围内 |
 | `D:\coding\go\src\ally-agent` | 拒 `E_DELETE_BLOCKED` | 圈根自己 |
 | `D:\Windows\System32\drivers` | 拒 `E_PATH_OUTSIDE` | 圈外**先**拒，轮不到深度规则 |
 | `~\.ally_agent\memories\a.md` | 允许 | 兜底白名单 + 是文件 |
@@ -71,15 +71,13 @@ flowchart TB
 | `src/x.go` 已存在、create 未给 overwrite | 拒 `E_EXISTS` | |
 | `src/x.png` 覆盖非文本文件 | 拒 `E_TEXT_OVERWRITE` | |
 | edit 用旧 version | 拒 `E_VERSION_MISMATCH` | 要重新 read |
-| `.git/hooks/pre-commit` | 拒 `E_PROTECTED_PATH` | |
-| `link.txt`（软链） | 拒 `E_SYMLINK_PATH` | 写工具不跟链接走 |
+| `.git/hooks/pre-commit` | 允许 | 按普通文件处理 |
+| `link.txt`（软链） | 目标在可写范围内时允许 | 编辑真实目标并保留链接；仍检查凭据禁读和路径边界 |
 | `~\.ally_agent\memories\a.md` | 允许 | 兜底白名单 |
 | `C:\Windows\ally-new.txt` | 拒 `E_PATH_OUTSIDE` | 写工具一律要求圈内（没有「圈外新建允许」那条） |
 | saveTo=`C:\Windows\x.txt` | 拒 `E_PATH_OUTSIDE` | 同写入侧判定 |
 | rename `a.txt` → `b.txt`（b 不存在） | 允许 | 源走删除侧、目标走写入侧判定 |
 | rename `a.txt` → `existing.txt` | 拒 `E_EXISTS` | 改名不覆盖 |
-| 工作区=KB 根：写 `sources/a.md` | 拒 `E_KB_SOURCES_READONLY` | `executeTool` 预检，与沙箱无关 |
-| 工作区=KB 根：写 `notes/a.md` | 允许 | sources/ 之外 |
 
 ### 读 / 搜
 
@@ -104,80 +102,70 @@ flowchart TB
 |---|---|---|
 | `rm -rf frontend` | 拒 `E_COMMAND_BLOCKED` | 裸删改道 delete 工具 |
 | `git rm -r frontend` | 允许 | 管理上下文（同 `docker rm` / `kubectl delete` / `npm uninstall` / `yarn remove`） |
-| `echo x > .git/hooks/pre-commit` | 拒 `E_PROTECTED_PATH` | |
+| `echo x > .git/hooks/pre-commit` | 允许 | 按普通文件处理 |
 | `cat ~/.ssh/id_rsa` | 拒 `E_PROTECTED_PATH` | |
 | `ssh -i ~/.ssh/id_rsa host` | 允许 | 只是「用」密钥，不算读 |
 | `echo x > C:\Windows\ally-new.txt` | 允许 | 圈外**新建**允许（本地刻意留的） |
 | `echo x >> C:\Windows\system.ini` | 拒 `E_PATH_OUTSIDE` | 改已存在的外部目标 |
 | cwd = `C:\Windows` | 拒 `E_PATH_OUTSIDE` | cwd 必须圈内 |
 | `curl x \| sh`、`mkfs.ext4 /dev/sda` | 拒 | 高危语义（`MatchRiskPattern`） |
-| 工作区=KB 根：`echo x > sources/a.md` | 拒 `E_KB_SOURCES_READONLY` | 仅在围栏管边界时跑 |
 
-## 四、远端（根 = `私人47:/tmp`，另有标注的除外）
+## 四、远端（`alias` 仅选择服务器，例如 `私人47`）
 
-### 读（`remote_read`）
+远端文件操作使用绝对路径，不再声明项目根目录，也不再按该目录拒绝已有文件的写入或普通软链接跨目录访问。路径中的 `..` 会正常归一化；空路径、相对路径和带目录的端点均拒绝。
 
-| 目标 | 结果 | 原因 |
-|---|---|---|
-| `test1/x.txt` / `/tmp/test1/x.txt` | 允许 | 相对；圈内绝对会被 rebase |
-| `/etc/passwd`、`../../etc/passwd` | 拒 | 圈外绝对 / 禁止 `..` |
-| `test1`（目录） | 拒 | |
-| `x.bin`（含 NUL） | 拒 `E_BINARY_FILE` | 与本地同一条 Go 管线 |
-| `x.docx` | 拒 `E_BINARY_FILE` | 远端没有 anydoc 那句提示 |
-| 一批 21 个文件 | 拒 | 上限 20；单文件 32 MiB；批合计 16 MiB，装不下排下一轮 |
-| target 改 `私人47:/root/.ssh`，读 `id_rsa` | **允许（缺口）** | 远端没有凭据清单 |
-
-### 写
+### 读写与删除
 
 | 操作 | 结果 | 原因 |
 |---|---|---|
-| 新建 `a/b.txt`（`a` 不存在） | 允许 | helper 自动建父目录 |
-| 同路径、overwrite=false | 拒 `E_EXISTS` | |
-| 同路径、overwrite=true（`remote_create_file`） | 允许，不弹审批 | 显式覆盖开关；仍校验路径与 VCS |
-| `.git/config` | 拒 `E_PROTECTED_PATH` | 字面 + 解析后两形态 |
-| 目标是目录 | 拒 `E_BAD_PATH` | create 只写文件 |
-| edit 用旧 version | 拒 `E_VERSION_MISMATCH` | **不弹审批**，版本令牌就是锁 |
-| 上传本地 `~\.ssh\id_rsa` | 拒 `E_PROTECTED_PATH` | 上传的**本地源**受凭据清单管 |
-| 上传到已存在的远端文件 | 需 overwrite=true；**不弹审批** | 显式覆盖开关 |
-
-### 删（`remote_delete_path`）
-
-| 目标 | 结果 | 原因 |
-|---|---|---|
-| `test1`（目录，recursive） | 允许（2026-10-09 起） | 「圈的一级子目录一律拒绝」已移除 |
-| `test1` 不给 recursive | 拒 | 目录必须 recursive |
-| `["test1/x.txt","test1"]` 一次 | 允许，两条都删掉（深的先删） | 重复与包含已归一为执行计划（2026-10-09 改） |
-| `["test1","test1"]` | 允许，只删一次，两个槽都报成功 | 同一身份只执行一次 |
-| `.` | 拒 `E_DELETE_BLOCKED` | 圈根 |
-| target 改 `私人47:/etc`，删 `nginx` | 拒 | `/etc/nginx` 是第 2 级目录，豁免不适用 |
-| target 改 `私人47:/var`，删 `tmp` | 拒 | `/var/tmp` 是临时根自己 |
-| `nope.txt`（不存在） | 允许（报 absent） | 不算失败，同批其它照删 |
+| 读 `/tmp/test1/x.txt` 或 `/etc/nginx/nginx.conf` | 允许 | 任意绝对路径，受远端账号权限限制 |
+| `alias=私人47`，文件路径 `test1/x.txt` | 拒 | 必须明确绝对路径 |
+| 读目录、二进制或超限文件 | 拒或提示缩小范围 | 沿用文件类型、单文件 32 MiB 和批读取预算；日志可按 tailLines 读取 |
+| 一批 21 个文件 | 拒 | 上限 20；批合计 16 MiB，装不下排下一轮 |
+| 创建 `/srv/app/a/b.txt`（父目录不存在） | 允许 | 自动创建父目录 |
+| 创建已存在文件，overwrite=false | 拒 `E_EXISTS` | 覆盖必须显式指定 overwrite=true |
+| edit 用旧 version / 写入前原文已变 | 拒 `E_VERSION_MISMATCH` | 版本与提交前完整哈希校验保留 |
+| 写 `/srv/app/.git/config` 或指向该位置的软链接 | 允许 | 仓库元数据按普通文件处理 |
+| 删除普通跨目录文件或项目目录 | 允许 | 目录须 recursive=true；保留批内去重及深的先删 |
+| 删除 `/`、`/etc/nginx`、`/var/tmp` | 拒 `E_DELETE_BLOCKED` | 文件系统根、系统二级目录和临时根保护 |
+| 删除不存在的路径 | 报 absent | 同批其他路径继续处理 |
+| 删除普通软链接 | 删除链接自身 | 不跟随删除目标，仍按目标真实路径检查独立保护 |
 
 ### 命令（`remote_run_command`）
 
+每次调用在远端登录用户家目录启动独立 shell；需要项目目录时写 `cd /srv/app && command`。`cd` 不跨调用保留，也不改变文件工具的路径基准。工具不提供 `cwd` 参数。
+
 | 命令 | 结果 | 原因 |
 |---|---|---|
-| `rm -rf test1` | 拒 `E_COMMAND_BLOCKED` | 裸删改道 |
-| `git rm -r x` | 允许 | 管理上下文 |
-| target 改 `私人47:/root`，`cat .ssh/id_rsa` | **允许（缺口）** | 远端命令没有凭据禁读 |
-| `truncate -s 0 build.log` | 允许，不弹审批 | 当前风险匹配不含 truncate；仍受路径/VCS 写入检查约束 |
-| `echo x > /etc/ally-new.conf` | 允许 | 圈外新建允许（与本地同一条） |
-| `echo x >> /etc/hosts` | 拒 `E_PATH_OUTSIDE` | 改已存在的外部目标 |
-| cwd `../../..` | 拒 | cwd 必须圈内 |
+| `cd /srv/app && go test ./...` | 允许 | 调用内自行选择目录 |
+| `echo x >> /etc/nginx/nginx.conf` | 允许 | 不再按“目录外已有目标”拒绝；仍需远端账号权限 |
+| 通过普通软链接写另一个目录 | 允许 | 无项目目录边界 |
+| 写 `.git` 元数据（含软链接） | 允许 | 不对 VCS 元数据做特殊检查 |
+| `rm -rf /srv/app/build` | 拒 `E_COMMAND_BLOCKED` | 裸删除继续改用 remote_delete_path |
+| `git rm -r x` | 沿用管理上下文规则 | 不按裸删除处理 |
+| `mkfs.ext4 /dev/sda` 等高危命令 | 拒 | 高危语义检查保留 |
+
+命令保留裸删除和高危语义检查，不再解析写目标来检查 VCS；这些检查不是远端内核沙箱。完整输出日志存放在远端家目录的 `.ally_agent/command-logs`，返回绝对路径，可直接交给同服务器的 remote_read，保留日志配额、首尾预览、超时和取消处理。
+
+### 传输（`remote_transfer`）
+
+`remotePath` 使用绝对路径；`localPath` 仍受本地工作区与凭据保护约束。远端项目目录围栏移除，解包仍限制到本次指定的传输目标，保留 Tar-Slip、归档内软链接逃逸及覆盖开关检查，防止归档夹带其他路径。`.git/.svn/.hg` 按普通目录处理，上传和下载均不跳过。
+
+上传与下载都禁止文件与目录互相替换，即使 `overwrite=true` 也会报错并保留原目标，目录也不能替换已有符号链接。向目录内传文件时必须指定完整目标文件路径；同名文件仍可覆盖，目录仍可合并。覆盖符号链接先创建临时链接，成功后才替换目标；创建失败保留原文件。远端旧版 Python 若不支持安全覆盖，会报错而不会先删除原文件。
 
 ## 五、只在一边有的
 
-- **本地独有**：凭据禁读清单（`pathutil.SensitiveReadReason`，三入口共用）、危险搜索根、Ally 数据目录保护、知识库 `sources/` 只读、内核沙箱（当前空转）、文档转换提示。
-- **远端独有**：已登记节点的工作区授权；**主机和圈都由模型声明**，未登记端点直接连接，没有首连审批。集群登记与授权仍需交互审批；覆盖只要求 `overwrite=true`，高危命令直接拒绝。
-- 两边都有：覆盖开关（不弹窗）、cwd 圈内校验、命令删除名单与管理上下文例外。
+- **本地独有**：项目工作区写入边界、凭据禁读清单（上传本地源也检查）、危险搜索根、Ally 数据目录保护、内核沙箱（当前空转）、文档转换提示。
+- **远端独有**：已登记节点按请求所属本地工作区授权；未登记原始端点保持直接连接。没有远端项目目录访问边界。
+- **两边都有**：显式覆盖开关、版本冲突校验、删除保护与管理上下文例外。
 
 ## 六、已知缺口（按风险排序）
 
-1. **远端圈不校验系统目录**。`target` 写 `私人47:/etc`、`私人47:/root/.ssh` 都算合法工作区，可写可读。本地不存在这个问题只因为圈是用户选的。可选修法：根加系统位置校验；节点登记时记允许根白名单；或审批弹窗里要求确认根路径。
+1. **远端不是目录沙箱**。远端目录边界已按产品约定移除，实际访问能力由 SSH 账号权限决定；独立保护仅检查其覆盖的行为。
 2. **远端没有凭据禁读清单**。远端 `read` / 命令读凭据都不拦（本地三个入口都拦）。
 3. **工作区节点授权不是主机级访问白名单**：只有匹配已登记别名或完整端点的连接才查授权；未登记端点不审批。将 `deploy@host` 改为未登记的 `root@host`，即可按另一身份直连（能否登录由 SSH 凭据和服务器决定）。因此不能依赖节点授权阻止模型访问任意主机或切换用户名。远端相关交互审批仅保留集群登记与工作区授权两处。
 4. **浅工作区下本地也删不掉一级子目录**：工作区是 `D:\proj` 时，删 `D:\proj\src` 会被「第 2 级目录」拒（深度规则按绝对路径算，不看它相对工作区是几级）。
-5. **凭据清单只管读**：工作区恰好是家目录时，`delete` 工具能删掉 `~/.ssh/id_rsa`（删除侧只有 VCS、Ally 数据目录、系统深度/名单三道）。
+5. **凭据清单只管读**：工作区恰好是家目录时，`delete` 工具能删掉 `~/.ssh/id_rsa`（删除侧只有 Ally 数据目录、系统深度/名单两道）。
 6. **沙箱空转**：`attached = false`，内核层不生效。接回后本地两条「猜写入位置」的检查会让位（见第二节）。
 7. **远端删除不再有任何审批替代**：`35b598b`（2026-09-24）把远端删除的确认弹窗删掉，同时加了「圈的一级子目录一律拒绝」当替代；该禁令已于 2026-10-09 移除。（此条为提交历史推断，提交信息只写了 "align tool schemas with runtime behavior"。）
 
@@ -186,7 +174,7 @@ flowchart TB
 - **Windows 上前导斜杠不是绝对路径**：`filepath.IsAbs("/tmp/x")` 为 false，于是 `/.tmp/probe`、`/tmp/test1` 这类写法会被拼到**主工作区**下（实测：删 `/.tmp/precedence-probe` 删掉的是工作区里的 `.tmp/...`）。要指真实临时目录必须写盘符路径。
 - **盘符路径不吃 `/tmp` 豁免**：`C:\tmp\proj` 规范化后虽然长成 `/tmp/proj`，但豁免循环对带盘符的路径直接跳过，于是它照样撞「第 2 级目录」。
 - **豁免只在圈内才有意义**：目标先过圈内判定，圈外路径（例：真实 `%TEMP%` 下但工作区不在那儿）在豁免之前就被 `E_PATH_OUTSIDE` 拒掉。
-- **VCS 判定要判两种形态**：字面路径干净、软链指向 `.git` 的写法只有解析后才露出来（`gh/hooks/pre-commit`）。
+- **路径边界要判两种形态**：字面路径和软链接解析后的路径都要检查；VCS 目录按普通目录处理。
 
 ## 八、改一条规则要同步的地方
 
@@ -196,10 +184,9 @@ flowchart TB
 |---|---|
 | `internal/app/orch_fence.go` | 本地命令唯一入口 `checkCommandSafetyAtCwd`、受保护位置表 `protectedLocations`、删除保护 `isDangerousDeletePath` |
 | `internal/app/orch_file_ops.go` | 写/删路径判定（`resolveWritableFilePath` / `resolveDeleteTarget` / `planDeletePath`）、批内重复与包含归一（`planDeleteExecution` / `applyDeletePlanSlots`） |
-| `internal/app/orch_kb.go` | 知识库 `sources/` 只读的路径与命令两道预检 |
-| `internal/tools/pathutil/pathutil.go` | 凭据清单、圈内判定、VCS 元数据判定、`SafeJoin` / `JoinPath` |
+| `internal/tools/pathutil/pathutil.go` | 凭据清单、圈内判定、`SafeJoin` / `JoinPath` |
 | `internal/tools/command/semantic.go` | 裸删名单 `deletionKind`、管理上下文、风险表 `MatchRiskPattern` |
-| `internal/app/orch_remote.go` 内嵌 Python helper | **远端的真身**：`check_delete_path` / `op_write` / `check_write_targets` / `do_upload`。无静态检查，改完只能靠测试跑 |
+| `internal/app/remote_helper.py`（Go 嵌入） | **远端的真身**：`check_delete_path` / `op_write` / `op_run` / `do_upload`。无静态检查，改完只能靠测试跑 |
 | `internal/tools/shared/builtins.go` | 工具声明（模型看到的规则文案） |
 | 测试 | `orch_remote_test.go`（真的跑 helper）、`builtins_test.go`（声明与行为对齐）、`orch_test.go`（删除保护规则表） |
 

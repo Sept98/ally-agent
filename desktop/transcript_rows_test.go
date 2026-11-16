@@ -2,9 +2,89 @@
 package desktop
 
 import (
+	"fmt"
 	"slices"
 	"testing"
+
+	"github.com/egoist/mygo/ui"
 )
+
+// The list builds a few rows either side of the viewport, so the handles and the
+// derived text of a long conversation stay near the size of the screen, and a
+// retired binding serves the next row instead of being registered again.
+func TestTranscriptHandlesAndCachesStayBoundToTheView(t *testing.T) {
+	conv := &conversation{ID: "pages"}
+	for i := 0; i < 300; i++ {
+		conv.Messages = append(conv.Messages,
+			map[string]any{"role": "user", "content": fmt.Sprintf("question-%d", i)},
+			map[string]any{"role": "assistant", "content": fmt.Sprintf("```go\nvar needle%d = 1\n```", i)},
+		)
+	}
+	a := &desktop{prefs: defaultPrefs(), tabs: []*conversation{conv}, page: "chat"}
+	st := conv.uiState()
+	st.Search.Open = true
+	st.Search.Query = "needle"
+	tt := ui.NewTester(func(c *ui.Context) {
+		c.SetTheme(a.theme())
+		c.DisableAnimations()
+		ui.Column(c).Fill().Children(func() { a.chatMessages(c, conv, 800) })
+	}, 800, 600)
+	seen := map[*ui.Handle]bool{}
+	for prompt := 0; prompt < 30; prompt++ {
+		st.PendingPromptIdx, st.PendingPrompt = prompt*8, true
+		viewLo, viewHi := st.built.lo, st.built.hi
+		tt.Frame()
+		if st.PendingPrompt {
+			t.Fatal("prompt navigation lost the new row's bounds")
+		}
+		// A frame prunes to what the one before it built, and may then build
+		// another place entirely: a handle stays only while one of the two shows
+		// its row.
+		within := func(index int) bool {
+			return (index >= viewLo-chatBuildMargin && index <= viewHi+chatBuildMargin) ||
+				(index >= st.built.lo-chatBuildMargin && index <= st.built.hi+chatBuildMargin)
+		}
+		for _, handles := range []map[int]*ui.Handle{st.PromptHandles, st.Search.handles} {
+			for index, handle := range handles {
+				if !within(index) {
+					t.Fatalf("a row outside the view kept a handle: %d, built %d..%d then %d..%d", index, viewLo, viewHi, st.built.lo, st.built.hi)
+				}
+				seen[handle] = true
+			}
+		}
+		for key := range st.Search.codeCache {
+			if !within(key.Message) {
+				t.Fatalf("the find bar retained a derived code block outside the view: %d", key.Message)
+			}
+		}
+		if st.Search.frameDoc != nil {
+			t.Fatal("the find bar retained a frame's Markdown document")
+		}
+	}
+	if len(seen) > 60 {
+		t.Fatalf("row bindings grew with the conversation: %d", len(seen))
+	}
+	replaceTranscript(conv, "compacted")
+	tt.Frame()
+	for _, handles := range []map[int]*ui.Handle{st.PromptHandles, st.Search.handles} {
+		for index := range handles {
+			if index >= len(conv.Messages) {
+				t.Fatalf("compaction retained row %d of %d", index, len(conv.Messages))
+			}
+		}
+	}
+	pooled := slices.Clone(st.transcriptHandlePool)
+	conv.Messages = append(conv.Messages, map[string]any{"role": "user", "content": "new question"})
+	tt.Frame()
+	if handle := st.PromptHandles[len(conv.Messages)-1]; handle == nil || !slices.Contains(pooled, handle) {
+		t.Fatal("the compacted conversation did not reuse a retired binding")
+	}
+	conv.Messages = conv.Messages[:1]
+	resetTranscriptAfterDelete(conv, 1)
+	if st.PromptHandles[1] != nil || st.Search.handles[1] != nil {
+		t.Fatal("deleting a prompt retained its navigation identity")
+	}
+}
 
 func TestToolEventsRefreshCachedRowOwnership(t *testing.T) {
 	for _, tc := range []struct {
@@ -47,6 +127,149 @@ func TestToolEventsRefreshCachedRowOwnership(t *testing.T) {
 				if got := conv.blockStarts(); !slices.Equal(got, []int{0, 1, 2}) {
 					t.Fatalf("detached child did not regain its history block: %v", got)
 				}
+			}
+		})
+	}
+}
+
+func TestHistoryAppendMatchesFullOwnershipRebuild(t *testing.T) {
+	conv := &conversation{ID: "incremental"}
+	check := func() {
+		t.Helper()
+		full := newTranscriptRows(conv)
+		want := []int{}
+		for i := range conv.Messages {
+			if full.startsBlock(i) {
+				want = append(want, i)
+			}
+		}
+		want = append(want, len(conv.Messages))
+		if got := conv.blockStarts(); !slices.Equal(got, want) {
+			t.Fatalf("history %d: page boundaries %v, full rebuild %v", len(conv.Messages), got, want)
+		}
+		got := conv.cachedTranscriptRows()
+		for i := range conv.Messages {
+			if got.kindAt(i) != full.kindAt(i) {
+				t.Fatalf("history %d: row %d changed owner", len(conv.Messages), i)
+			}
+		}
+		for id, children := range full.children {
+			if !slices.Equal(got.childrenOf(id), children) {
+				t.Fatalf("parent %s lost child order", id)
+			}
+		}
+	}
+	check() // empty sentinel must not become a duplicate first row
+	for _, m := range []map[string]any{
+		{"role": "user", "content": "question"},
+		{"role": "assistant", "content": ""},
+		{"role": "tool_call", "name": "read", "toolCallId": "read-1"},
+		{"role": "tool_call", "name": "command", "toolCallId": "command-1"},
+		{"role": "subagent", "parentToolCallId": "parent", "subId": "agent"},
+		{"role": "tool_call", "name": "subagent", "toolCallId": "parent", "result": map[string]any{"agentId": "agent"}},
+		{"role": "subagent", "subId": "agent"},
+		{"role": "tool_call", "name": "list", "toolCallId": "list-1"},
+		{"role": "tool_call", "name": "read", "toolCallId": "read-2"},
+		{"role": "assistant", "content": "done"},
+	} {
+		conv.Messages = append(conv.Messages, m)
+		check()
+	}
+	// Multiple appends may reach the ownership cache before the page index.
+	for i := 0; i < 3; i++ {
+		conv.Messages = append(conv.Messages, map[string]any{"role": "tool_call", "name": "read"})
+		_ = conv.cachedTranscriptRows()
+	}
+	check()
+	a := &desktop{}
+	a.applyToolEvent(conv, "tool:result", map[string]any{"name": "subagent", "toolCallId": "parent", "result": map[string]any{"agentId": "other"}})
+	check()
+	conv.Messages[1]["content"] = "first token"
+	conv.markHistoryAt(1)
+	check()
+	conv.Messages = conv.Messages[:4]
+	conv.resetTranscriptLookup()
+	conv.markHistory()
+	check()
+	conv.Messages = append(conv.Messages, map[string]any{"role": "assistant", "content": "after deletion"})
+	check()
+	replaceTranscript(conv, "summary")
+	check()
+}
+
+func TestAppendedSubagentParentOnlyRebuildsWhenItClaimsOldRows(t *testing.T) {
+	conv := &conversation{Messages: []map[string]any{{"role": "user", "content": "hello"}}}
+	before := conv.cachedTranscriptRows()
+	conv.Messages = append(conv.Messages,
+		map[string]any{"role": "tool_call", "name": "subagent", "toolCallId": "new"},
+		map[string]any{"role": "subagent", "parentToolCallId": "new"})
+	rows := conv.cachedTranscriptRows()
+	if rows != before || !slices.Equal(rows.childrenOf("new"), []int{2}) {
+		t.Fatal("new parent and child did not extend the existing index")
+	}
+	conv.Messages = append(conv.Messages, map[string]any{"role": "subagent", "subId": "late"})
+	rows = conv.cachedTranscriptRows()
+	conv.Messages = append(conv.Messages, map[string]any{"role": "tool_call", "name": "subagent", "toolCallId": "parent", "result": map[string]any{"agentId": "late"}})
+	got := conv.cachedTranscriptRows()
+	if got == rows || !slices.Equal(got.childrenOf("parent"), []int{3}) {
+		t.Fatal("late parent did not claim its existing child")
+	}
+}
+
+func TestRoundFootersFollowSuggestions(t *testing.T) {
+	conv := &conversation{Messages: []map[string]any{
+		{"role": "user", "content": "question"},
+		{"role": "assistant", "content": "answer"},
+		{"role": "tool_call", "name": "read"},
+		{"role": "tool_call", "name": "command"},
+		{"role": "tool_call", "name": "suggest"},
+		{"role": "user", "content": "next question"},
+		{"role": "assistant", "content": "next answer"},
+	}}
+	st := conv.uiState()
+	st.Round[1], st.Round[6] = &roundStat{Done: true}, &roundStat{Done: true}
+	rows := conv.chatRows()
+	if len(st.RoundAt) != 2 || st.RoundAt[4] != 1 || st.RoundAt[6] != 6 {
+		t.Fatalf("a round's footer did not land on its suggestion: %v", st.RoundAt)
+	}
+	for _, target := range []int{4, 6} {
+		if at := conv.rowOfMessage(target); at < 0 || rows[at].message != target {
+			t.Fatalf("no row draws the footer at %d", target)
+		}
+	}
+	conv.Messages = append(conv.Messages, map[string]any{"role": "tool_call", "name": "suggest"})
+	conv.chatRows()
+	if len(st.RoundAt) != 2 || st.RoundAt[7] != 6 {
+		t.Fatal("an appended suggestion did not move its round's footer")
+	}
+	conv.Messages = conv.Messages[:4]
+	resetTranscriptAfterDelete(conv, 4)
+	conv.chatRows()
+	if len(st.RoundAt) != 1 || st.RoundAt[1] != 1 {
+		t.Fatal("deleting suggestions retained a retired footer placement")
+	}
+}
+
+func TestHistoryRewritesInvalidateBeforeSameLengthRegrowth(t *testing.T) {
+	for _, operation := range []string{"delete", "drop preview"} {
+		t.Run(operation, func(t *testing.T) {
+			conv := &conversation{Messages: []map[string]any{
+				{"role": "user", "content": "question"},
+				{"role": "tool_call", "name": "read"},
+				{"role": "assistant", "content": "old", compactPreviewFlag: true},
+			}}
+			_ = conv.blockStarts()
+			if operation == "delete" {
+				conv.Messages = conv.Messages[:2]
+				resetTranscriptAfterDelete(conv, 2)
+			} else {
+				dropCompactPreview(conv)
+			}
+			// No UI frame between removal and another append: the length key
+			// returns to its old value, but this tool now folds into the read.
+			conv.Messages = append(conv.Messages, map[string]any{"role": "tool_call", "name": "command"})
+			if got := conv.blockStarts(); !slices.Equal(got, []int{0, 1, 3}) {
+				t.Fatalf("retired answer still opens a block: %v", got)
 			}
 		})
 	}
@@ -95,14 +318,9 @@ func TestRowOwnershipDecidesWhoDraws(t *testing.T) {
 		{13, rowSkipped, "an unknown role without content draws nothing"},
 		{14, rowPlain, "an unknown role with content still draws"},
 	} {
-		if got := rows.kindAt(tc.index, -1); got != tc.want {
+		if got := rows.kindAt(tc.index); got != tc.want {
 			t.Errorf("message %d: kind %v, want %v (%s)", tc.index, got, tc.want, tc.why)
 		}
-	}
-	// A run whose head sits before the window keeps its card on the first
-	// visible member, so paging down never hides the group.
-	if got := rows.kindAt(7, 7); got != rowReadGroup {
-		t.Errorf("window start on a follower: kind %v, want the group", got)
 	}
 }
 
@@ -111,14 +329,14 @@ func TestSubagentChildIsFoundByAgentIDToo(t *testing.T) {
 		{"role": "tool_call", "name": "subagent", "toolCallId": "call-x", "result": map[string]any{"agentId": "agent-7"}},
 		{"role": "subagent", "subId": "agent-7"},
 	}}
-	if got := newTranscriptRows(conv).kindAt(1, 0); got != rowSkipped {
+	if got := newTranscriptRows(conv).kindAt(1); got != rowSkipped {
 		t.Fatalf("child matched by agent id: kind %v, want skipped", got)
 	}
 }
 
-// A history page must never begin on a row that draws nothing, or the page
-// opens with dead space instead of content.
-func TestHistoryPagesStartOnDrawnRows(t *testing.T) {
+// Every row the transcript asks the list to build draws something: a row that
+// draws nothing would cost the list its gap for an empty band.
+func TestTranscriptRowsOnlyDraw(t *testing.T) {
 	conv := &conversation{}
 	for block := 0; block < 4; block++ {
 		conv.Messages = append(conv.Messages,
@@ -132,16 +350,12 @@ func TestHistoryPagesStartOnDrawnRows(t *testing.T) {
 		}
 	}
 	rows := newTranscriptRows(conv)
-	for size := 1; size <= 6; size++ {
-		for _, visible := range []int{0, 1, 2, 4, 9, 17} {
-			conv.uiState().VisibleStart = visible
-			start, end := historyMessageWindow(conv, size)
-			if start > 0 && rows.kindAt(start, start-1) == rowSkipped {
-				t.Fatalf("size %d visible %d: page starts on a skipped row %d", size, visible, start)
-			}
-			if end < len(conv.Messages) && rows.kindAt(end, end-1) == rowSkipped {
-				t.Fatalf("size %d visible %d: page ends on a skipped row %d", size, visible, end)
-			}
+	for _, row := range conv.chatRows() {
+		if row.message == welcomeRow {
+			continue
+		}
+		if rows.kindAt(row.message) == rowSkipped {
+			t.Fatalf("row %d draws nothing", row.message)
 		}
 	}
 }

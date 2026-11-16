@@ -132,7 +132,7 @@ func (a *App) editFiles(ctx context.Context, cfg ConfigState, files []FileTextEd
 	if err != nil {
 		return MultiEditResult{}, err
 	}
-	spec := fileMutationSpec(cfg, roots)
+	spec := fileMutationSpec(roots)
 	prepared := make([]preparedFileEdit, 0, len(plan.Files))
 	for i, filePlan := range plan.Files {
 		file := filePlan.Edit
@@ -294,16 +294,14 @@ func (a *App) executeLocalEditToolCall(ctx context.Context, cfg ConfigState, cal
 	if err := ctx.Err(); err != nil {
 		return toolErrorResult(codedToolError("E_CANCELLED", err))
 	}
+	args := prepareToolPurpose(ctx, "edit", []byte(call.Function.Arguments))
 	var file FileTextEdits
-	err, warnings := decodeToolArguments("edit", []byte(call.Function.Arguments), &file)
+	err, warnings := decodeToolArguments("edit", args, &file)
 	if toolcall.IsTruncatedArguments(call.Function.Arguments) {
 		err = codedToolError("E_TRUNCATED_ARGS", errors.New("edit arguments were truncated; resend complete parameters"))
 	}
 	if err == nil {
 		err = validateModelEditToolRequest([]FileTextEdits{file})
-	}
-	if err == nil {
-		err = kbDenyCheckPaths(ctx, cfg, file.Path)
 	}
 	if err != nil {
 		return toolErrorResult(err)

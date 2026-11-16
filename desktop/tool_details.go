@@ -3,11 +3,42 @@ package desktop
 
 import (
 	"ally-dev/desktop/uikit"
+	"ally-dev/locales"
 	"fmt"
 	"strings"
 
 	"github.com/egoist/mygo/ui"
 )
+
+// The result names the file actually written. Arguments also support opening a
+// target while create/edit is running or failed, including legacy calls.
+func toolFilePath(args, result map[string]any) string {
+	for _, source := range []map[string]any{result, args} {
+		for _, key := range []string{"path", "file_path", "file"} {
+			if path := str(source, key); strings.TrimSpace(path) != "" {
+				return path
+			}
+		}
+		for _, raw := range list(source, "files") {
+			if file, ok := raw.(map[string]any); ok {
+				if path := str(file, "path"); strings.TrimSpace(path) != "" {
+					return path
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func (a *desktop) openToolFile(t *conversation, path string) {
+	// A queued click belongs to the conversation that drew it, just like the
+	// explorer's file operations. Never resolve its path in a different workspace.
+	if t == nil || a.current() != t || a.closing || strings.TrimSpace(path) == "" {
+		return
+	}
+	a.setExplorerOpen(true)
+	a.openFile(path)
+}
 
 // attachToolImage runs on event/session ingestion, never during rendering.
 func (a *desktop) attachToolImage(t *conversation, m map[string]any) {
@@ -22,7 +53,7 @@ func (a *desktop) attachToolImage(t *conversation, m map[string]any) {
 	}
 	id := str(m, "toolCallId") + "-image"
 	if len(messageAttachmentList(m)) == 0 {
-		m["attachments"] = []any{map[string]any{"id": id, "name": map[bool]string{true: "截图", false: "生成的图片"}[name == "screenshot"], "kind": "image", "generated": name != "screenshot", "imageRef": ref, "dataUrl": url, "type": str(data, "mime")}}
+		m["attachments"] = []any{map[string]any{"id": id, "name": map[bool]string{true: locales.Text("截图"), false: locales.Text("生成的图片")}[name == "screenshot"], "kind": "image", "generated": name != "screenshot", "imageRef": ref, "dataUrl": url, "type": str(data, "mime")}}
 		// A row that only carried a tool call now draws an image: it may open a
 		// history block where it did not before.
 		t.markHistory()
@@ -80,14 +111,61 @@ func toolDeleteTree(c *ui.Context, args, result map[string]any, ink ...ui.Color)
 			// Not what the tool writes: format it rather than hide it.
 			path = fmt.Sprint(raw)
 		}
-		prefix := "├─ "
-		if n == len(rows)-1 {
-			prefix = "└─ "
-		}
-		ui.Text(c, prefix+path+suffix).Font(monoFamily).FontSize(fsTool - 2).TextColor(color.Mix(c.Theme().Text, 0.3)).FillWidth().MinWidth(0).SingleLine().Selectable()
+		toolPathTreeRow(c, n, len(rows), path+suffix, color)
 	}
 	if count := int(num(result, "failedCount")); count > 0 {
-		notice(c, "error", fmt.Sprintf("%d 个路径删除失败", count), ink...)
+		notice(c, "error", fmt.Sprintf(locales.Text("%d 个路径删除失败"), count), ink...)
+	}
+}
+
+func toolPathTreeRow(c *ui.Context, index, count int, text string, color ui.Color) {
+	prefix := "├─ "
+	if index == count-1 {
+		prefix = "└─ "
+	}
+	ui.Text(c, prefix+text).Font(monoFamily).FontSize(fsTool - 2).TextColor(color.Mix(c.Theme().Text, 0.3)).FillWidth().MinWidth(0).SingleLine().Selectable()
+}
+
+func toolReadTree(c *ui.Context, args, result map[string]any, ink ui.Color) {
+	files, missing := list(result, "files"), list(result, "missing")
+	if len(files)+len(missing) == 0 {
+		files = list(args, "files")
+	}
+	count := len(files) + len(missing)
+	if count == 0 {
+		// Older calls and summaries may describe a single file directly.
+		path := toolFilePath(args, result)
+		if path != "" {
+			text := path
+			if summary := toolGroupReadSummary(result); summary != "" {
+				text += " · " + summary
+			}
+			toolPathTreeRow(c, 0, 1, text, ink)
+		}
+		return
+	}
+	for n := 0; n < count; n++ {
+		var raw any
+		if n < len(files) {
+			raw = files[n]
+		} else {
+			raw = missing[n-len(files)]
+		}
+		file, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, color := str(file, "path"), ink
+		if reason := str(file, "error"); reason != "" {
+			text += " · " + reason
+			color = c.Theme().Danger
+		} else if n >= len(files) {
+			text += " · " + str(file, "errorCode")
+			color = c.Theme().Danger
+		} else if summary := toolGroupReadSummary(file); summary != "" {
+			text += " · " + summary
+		}
+		toolPathTreeRow(c, n, count, text, color)
 	}
 }
 
@@ -107,7 +185,7 @@ func toolAskSummary(c *ui.Context, key string, args, result map[string]any) {
 								ui.Row(c).Gap(gapInline).Children(func() {
 									ui.Text(c, "✓ "+str(selection, "label")).FontSize(fsSmall).TextColor(c.Theme().Success)
 									if boolOf(selection, "recommended") {
-										accentChip(c, "推荐")
+										accentChip(c, locales.Text("推荐"))
 									}
 								})
 							}
@@ -153,7 +231,7 @@ var resourceStatusText = map[string]string{
 
 func resourceStatus(status string) string {
 	if text, ok := resourceStatusText[strings.ToLower(strings.TrimSpace(status))]; ok {
-		return text
+		return locales.Text(text)
 	}
 	return status
 }
@@ -211,4 +289,24 @@ func (a *desktop) scheduledTaskSummary(args, result map[string]any) string {
 		return action
 	}
 	return action + " · " + name
+}
+
+func (a *desktop) serviceReadSummary(args, result map[string]any) string {
+	id := str(args, "id")
+	name := str(result, "name")
+	if name == "" {
+		for _, service := range a.services {
+			if service.ID == id {
+				name = service.Name
+				break
+			}
+		}
+	}
+	if name == "" {
+		name = id
+	}
+	if name == "" {
+		return "read"
+	}
+	return "read · " + name
 }

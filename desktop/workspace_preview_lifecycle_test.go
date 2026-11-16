@@ -29,6 +29,54 @@ func workspacePreviewTestKey(root, path string) string {
 	return workspaceKey(root) + "\x00" + path
 }
 
+func TestWorkspaceImageSwitchKeepsCommittedFrame(t *testing.T) {
+	root := t.TempDir()
+	p := &fakeWorkspacePreview{body: "decoded first frame"}
+	first := workspacePreviewTestKey(root, "first.png")
+	life := workspacePreviewLifecycle{mounted: map[string]*mountedWorkspacePreview{workspaceKey(root): {key: first, surface: p, autoplay: true}}}
+	t.Cleanup(life.release)
+	ctx, pending := life.beginLoad(root, "second.png")
+	if life.mountedFor(first) != nil || life.retainedImageFor(first) != p || p.body != "decoded first frame" || p.resets != 0 {
+		t.Fatal("image switch cleared the committed frame")
+	}
+	_, latest := life.beginLoad(root, "third.webp")
+	if ctx.Err() == nil || life.finishLoad(pending) || !life.finishLoad(latest) {
+		t.Fatal("rapid selection accepted an outdated load")
+	}
+	third := workspacePreviewTestKey(root, "third.webp")
+	if life.retainedImageFor(third) != p {
+		t.Fatal("placeholder hid the committed image before replacement")
+	}
+	if err := life.mount(third, true, func() (workspacePreviewSurface, error) {
+		t.Fatal("image switch recreated the native view")
+		return nil, nil
+	}, func(surface workspacePreviewSurface) error {
+		if p.resets != 0 || p.body != "decoded first frame" {
+			t.Fatal("mount cleared the old image before its replacement was ready")
+		}
+		surface.LoadHTML("decoded third frame")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if life.mountedFor(third) != p || p.resets != 0 || p.destroys != 0 {
+		t.Fatal("image replacement churned the surface")
+	}
+}
+
+func TestWorkspaceImageSwitchToOtherKindStopsRetainedPage(t *testing.T) {
+	root := t.TempDir()
+	p := &fakeWorkspacePreview{body: "first frame"}
+	first := workspacePreviewTestKey(root, "first.png")
+	life := workspacePreviewLifecycle{mounted: map[string]*mountedWorkspacePreview{workspaceKey(root): {key: first, surface: p, autoplay: true}}}
+	t.Cleanup(life.release)
+	life.beginLoad(root, "second.png")
+	life.beginLoad(root, "video.mp3")
+	if p.resets != 1 || p.body != "" || life.retainedImageFor(first) != nil {
+		t.Fatal("non-image selection retained an outdated image page")
+	}
+}
+
 func TestWorkspacePreviewReusesCompatibleFileKinds(t *testing.T) {
 	root := t.TempDir()
 	var life workspacePreviewLifecycle
@@ -37,7 +85,7 @@ func TestWorkspacePreviewReusesCompatibleFileKinds(t *testing.T) {
 		creates++
 		return &fakeWorkspacePreview{}, nil
 	}
-	for _, path := range []string{"one.mp4", "picture.jpg", "report.pdf", "page.html"} {
+	for _, path := range []string{"one.mp3", "picture.jpg", "report.pdf", "page.html"} {
 		_, pending := life.beginLoad(root, path)
 		life.finishLoad(pending)
 		policy := previewAutoplayAllowed(workspaceFileKindForPath(path).hasMediaPlayer())
@@ -65,7 +113,7 @@ func TestWorkspacePreviewReusesSwitchAndRefresh(t *testing.T) {
 		created = append(created, p)
 		return p, nil
 	}
-	body := "first.mp4"
+	body := "first.mp3"
 	load := func(p workspacePreviewSurface) error { p.LoadHTML(body); return nil }
 	first := workspacePreviewTestKey(root, body)
 	if err := life.mount(first, true, create, load); err != nil {
@@ -74,7 +122,7 @@ func TestWorkspacePreviewReusesSwitchAndRefresh(t *testing.T) {
 	if err := life.mount(first, true, create, load); err != nil || created[0].loads != 1 {
 		t.Fatal("unchanged file reloaded the page", err)
 	}
-	for _, path := range []string{"second.mp4", "second.mp4"} {
+	for _, path := range []string{"second.mp3", "second.mp3"} {
 		ctx, pending := life.beginLoad(root, path)
 		if len(created) != 1 || created[0].destroys != 0 || created[0].body != "" || life.mountedFor(first) != nil {
 			t.Fatal("switch did not retire content while retaining the native slot")
@@ -99,25 +147,25 @@ func TestWorkspacePreviewReusesSwitchAndRefresh(t *testing.T) {
 func TestWorkspacePreviewRapidSwitchKeepsLatestLoad(t *testing.T) {
 	root := t.TempDir()
 	p := &fakeWorkspacePreview{}
-	life := workspacePreviewLifecycle{mounted: &mountedWorkspacePreview{key: workspacePreviewTestKey(root, "first.mp4"), surface: p, autoplay: true}}
-	firstCtx, first := life.beginLoad(root, "second.mp4")
-	_, second := life.beginLoad(root, "third.mp4")
+	life := workspacePreviewLifecycle{mounted: map[string]*mountedWorkspacePreview{workspaceKey(root): {key: workspacePreviewTestKey(root, "first.mp3"), surface: p, autoplay: true}}}
+	firstCtx, first := life.beginLoad(root, "second.mp3")
+	_, second := life.beginLoad(root, "third.mp3")
 	if firstCtx.Err() == nil || life.finishLoad(first) || !life.finishLoad(second) || p.resets != 1 || p.destroys != 0 {
 		t.Fatal("rapid selection retained a stale load or churned the native slot")
 	}
 	creates := 0
-	if err := life.mount(workspacePreviewTestKey(root, "third.mp4"), true,
+	if err := life.mount(workspacePreviewTestKey(root, "third.mp3"), true,
 		func() (workspacePreviewSurface, error) { creates++; return nil, nil },
-		func(surface workspacePreviewSurface) error { surface.LoadHTML("third.mp4"); return nil }); err != nil {
+		func(surface workspacePreviewSurface) error { surface.LoadHTML("third.mp3"); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if creates != 0 || p.loads != 1 || p.body != "third.mp4" {
+	if creates != 0 || p.loads != 1 || p.body != "third.mp3" {
 		t.Fatal("latest file was not loaded into the retained slot")
 	}
 	life.release()
 }
 
-func TestWorkspacePreviewDoesNotReuseAcrossWorkspaceOrPolicy(t *testing.T) {
+func TestWorkspacePreviewSeparatesWorkspacesAndPlaybackPolicy(t *testing.T) {
 	root, other := t.TempDir(), t.TempDir()
 	var life workspacePreviewLifecycle
 	var created []*fakeWorkspacePreview
@@ -130,20 +178,20 @@ func TestWorkspacePreviewDoesNotReuseAcrossWorkspaceOrPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		root, path string
 		autoplay   bool
-	}{{root, "one.mp4", true}, {other, "two.mp4", true}, {other, "page.html", false}} {
+	}{{root, "one.mp3", true}, {other, "two.mp3", true}, {other, "page.html", false}} {
 		if err := life.mount(workspacePreviewTestKey(tc.root, tc.path), tc.autoplay, create, load); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if len(created) != 3 || created[0].destroys != 1 || created[1].destroys != 1 || created[2].destroys != 0 {
+	if len(created) != 3 || created[0].destroys != 0 || created[1].destroys != 1 || created[2].destroys != 0 {
 		t.Fatal("preview reused a different workspace or immutable playback policy")
 	}
 	life.releaseWorkspace(root)
-	if created[2].destroys != 0 {
-		t.Fatal("releasing another workspace destroyed the active preview")
+	if created[0].destroys != 1 || created[2].destroys != 0 {
+		t.Fatal("workspace close did not isolate its preview")
 	}
 	life.releaseWorkspace(other)
-	if created[2].destroys != 1 || life.mounted != nil {
+	if created[2].destroys != 1 || len(life.mounted) != 0 {
 		t.Fatal("active workspace release retained its preview")
 	}
 }
@@ -151,12 +199,12 @@ func TestWorkspacePreviewDoesNotReuseAcrossWorkspaceOrPolicy(t *testing.T) {
 func TestWorkspacePreviewLoadFailureReleasesReusedSlot(t *testing.T) {
 	root := t.TempDir()
 	p := &fakeWorkspacePreview{}
-	life := workspacePreviewLifecycle{mounted: &mountedWorkspacePreview{key: workspacePreviewTestKey(root, "one.mp4"), surface: p, autoplay: true}}
+	life := workspacePreviewLifecycle{mounted: map[string]*mountedWorkspacePreview{workspaceKey(root): {key: workspacePreviewTestKey(root, "one.mp3"), surface: p, autoplay: true}}}
 	failure := errors.New("invalid preview")
-	err := life.mount(workspacePreviewTestKey(root, "two.mp4"), true,
+	err := life.mount(workspacePreviewTestKey(root, "two.mp3"), true,
 		func() (workspacePreviewSurface, error) { t.Fatal("recreated compatible view"); return nil, nil },
 		func(workspacePreviewSurface) error { return failure })
-	if !errors.Is(err, failure) || p.destroys != 1 || life.mounted != nil {
+	if !errors.Is(err, failure) || p.destroys != 1 || len(life.mounted) != 0 {
 		t.Fatal("failed replacement retained its native view")
 	}
 }
@@ -167,7 +215,7 @@ func TestWorkspacePreviewQueuedCreationCannotReviveAfterRelease(t *testing.T) {
 		updates := make(chan func(), 1)
 		creates := 0
 		visible := true
-		life.schedule(func(fn func()) { updates <- fn }, "workspace\x00file.mp4", true,
+		life.schedule(func(fn func()) { updates <- fn }, "workspace\x00file.mp3", true,
 			func() bool { return visible },
 			func() (workspacePreviewSurface, error) { creates++; return &fakeWorkspacePreview{}, nil },
 			func(workspacePreviewSurface) error { return nil },
@@ -191,23 +239,27 @@ func TestWorkspacePreviewQueuedCreationCannotReviveAfterRelease(t *testing.T) {
 	}
 }
 
-func TestHiddenPreviewGraceStopsContentThenReleasesSlots(t *testing.T) {
+func TestHiddenWindowKeepsPreviewPagesUntilExplicitClose(t *testing.T) {
 	root := t.TempDir()
 	fileView := &fakeWorkspacePreview{body: "playing video"}
 	chartView := &fakePreviewSurface{}
 	a := &desktop{tabs: []*conversation{{Workspace: root}}}
-	a.media.playing, a.media.autoplay = true, true
-	a.workspacePreview.mounted = &mountedWorkspacePreview{key: workspacePreviewTestKey(root, "one.mp4"), surface: fileView, autoplay: true}
+	media := a.workspaceMedia()
+	media.playing, media.autoplay = true, true
+	key := workspacePreviewTestKey(root, "one.mp3")
+	a.workspacePreview.mounted = map[string]*mountedWorkspacePreview{workspaceKey(root): {key: key, surface: fileView, autoplay: true}}
 	a.previews.entries = map[string]*previewEntry{"chart": {request: previewRequest{Key: "chart"}, surface: chartView}}
-	a.releaseHiddenWindowResources()
-	if fileView.resets != 1 || fileView.body != "" || fileView.destroys != 0 || chartView.destroys != 0 || a.media.playing || a.media.autoplay {
-		t.Fatal("quick hide did not stop content while retaining bounded native slots")
+	for i := 0; i < 2; i++ {
+		a.hideFilePreview() // The minimize handler uses the same operation.
+		a.releaseHiddenWindowResources()
+		if fileView.resets != 0 || fileView.body != "playing video" || fileView.destroys != 0 || chartView.destroys != 0 || !media.playing || !media.autoplay || a.workspacePreview.mountedFor(key) != fileView {
+			t.Fatal("hide/minimize retired a preview page or playback state")
+		}
 	}
-	// These are the native cleanup operations run once the grace period expires.
 	a.releaseAllHTMLPreviews()
-	a.releaseFilePreview()
-	if fileView.destroys != 1 || chartView.destroys != 1 || a.workspacePreview.mounted != nil || len(a.previews.entries) != 0 {
-		t.Fatal("hidden-window cleanup retained native slots")
+	a.releaseAllFilePreviews()
+	if fileView.destroys != 1 || chartView.destroys != 1 || len(a.workspacePreview.mounted) != 0 || len(a.previews.entries) != 0 || len(a.mediaPlayback) != 0 {
+		t.Fatal("explicit cleanup retained preview resources")
 	}
 }
 

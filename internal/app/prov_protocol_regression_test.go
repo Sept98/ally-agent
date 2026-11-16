@@ -37,7 +37,7 @@ func nativeReply(output []json.RawMessage) string {
 
 func TestResponsesNativeReplayAndProtectedRestart(t *testing.T) {
 	t.Parallel()
-	a := newApiTestApp(t)
+	a := newIsolatedChatTestApp(t)
 	block, _ := aes.NewCipher(make([]byte, 32))
 	gcm, _ := cipher.NewGCM(block)
 	protector := oauthTestProtector{gcm}
@@ -122,12 +122,12 @@ func TestResponsesNativeReplayAndProtectedRestart(t *testing.T) {
 	if json.Unmarshal(raw, &legacy) != nil || legacy[2].Content != toolResultPlaceholder {
 		t.Fatal("legacy history compatibility lost")
 	}
-	b := newApiTestApp(t)
+	b := newIsolatedChatTestApp(t)
 	b.historiesDir = a.historiesDir
 	b.modelHistoryCodec = &modelHistoryCodec{protector: protector}
 	restored, _, _ := b.sessionHistorySnapshot(sid)
-	if restored[2].Content != "private-tool-result-sentinel" {
-		t.Fatal("model tool evidence lost on restart")
+	if restored[2].Content != toolResultPlaceholder {
+		t.Fatal("restart resurrected transient tool output")
 	}
 	_, input := buildOpenAIResponsesInput(restored, b.reasoningStash.get(reasoningReplayKey(cfg, cfg.Model)))
 	encoded, _ := json.Marshal(input)
@@ -168,6 +168,7 @@ func TestResponsesNativeReplayAndProtectedRestart(t *testing.T) {
 }
 
 func TestResponsesTerminalDoesNotWaitForConnection(t *testing.T) {
+	t.Parallel()
 	for _, auth := range []string{"", authChatGPTOAuth} {
 		t.Run(auth, func(t *testing.T) {
 			reader, writer := io.Pipe()
@@ -199,7 +200,7 @@ func TestSubagentDoesNotMultiplyAdapterRetries(t *testing.T) {
 	t.Parallel()
 	for _, format := range []string{apiFormatOpenAIChat, apiFormatOpenAIResponses} {
 		t.Run(format, func(t *testing.T) {
-			a := newApiTestApp(t)
+			a := newIsolatedChatTestApp(t)
 			var count atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				count.Add(1)
@@ -231,6 +232,7 @@ func (tr protocolTailTransport) RoundTrip(req *http.Request) (*http.Response, er
 }
 
 func TestChatKeepsTrailingUsageAndCompletedTransportErrors(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, tail string
 		err        error
@@ -264,6 +266,7 @@ func TestChatKeepsTrailingUsageAndCompletedTransportErrors(t *testing.T) {
 }
 
 func TestRetryModelTurnOnlyOwnsInterruptedOrEmptyResponses(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		err           error
 		emitted, want bool
@@ -281,6 +284,7 @@ func TestRetryModelTurnOnlyOwnsInterruptedOrEmptyResponses(t *testing.T) {
 }
 
 func TestChatRemembersExplicitStreamOptionsRejection(t *testing.T) {
+	t.Parallel()
 	var requests, rejected atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -312,6 +316,7 @@ func TestChatRemembersExplicitStreamOptionsRejection(t *testing.T) {
 }
 
 func TestResponsesRepeatedAnswersKeepTheirOwnPhase(t *testing.T) {
+	t.Parallel()
 	cfg := protocolConfig("https://mock.invalid/v1", apiFormatOpenAIResponses)
 	a := &App{reasoningStash: newReasoningStash()}
 	var history []openai.ChatCompletionMessage
@@ -331,6 +336,7 @@ func TestResponsesRepeatedAnswersKeepTheirOwnPhase(t *testing.T) {
 }
 
 func TestRunUsageIncludesNestedAndFailedTerminalRequests(t *testing.T) {
+	t.Parallel()
 	ctx := withModelRunUsage(context.Background())
 	child := withModelRunUsage(ctx)
 	if ctx.Value(modelRunUsageKey{}) != child.Value(modelRunUsageKey{}) {
@@ -357,6 +363,7 @@ func TestRunUsageIncludesNestedAndFailedTerminalRequests(t *testing.T) {
 }
 
 func TestChatCacheMissIncludesCompletelyUncachedRequests(t *testing.T) {
+	t.Parallel()
 	var records []statsRecord
 	for _, hit := range []int{80, 0} {
 		usage := modelUsageFromLegacy(&openai.Usage{
@@ -374,7 +381,7 @@ func TestAnthropicFailedAttemptsKeepUsage(t *testing.T) {
 	t.Parallel()
 	for _, retry := range []bool{false, true} {
 		t.Run(fmt.Sprint("retry=", retry), func(t *testing.T) {
-			a := newApiTestApp(t)
+			a := newIsolatedChatTestApp(t)
 			var requests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				attempt := requests.Add(1)
@@ -420,6 +427,7 @@ func TestAnthropicFailedAttemptsKeepUsage(t *testing.T) {
 }
 
 func TestResponsesIncompleteIsNotACompleteNativeTurn(t *testing.T) {
+	t.Parallel()
 	cfg := protocolConfig("https://mock.invalid/v1", apiFormatOpenAIResponses)
 	a := &App{reasoningStash: newReasoningStash()}
 	r, _, err := a.consumeOpenAIResponsesStream(cfg, buildOpenAIResponsesRequest(cfg, cfg.Model, nil, nil, nil), auditStream(`data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}`+"\n\n", true), nil)
@@ -443,7 +451,7 @@ func (unavailableHistoryProtector) Open([]byte) ([]byte, error) {
 
 func TestProtectedHistoryFailureFallsBackWithoutPlaintextState(t *testing.T) {
 	t.Parallel()
-	a := newApiTestApp(t)
+	a := newIsolatedChatTestApp(t)
 	a.modelHistoryCodec = &modelHistoryCodec{protector: unavailableHistoryProtector{}}
 	cfg := protocolConfig("https://mock.invalid/v1", apiFormatOpenAIResponses)
 	history := []openai.ChatCompletionMessage{{Role: "user", Content: "task"}, {Role: "assistant", Content: "done"}}
@@ -463,6 +471,7 @@ func TestProtectedHistoryFailureFallsBackWithoutPlaintextState(t *testing.T) {
 }
 
 func TestResponsesOutputCaptureOrdersCompletionEventsAndHandlesReusedIndex(t *testing.T) {
+	t.Parallel()
 	var capture responsesOutputCapture
 	for _, raw := range []string{
 		`{"output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"one"}}`,
@@ -487,6 +496,7 @@ func TestResponsesOutputCaptureOrdersCompletionEventsAndHandlesReusedIndex(t *te
 }
 
 func TestResponsesInterruptedBeforeTerminalCannotBecomeReplayState(t *testing.T) {
+	t.Parallel()
 	cfg := protocolConfig("https://mock.invalid/v1", apiFormatOpenAIResponses)
 	a := &App{reasoningStash: newReasoningStash()}
 	r, _, err := a.consumeOpenAIResponsesStream(cfg, buildOpenAIResponsesRequest(cfg, cfg.Model, nil, nil, nil), auditStream(`data: {"type":"response.output_text.delta","delta":"unfinished"}`+"\n\n", true), nil)
@@ -507,7 +517,7 @@ func TestResponsesCallIDsIndependentOfNativeReplay(t *testing.T) {
 		{"legacy-ledger", "response.completed", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := newApiTestApp(t)
+			a := newIsolatedChatTestApp(t)
 			items := []json.RawMessage{
 				json.RawMessage(`{"type":"reasoning","id":"rs_duplicate","encrypted_content":"opaque","summary":[]}`),
 				json.RawMessage(`{"type":"function_call","id":"fc_a","call_id":"shared","name":"read","arguments":"{}"}`),
@@ -569,9 +579,9 @@ func TestResponsesCallIDsIndependentOfNativeReplay(t *testing.T) {
 	}
 }
 
-func TestProtectedHistoryOmitsImagesButKeepsToolEvidence(t *testing.T) {
+func TestProtectedHistoryOmitsImagesAndTransientToolResults(t *testing.T) {
 	t.Parallel()
-	a := newApiTestApp(t)
+	a := newIsolatedChatTestApp(t)
 	block, _ := aes.NewCipher(make([]byte, 32))
 	gcm, _ := cipher.NewGCM(block)
 	a.modelHistoryCodec = &modelHistoryCodec{protector: oauthTestProtector{gcm}}
@@ -586,6 +596,7 @@ func TestProtectedHistoryOmitsImagesButKeepsToolEvidence(t *testing.T) {
 		{Role: "tool", ToolCallID: call.ID, Content: "real private tool evidence"},
 	}
 	a.captureResponsesOutput(cfg, cfg.Model, history[:1], &modelStreamResult{StopReason: "stop", ToolCalls: []openai.ToolCall{call}, responsesOutput: []json.RawMessage{json.RawMessage(`{"type":"function_call","id":"fc_image","call_id":"call_image","name":"read","arguments":"{}"}`)}})
+	a.reasoningStash.recordToolStatus(openAIResponsesPromptCacheKey("protocol-session"), history[2], toolResult{OK: false})
 	disk := sanitizeHistoryMessagesForDisk(history)
 	raw, err := json.Marshal(a.modelHistoryForStorage("protocol-session", disk, history))
 	if err != nil {
@@ -595,8 +606,13 @@ func TestProtectedHistoryOmitsImagesButKeepsToolEvidence(t *testing.T) {
 		t.Fatal("image caused protected history fallback")
 	}
 	restored, publish := a.modelHistoryFromStorage("protocol-session", raw, disk)
-	if publish == nil || len(restored) != 3 || restored[2].Content != history[2].Content {
-		t.Fatal("tool evidence or replay lost")
+	if publish == nil || len(restored) != 3 || restored[2].Content != toolResultPlaceholder || restored[2].ToolCallID != call.ID {
+		t.Fatal("tool pairing/replay lost or transient output persisted")
+	}
+	a.reasoningStash.clearSession("protocol-session")
+	publish()
+	if !a.reasoningStash.toolStatuses(openAIResponsesPromptCacheKey("protocol-session"))[toolStatusIdentity(restored[2])] {
+		t.Fatal("tool failure status was lost alongside protected replay state")
 	}
 	if len(restored[0].MultiContent) != 0 || !strings.Contains(restored[0].Content, "image attachment(s) omitted") {
 		t.Fatal("image payload persisted")
@@ -606,9 +622,137 @@ func TestProtectedHistoryOmitsImagesButKeepsToolEvidence(t *testing.T) {
 	}
 }
 
+func TestProtectedRestartFiltersLegacyObservationsWithoutLosingPairing(t *testing.T) {
+	t.Parallel()
+	a := newIsolatedChatTestApp(t)
+	block, _ := aes.NewCipher(make([]byte, 32))
+	gcm, _ := cipher.NewGCM(block)
+	protector := oauthTestProtector{gcm}
+	a.modelHistoryCodec = &modelHistoryCodec{protector: protector}
+	names := []string{"read", "remote_read", "batch_read", "grep", "Glob", "list_files", "Bash", "command", "remote_run_command", "edit", "plan", "mcp__example"}
+	history := []openai.ChatCompletionMessage{{Role: "user", Content: "task"}}
+	for i, name := range names {
+		id := fmt.Sprint("call-", i)
+		history = append(history, openai.ChatCompletionMessage{Role: "assistant", ReasoningContent: "reasoning", ToolCalls: []openai.ToolCall{{ID: id, Type: "function", Function: openai.FunctionCall{Name: name, Arguments: `{"path":"main.go"}`}}}}, openai.ChatCompletionMessage{Role: "tool", ToolCallID: id, Content: fmt.Sprint("raw-observation-", i)})
+	}
+	// A reused call ID must be classified at its own chronological call, not
+	// by a later call's tool name elsewhere in the same saved history.
+	history = append(history, openai.ChatCompletionMessage{Role: "assistant", ToolCalls: []openai.ToolCall{{ID: "call-0", Type: "function", Function: openai.FunctionCall{Name: "plan", Arguments: "{}"}}}}, openai.ChatCompletionMessage{Role: "tool", ToolCallID: "call-0", Content: "latest plan"})
+	disk := sanitizeHistoryMessagesForDisk(history)
+	// Simulate the previous protected format, which still stored raw results.
+	state := protectedModelState{Version: 1, Session: "legacy", DiskHash: modelHistoryHash(disk), History: history}
+	plain, _ := json.Marshal(state)
+	sealed, err := protector.Seal(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(disk)
+	var rows []map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &rows)
+	rows[0][protectedModelStateField], _ = json.Marshal(sealed)
+	raw, _ = json.Marshal(rows)
+	restored, publish := a.modelHistoryFromStorage("legacy", raw, disk)
+	if publish == nil || len(restored) != len(history) {
+		t.Fatal("protected state rejected or message structure changed")
+	}
+	for i, name := range names {
+		call, result := restored[i*2+1], restored[i*2+2]
+		if len(call.ToolCalls) != 1 || call.ToolCalls[0].ID != result.ToolCallID || call.ToolCalls[0].Function.Arguments != history[i*2+1].ToolCalls[0].Function.Arguments || call.ReasoningContent != "reasoning" {
+			t.Fatal("tool pairing, arguments or reasoning lost")
+		}
+		want := history[i*2+2].Content
+		if i < 9 {
+			want = toolResultPlaceholder
+		}
+		if result.Content != want {
+			t.Fatalf("%s result=%q", name, result.Content)
+		}
+		if history[i*2+2].Content == toolResultPlaceholder {
+			t.Fatal("in-memory evidence modified")
+		}
+	}
+	if restored[len(restored)-1].Content != "latest plan" {
+		t.Fatal("later non-transient result lost")
+	}
+	// Each protocol keeps one non-empty result for every retained call.
+	chatJSON, err := json.Marshal(openai.ChatCompletionRequest{Model: "test", Messages: restored})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat struct {
+		Messages []openai.ChatCompletionMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(chatJSON, &chat); err != nil {
+		t.Fatal(err)
+	}
+	results := 0
+	for _, m := range chat.Messages {
+		if m.Role == "tool" && m.ToolCallID != "" && m.Content != "" {
+			results++
+		}
+	}
+	if results != len(names)+1 {
+		t.Fatalf("Chat result pairing changed: %d", results)
+	}
+	_, input := buildOpenAIResponsesInput(restored, nil)
+	results = 0
+	for _, raw := range input {
+		if item, ok := raw.(openai.ResponseFunctionCallOutput); ok && item.Type == "function_call_output" && item.CallID != "" && item.Output != "" {
+			results++
+		}
+	}
+	if results != len(names)+1 {
+		t.Fatalf("Responses result pairing changed: %d", results)
+	}
+	_, anthropicMessages := buildAnthropicMessages(restored, nil, false)
+	results = 0
+	for _, m := range anthropicMessages {
+		for _, block := range m.Content {
+			if block.OfToolResult != nil && block.OfToolResult.ToolUseID != "" && len(block.OfToolResult.Content) > 0 {
+				results++
+			}
+		}
+	}
+	if results != len(names)+1 {
+		t.Fatalf("Anthropic result pairing changed: %d", results)
+	}
+}
+
+func TestProtectedHistoryClassifiesRepeatedIDsByDeclarationOrder(t *testing.T) {
+	t.Parallel()
+	for _, names := range [][]string{{"read", "plan"}, {"plan", "read"}} {
+		history := []openai.ChatCompletionMessage{{Role: "user", Content: "task"}, {Role: "assistant", ToolCalls: []openai.ToolCall{
+			{ID: "same", Type: "function", Function: openai.FunctionCall{Name: names[0], Arguments: "{}"}},
+			{ID: "same", Type: "function", Function: openai.FunctionCall{Name: names[1], Arguments: "{}"}},
+		}}, {Role: "tool", ToolCallID: "same", Content: "first result"}, {Role: "tool", ToolCallID: "same", Content: "second result"}}
+		protected := sanitizeHistoryMessagesFor(history, historyProfileProtected)
+		if len(protected) != len(history) || len(protected[1].ToolCalls) != 2 {
+			t.Fatal("paired repeated IDs changed")
+		}
+		for i, name := range names {
+			want := history[i+2].Content
+			if name == "read" {
+				want = toolResultPlaceholder
+			}
+			if protected[i+2].Content != want {
+				t.Fatalf("%v result %d misclassified: %q", names, i, protected[i+2].Content)
+			}
+		}
+	}
+	// Filtered empty messages do not close the preceding tool turn during
+	// pairing repair, and must not erase its persistence classification either.
+	history := []openai.ChatCompletionMessage{{Role: "user", Content: "task"}, {Role: "assistant", ToolCalls: []openai.ToolCall{
+		{ID: "read", Type: "function", Function: openai.FunctionCall{Name: "read", Arguments: "{}"}},
+	}}, {Role: "assistant"}, {Role: "user"}, {Role: "tool", ToolCallID: "read", Content: "raw result"}}
+	protected := sanitizeHistoryMessagesFor(history, historyProfileProtected)
+	if len(protected) != 3 || protected[2].Content != toolResultPlaceholder {
+		t.Fatal("filtered empty messages lost the read result classification")
+	}
+}
+
 func TestResponsesSparseOutputIndexesDoNotDuplicateCalls(t *testing.T) {
 	t.Parallel()
-	a := newApiTestApp(t)
+	a := newIsolatedChatTestApp(t)
 	cfg := protocolConfig("https://mock.invalid", apiFormatOpenAIResponses)
 	wire := ""
 	for _, event := range []string{
@@ -644,7 +788,7 @@ func TestProtectedReplayRebasesOnlyUnchangedTurns(t *testing.T) {
 		{"truncated-arguments", openai.ChatCompletionMessage{Role: "assistant", Content: "same", ToolCalls: []openai.ToolCall{call("read", `{"path":`)}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := newApiTestApp(t)
+			a := newIsolatedChatTestApp(t)
 			block, _ := aes.NewCipher(make([]byte, 32))
 			gcm, _ := cipher.NewGCM(block)
 			protector := oauthTestProtector{gcm}
@@ -678,7 +822,7 @@ func TestProtectedReplayRebasesOnlyUnchangedTurns(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			b := newApiTestApp(t)
+			b := newIsolatedChatTestApp(t)
 			b.modelHistoryCodec = &modelHistoryCodec{protector: protector}
 			restored, publish := b.modelHistoryFromStorage("protocol-session", raw, disk)
 			if publish == nil {

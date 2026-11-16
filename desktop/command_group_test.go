@@ -26,7 +26,7 @@ func TestLocalCommandGroupPreservesCardsOnExpansion(t *testing.T) {
 				}
 			})
 		}, 700, 700)
-		title := fmt.Sprintf("执行命令 %d 次", count)
+		title := "执行命令"
 		if !tt.HasText(title) || tt.HasText("OUTPUT-") {
 			t.Fatalf("group not collapsed: %v", tt.Texts())
 		}
@@ -66,7 +66,7 @@ func TestCommandGroupsStopAtRemoteAndProse(t *testing.T) {
 		}, 700, 600)
 		n := 0
 		for _, s := range tt.Texts() {
-			if s == "执行命令 1 次" {
+			if s == "执行命令" {
 				n++
 			}
 		}
@@ -95,22 +95,25 @@ func TestCommandGroupStaysCollapsedThroughoutExecution(t *testing.T) {
 	}, 700, 700)
 	check := func(title string) {
 		t.Helper()
-		if !tt.HasText(title) || tt.HasText("echo live") || tt.HasText("OUTPUT-") {
+		if (title != "" && !tt.HasText(title)) || (title == "" && tt.HasText(groupPurposeFallbacks[3])) || tt.HasText("echo live") || tt.HasText("OUTPUT-") {
 			t.Fatalf("command escaped its collapsed group: %v", tt.Texts())
 		}
 	}
-	check("执行命令 1 次")
+	check("")
 	for _, state := range []string{"running", "success", "error", "cancelled"} {
 		msg["status"] = state
 		tt.Frame()
-		check("执行命令 1 次")
+		if state == "running" {
+			check("")
+		} else {
+			check("执行命令")
+		}
 	}
 	conv.Messages = append(conv.Messages, groupCommand("next", "Bash", "running"))
 	tt.Frame()
-	check("执行命令 2 次")
-	// The header no longer prints an executing hint, so click the visible count
-	// instead: what this asserts is that a live group can be expanded.
-	if err := tt.Click("执行命令 2 次"); err != nil {
+	check("执行命令")
+	// A live group can be expanded through its visible fallback description.
+	if err := tt.Click("执行命令"); err != nil {
 		t.Fatal(err)
 	}
 	if !tt.HasText("echo next") {
@@ -129,6 +132,55 @@ func mixedReadTool(id, path string) map[string]any {
 		"args":   `{"path":"` + path + `"}`,
 		"result": map[string]any{"files": []any{map[string]any{"path": path, "startLine": 1, "endLine": 40, "totalLines": 40}}},
 	}
+}
+
+func TestToolGroupCountsFollowBatchedResultsAndWindowChanges(t *testing.T) {
+	conv := &conversation{ID: "counts", Messages: []map[string]any{
+		groupCommand("first", "command", "running"),
+		mixedReadTool("read", "main.go"),
+		groupCommand("last", "command", "pending"),
+		{"role": "assistant", "content": "separator"},
+		groupCommand("other", "command", "running"),
+	}}
+	a := &desktop{tabs: []*conversation{conv}}
+	memos := map[int]*memoOf[toolGroupSummaryKey, toolGroupSummary]{0: {}, 4: {}}
+	check := func(index, end int) {
+		t.Helper()
+		_ = conv.blockStarts()
+		key := toolGroupSummaryKey{historyKey{len(conv.Messages), conv.historyRev}, conv.toolRev, index, end}
+		got := cachedToolGroupSummary(memos[index], conv, key)
+		want := summarizeToolGroup(conv, index, end)
+		if got != want {
+			t.Fatalf("group %d: counts/status %+v, full rebuild %+v", index, got, want)
+		}
+	}
+	check(0, 5)
+	check(4, 5)
+	for _, payload := range []map[string]any{
+		{"toolCallId": "first", "name": "command", "result": map[string]any{"ok": true}},
+		{"toolCallId": "last", "name": "command", "result": map[string]any{"ok": false}},
+		{"toolCallId": "other", "name": "command", "result": map[string]any{"cancelled": true}},
+	} {
+		a.applyToolEvent(conv, "tool:result", payload)
+	}
+	check(0, 5)
+	check(4, 5)
+	// A frame can miss more changes than the bounded journal holds.
+	for i := 0; i < toolGroupChangeLimit+2; i++ {
+		a.applyToolEvent(conv, "tool:result", map[string]any{"toolCallId": "first", "name": "command", "result": map[string]any{"ok": i%2 == 0}})
+	}
+	check(0, 5)
+	check(4, 5)
+	a.applyToolEvent(conv, "tool:start", map[string]any{"toolCallId": "appended", "name": "read"})
+	check(4, 6)
+	a.applyToolEvent(conv, "tool:result", map[string]any{"toolCallId": "read", "name": "grep", "result": map[string]any{"hits": 2}})
+	check(0, 5)
+	check(0, 2)
+	check(0, 5) // shrink and then grow the page's range
+	// Terminal cleanup changes running calls even without individual results.
+	conv.toolRev++
+	settleRunningToolMessages(conv, "done", "")
+	check(4, 6)
 }
 
 // Reads and commands used to fold into separate cards. One batch of work now
@@ -150,7 +202,7 @@ func TestReadsAndCommandsShareOneGroup(t *testing.T) {
 			}
 		})
 	}, 700, 600)
-	if !tt.HasText("读取 1 次") || !tt.HasText("执行命令 1 次") {
+	if !tt.HasText("读取文件") || !tt.HasText("执行命令") {
 		t.Fatalf("mixed group header: %v", tt.Texts())
 	}
 	if tt.HasText("main.go") || tt.HasText("echo mixed-cmd") {
@@ -179,5 +231,17 @@ func TestReadsAndCommandsShareOneGroup(t *testing.T) {
 	}
 	if conv.uiState().ToolOpen["mixed-cmd"] {
 		t.Fatal("collapsing the group left its command open")
+	}
+}
+
+func TestSSHToolsRemainIndependent(t *testing.T) {
+	for _, name := range []string{"remote_read", "remote_edit", "remote_create_file", "remote_delete_path", "remote_run_command", "remote_transfer", "ssh_cluster"} {
+		msg := map[string]any{"role": "tool_call", "name": name, "toolCallId": name, "status": "running"}
+		if isFoldableToolGroupItem(msg) {
+			t.Fatalf("%s joined a collapsed tool group", name)
+		}
+	}
+	if !isFoldableToolGroupItem(map[string]any{"role": "tool_call", "name": "read", "toolCallId": "local"}) {
+		t.Fatal("local reads stopped joining tool groups")
 	}
 }

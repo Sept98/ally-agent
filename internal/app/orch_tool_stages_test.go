@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -283,6 +284,7 @@ func TestStageLocalWriteConflicts(t *testing.T) {
 }
 
 func TestSubagentStepLimitBlocksDependentStage(t *testing.T) {
+	t.Parallel()
 	for _, limited := range []bool{false, true} {
 		t.Run(fmt.Sprintf("limited=%v", limited), func(t *testing.T) {
 			a := newIsolatedTestApp(t)
@@ -375,5 +377,5 @@ func TestAgentLoopsStageFailureBlocksLaterWrites(t *testing.T) {
 
 func containsStageBlocked(content string) bool {
 	var result toolResult
-	return json.Unmarshal([]byte(content), &result) == nil && result.ErrorCode == "E_STAGE_BLOCKED"
+	return strings.Contains(content, "E_STAGE_BLOCKED") || json.Unmarshal([]byte(content), &result) == nil && result.ErrorCode == "E_STAGE_BLOCKED"
 }

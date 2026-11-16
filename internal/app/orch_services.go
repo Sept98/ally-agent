@@ -158,7 +158,7 @@ func (a *App) checkServiceWorkspace(cfg ConfigState, id string) error {
 			return nil
 		}
 	}
-	return codedToolError("E_SERVICE_NOT_FOUND", fmt.Errorf("service not found in the current workspace: %w", errServiceNotFound))
+	return codedToolError("E_SERVICE_NOT_FOUND", fmt.Errorf("no service with id %q in the current workspace; call service with action=list to see the ids that exist: %w", id, errServiceNotFound))
 }
 
 func (a *App) startServiceWithConfig(parent context.Context, cfg ConfigState, req StartServiceRequest) (ServiceInfo, error) {
@@ -220,38 +220,48 @@ func (a *App) startServiceWithConfigLocked(parent context.Context, cfg ConfigSta
 
 	id := "svc_" + newID()
 	// 生命周期与工具调用的那次 ctx 脱钩：后台服务要在这一轮对话结束之后继续跑，
-	// 而它又需要 ctx 里的值（kbDenyRoots 从 parent 上读知识库禁写根），所以脱掉
-	// 的只是取消链，不是带的值。取消只由 StopService / 应用退出走 cancel。
+	// 保留上下文中的运行信息，取消只由 StopService / 应用退出走 cancel。
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	shell := commandShell(req.Command, cfg.GitBashPath)
 	// service 与 command 走同一套沙箱策略：只接一条会让 dev server 成为绕开沙箱的
 	// 口子。
-	spec := sandboxSpec(roots, kbDenyRoots(parent))
+	spec := sandboxSpec(roots)
 	argv := wrapSandboxedCommand(spec, append([]string{shell.path}, shell.args...))
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
 	cmd.Env = commandEnvironment(cfg)
 
 	buf := newRollingBuffer(serviceOutputLimit)
-	stdout, err := cmd.StdoutPipe()
+	// Own the reader ends: exec.Cmd.Wait closes StdoutPipe/StderrPipe before
+	// our copy goroutines necessarily drain a short-lived process's output.
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		cancel()
 		return ServiceInfo{}, err
 	}
-	stderr, err := cmd.StderrPipe()
+	defer stdoutWriter.Close()
+	stderr, stderrWriter, err := os.Pipe()
 	if err != nil {
+		_ = stdout.Close()
 		cancel()
 		return ServiceInfo{}, err
 	}
+	defer stderrWriter.Close()
+	closeReaders := func() { _ = stdout.Close(); _ = stderr.Close() }
+	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter
 	if err := startTrackedCommand(cmd); err != nil {
+		closeReaders()
 		cancel()
 		return ServiceInfo{}, err
 	}
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
 	stopTree, err := serviceProcessStop(cmd.Process.Pid)
 	if err != nil {
 		cancel()
 		unregisterProcessJob(cmd.Process.Pid)
 		_ = cmd.Wait()
+		closeReaders()
 		return ServiceInfo{}, err
 	}
 
@@ -289,7 +299,12 @@ func (a *App) startServiceWithConfigLocked(parent context.Context, cfg ConfigSta
 		waitErr := cmd.Wait()
 		// Close the job before draining pipes: descendants may hold them open.
 		unregisterProcessJob(cmd.Process.Pid)
+		// A descendant outside the managed job can keep a pipe open. Preserve
+		// already-written output without waiting indefinitely for that EOF.
+		drainTimer := time.AfterFunc(time.Second, closeReaders)
 		copyWG.Wait()
+		drainTimer.Stop()
+		closeReaders()
 		// 所有管道已收尾。
 		service.mu.Lock()
 		service.updateOutputInfoLocked()
@@ -489,7 +504,7 @@ func (a *App) restartServiceWithConfig(parent context.Context, cfg ConfigState, 
 		}
 		if !serviceBelongsToWorkspace(original.Workspace, workspace) {
 			service.stopMu.Unlock()
-			return ServiceInfo{}, codedToolError("E_SERVICE_NOT_FOUND", fmt.Errorf("service not found in the current workspace: %w", errServiceNotFound))
+			return ServiceInfo{}, codedToolError("E_SERVICE_NOT_FOUND", fmt.Errorf("no service with id %q in the current workspace; call service with action=list to see the ids that exist: %w", id, errServiceNotFound))
 		}
 
 		if _, err := a.stopServiceLocked(id, service); err != nil {
@@ -627,6 +642,7 @@ func (a *App) listServicesForTool(cfg ConfigState, includeFinished bool) (Servic
 // maxServiceReadTailBytes so a single read cannot overload the model context.
 type ServiceReadResult struct {
 	ID            string `json:"id"`
+	Name          string `json:"name,omitempty"`
 	Output        string `json:"output"`
 	ReturnedBytes int    `json:"returnedBytes"`
 	BufferBytes   int64  `json:"bufferBytes"`
@@ -694,12 +710,14 @@ func (a *App) readServiceOutput(req ServiceReadRequest) (ServiceReadResult, erro
 	// 与读取之间有一次竞态窗口），所以入参是 returned 而不是缓冲全量。
 	service.mu.Lock()
 	status := service.info.Status
+	name := service.info.Name
 	service.markSandboxDeniedLocked(returned)
 	denied := service.info.SandboxDenied
 	deniedHint := service.info.DeniedWriteHint
 	service.mu.Unlock()
 	return ServiceReadResult{
 		ID:              id,
+		Name:            name,
 		Output:          returned,
 		ReturnedBytes:   len(returned),
 		BufferBytes:     bufferBytes,
@@ -796,7 +814,7 @@ func (s *managedService) markSandboxDeniedLocked(output string) {
 	// 服务记录只留下可写根，没有留下那次运行的完整策略：用可写根重建一个，只用于
 	// 核验「这条路径真的不可写吗」。缺 KB 禁写根只会让我们少报一条路径，绝不会把
 	// 可写的位置说成被拒 —— 偏差只在保守方向。
-	s.info.DeniedWriteHint = sandbox.WriteDeniedHint(s.writeRoots, sandboxDeniedWriteTargets(sandboxSpec(s.writeRoots, nil), output)...)
+	s.info.DeniedWriteHint = sandbox.WriteDeniedHint(s.writeRoots, sandboxDeniedWriteTargets(sandboxSpec(s.writeRoots), output)...)
 }
 
 func (s *managedService) outputSnapshot() (string, int64, bool) {

@@ -313,20 +313,47 @@ func (a *App) LoadSession(sessionID string) (SessionSnapshot, error) {
 			break
 		}
 	}
+	snapshot = normalizeSessionSnapshot(snapshot, sessionID)
+	snapshot.HasSnapshot = true
+	if err := a.saveSessionLocked(snapshot); err != nil {
+		snapshot.HasSnapshot = false
+	}
 	return snapshot, nil
 }
 
-// syncSessionIndexFromHistory refreshes metadata for runs without a UI writer.
+// syncSessionIndexFromHistory refreshes the snapshot and index without a UI writer.
 func (a *App) syncSessionIndexFromHistory(sessionID string) error {
 	snapshot, err := a.LoadSession(sessionID)
 	if err != nil {
 		return err
 	}
 	history := a.loadSessionHistoryCopy(sessionID)
-	snapshot.Messages = legacySessionSnapshot(sessionID, history).Messages
+	snapshot.Messages = mergeSessionHistoryMessages(snapshot.Messages, legacySessionSnapshot(sessionID, history).Messages)
 	snapshot.ContextTokens = estimateTokensFromMessages(history)
 	snapshot.UpdatedAt = time.Now().UnixMilli()
-	return a.SaveSessionIndex(sessionIndexEntryFromSnapshot(snapshot))
+	return a.SaveSession(snapshot)
+}
+
+// mergeSessionHistoryMessages keeps the richer UI rows and appends history rows
+// after the last shared conversational message. Tool rows and attachments stay
+// attached to the original snapshot.
+func mergeSessionHistoryMessages(existing, history []map[string]any) []map[string]any {
+	if len(existing) == 0 {
+		return history
+	}
+	for i := len(existing) - 1; i >= 0; i-- {
+		role, _ := existing[i]["role"].(string)
+		content, _ := existing[i]["content"].(string)
+		if (role != "user" && role != "assistant") || content == "" {
+			continue
+		}
+		for j := len(history) - 1; j >= 0; j-- {
+			if history[j]["role"] == role && history[j]["content"] == content {
+				return append(existing, history[j+1:]...)
+			}
+		}
+	}
+	return append(existing, history...)
 }
 
 // SaveSession writes one complete UI snapshot and updates the local index.
@@ -345,6 +372,14 @@ func (a *App) SaveSession(snapshot SessionSnapshot) error {
 		return errors.New("session storage is not initialized")
 	}
 
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	return a.saveSessionLocked(snapshot)
+}
+
+// saveSessionLocked persists a normalized snapshot while sessionMu is held.
+func (a *App) saveSessionLocked(snapshot SessionSnapshot) error {
+	snapshot = a.sessionSnapshotForStorage(snapshot)
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -353,8 +388,6 @@ func (a *App) SaveSession(snapshot SessionSnapshot) error {
 		return fmt.Errorf("session snapshot exceeds %d bytes", maxSessionSnapshotJSONBytes)
 	}
 
-	a.sessionMu.Lock()
-	defer a.sessionMu.Unlock()
 	if err := writeCompressedJSONAtomic(a.sessionSnapshotPath(snapshot.ID), encoded); err != nil {
 		return err
 	}
@@ -366,6 +399,93 @@ func (a *App) SaveSession(snapshot SessionSnapshot) error {
 	}
 	entries = replaceSessionIndexEntry(entries, entry)
 	return a.writeSessionIndexLocked(entries)
+}
+
+// RenameSession updates both the compact index and any persisted snapshot so
+// index repair cannot restore the previous title.
+func (a *App) RenameSession(sessionID, title string) error {
+	if err := a.ensureInitialized(); err != nil {
+		return err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	title = strings.Join(strings.Fields(title), " ")
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	if title == "" {
+		return errors.New("session title is required")
+	}
+	title = normalizeSessionIndexTitle(title)
+	if a.sessionsDir == "" {
+		return errors.New("session storage is not initialized")
+	}
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	entries, err := a.readSessionIndexLocked()
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range entries {
+		if entries[i].ID == sessionID {
+			entries[i].Title = title
+			found = true
+			break
+		}
+	}
+	if !found {
+		return os.ErrNotExist
+	}
+	path := a.sessionSnapshotPath(sessionID)
+	var oldSnapshot, newSnapshot []byte
+	hasSnapshot := false
+	if oldSnapshot, err = os.ReadFile(path); err == nil {
+		hasSnapshot = true
+		snapshot, readErr := readCompressedSessionSnapshot(path)
+		if readErr != nil {
+			return readErr
+		}
+		snapshot.Title = title
+		newSnapshot, err = json.Marshal(snapshot)
+		if err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	indexPath := a.sessionIndexPath()
+	oldIndex, indexErr := os.ReadFile(indexPath)
+	hasIndex := indexErr == nil
+	if indexErr != nil && !errors.Is(indexErr, os.ErrNotExist) {
+		return indexErr
+	}
+	return commitSessionRename(path, newSnapshot, oldSnapshot, hasSnapshot, indexPath, oldIndex, hasIndex, func() error {
+		return a.writeSessionIndexLocked(entries)
+	})
+}
+
+func commitSessionRename(snapshotPath string, newSnapshot, oldSnapshot []byte, hasSnapshot bool, indexPath string, oldIndex []byte, hasIndex bool, writeIndex func() error) error {
+	if hasSnapshot {
+		if err := writeCompressedJSONAtomic(snapshotPath, newSnapshot); err != nil {
+			return err
+		}
+	}
+	if err := writeIndex(); err != nil {
+		rollbackSessionRenameFiles(snapshotPath, oldSnapshot, hasSnapshot, indexPath, oldIndex, hasIndex)
+		return fmt.Errorf("save renamed session index: %w", err)
+	}
+	return nil
+}
+
+func rollbackSessionRenameFiles(snapshotPath string, oldSnapshot []byte, hasSnapshot bool, indexPath string, oldIndex []byte, hasIndex bool) {
+	if hasSnapshot {
+		_ = writeAtomicBytes(snapshotPath, oldSnapshot, 0o600)
+	}
+	if hasIndex {
+		_ = writeAtomicBytes(indexPath, oldIndex, 0o600)
+	} else {
+		_ = os.Remove(indexPath)
+	}
 }
 
 // SaveSessionIndex updates only one small metadata record. It is used for
@@ -803,6 +923,20 @@ func legacySessionSnapshot(sessionID string, history []openai.ChatCompletionMess
 		if message.Role == openai.ChatMessageRoleSystem {
 			continue
 		}
+		if entries, ok := decodeFastCompactHistory(message); ok {
+			for _, entry := range entries {
+				if entry.Role == openai.ChatMessageRoleUser || entry.Role == openai.ChatMessageRoleAssistant {
+					messages = append(messages, map[string]any{"role": entry.Role, "content": entry.Content, "done": true})
+				} else if entry.Role == "tool_call" {
+					messages = append(messages, map[string]any{
+						"role": "tool_call", "name": entry.Name, "toolCallId": entry.ToolCallID,
+						"purpose": entry.Purpose, "status": entry.Status, "body": entry.Content,
+						"result": map[string]any{"_text": entry.Content}, "fastCompacted": true,
+					})
+				}
+			}
+			continue
+		}
 		content := message.Content
 		if content == "" && len(message.MultiContent) > 0 {
 			content = textFromMultiContent(message.MultiContent)
@@ -958,12 +1092,13 @@ func (a *App) saveHistory(sessionID string, messages []openai.ChatCompletionMess
 	// In-memory history keeps image MultiContent so subsequent runs in this
 	// process still see the images (stable prefix, prompt cache survives).
 	// The legacy disk profile remains text-only. A bounded, OS-protected
-	// provider payload can preserve full Responses context in the same file.
+	// provider payload preserves Responses replay and reasoning in the same
+	// file, while omitting raw read/search/list/command observations.
 	// SSH passwords stay in the history verbatim (no redaction): the live history
 	// is what the next request is built from, so masking a stored password here
 	// would make the model re-send the mask for the next host instead of the real
 	// credential.
-	inMemory := sanitizeHistoryMessages(messages)
+	inMemory, origins := sanitizeHistoryMessagesWithOrigins(messages, historyProfileMemory)
 	if countToolMessages(inMemory) < countToolMessages(messages) {
 		// The repair pass dropped tool results (dangling or duplicated calls), so
 		// the payloads they carried left the model's history: the read cache must
@@ -976,7 +1111,13 @@ func (a *App) saveHistory(sessionID string, messages []openai.ChatCompletionMess
 	breakdown := computeLiveBreakdown(inMemory)
 	a.finalizeSessionBreakdown(sessionID, &breakdown, inMemory)
 	a.mu.Lock()
-	a.historyCacheStateLocked(sessionID).revision++
+	state := a.historyCacheStateLocked(sessionID)
+	if state.task != nil {
+		boundary := *state.task
+		boundary.Start += leadingSystemCount(messages)
+		state.task = projectHistoryTask(resolveHistoryTask(&boundary, messages), messages, inMemory, origins)
+	}
+	state.revision++
 	a.histories[sessionID] = cloneChatMessages(inMemory)
 	a.liveBreakdown[sessionID] = breakdown
 	a.mu.Unlock()
@@ -1069,6 +1210,7 @@ func writeCompressedHistoryPayload(diskPath string, payload any) error {
 // A per-session load ticket and revision. Release drops the ticket, so an
 // older disk load cannot resurrect a released/deleted session.
 type historyCacheState struct {
+	task              *historyTaskBoundary
 	revision          uint64
 	loading           chan struct{}
 	breakdown         *ContextBreakdown
@@ -1248,39 +1390,13 @@ func (a *App) TruncateSessionHistory(req TruncateSessionHistoryRequest) (int, er
 	// drops, so the user-turn ordinal is not a reliable locator. With content
 	// we find the LAST user turn containing it — that is the one the user is
 	// hovering (the most recent occurrence).
-	targetIndex := -1
 	expected := strings.TrimSpace(req.ExpectedContent)
-	expectedLen := len(expected)
-	if expectedLen > 0 {
-		for i, m := range messages {
-			if m.Role != openai.ChatMessageRoleUser {
-				continue
-			}
-			content := strings.TrimSpace(textFromMessage(m))
-			if strings.Contains(content, expected) {
-				targetIndex = i
-			}
-		}
-		if targetIndex < 0 {
+	targetIndex, entryIndex := locateHistoryUser(messages, req.UserMessageIndex, expected)
+	if targetIndex < 0 {
+		if expected != "" {
 			return 0, fmt.Errorf("no user message contains expected content")
 		}
-	} else {
-		// Fallback: locate by ordinal among user turns.
-		userSeen := 0
-		for i, m := range messages {
-			if m.Role != openai.ChatMessageRoleUser {
-				continue
-			}
-			if userSeen != req.UserMessageIndex {
-				userSeen++
-				continue
-			}
-			targetIndex = i
-			break
-		}
-		if targetIndex < 0 {
-			return 0, fmt.Errorf("user message index %d not found in history", req.UserMessageIndex)
-		}
+		return 0, fmt.Errorf("user message index %d not found in history", req.UserMessageIndex)
 	}
 
 	// Keep everything strictly before the target user turn. No rewinding is
@@ -1293,7 +1409,12 @@ func (a *App) TruncateSessionHistory(req TruncateSessionHistoryRequest) (int, er
 	// when the target was the second user turn — which happens whenever the user
 	// message was queued while a run was working or the run was interrupted
 	// between a tool result and the next user turn.
-	truncated := repairDanglingToolCalls(messages[:targetIndex])
+	truncated := cloneChatMessages(messages[:targetIndex])
+	if entryIndex > 0 {
+		entries, _ := decodeFastCompactHistory(messages[targetIndex])
+		truncated = append(truncated, encodeFastCompactHistory(entries[:entryIndex]))
+	}
+	truncated = repairDanglingToolCalls(truncated)
 
 	// The discarded turns may have left provider reasoning artifacts (thinking
 	// signatures, encrypted reasoning) in the replay stash; they no longer belong

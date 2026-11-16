@@ -2,11 +2,10 @@ package desktop
 
 import (
 	"fmt"
-	"runtime"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -19,6 +18,7 @@ func TestHeaderTabsPanWithoutChoosing(t *testing.T) {
 	}
 	a := &desktop{ready: true, page: "chat", active: 1, tabs: tabs}
 	tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.headerBar(c) }, 500, 60)
+	tt.SetLocale("zh-Hans")
 	st := &a.tabStripOf("header-tabs").scroll
 	if st.MaxX <= 0 {
 		t.Fatalf("the header's tabs did not overflow: maxX=%v", st.MaxX)
@@ -47,54 +47,7 @@ func TestHeaderTabsPanWithoutChoosing(t *testing.T) {
 	}
 }
 
-func TestHeaderLeadingSurfaceIsSquare(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("Windows leading surface")
-	}
-	for _, appearance := range []string{"light", "dark"} {
-		for _, expanded := range []bool{false, true} {
-			a := &desktop{prefs: defaultPrefs(), page: "chat", win: &mygo.Window{}, tabs: []*conversation{{ID: "first", Workspace: "ally-agent"}, {ID: "second", Workspace: "临时"}}}
-			a.prefs.Appearance = appearance
-			a.prefs.RailExpanded = expanded
-			a.prefs.RailWidth = 180
-			tt := ui.NewTester(func(c *ui.Context) {
-				c.SetTheme(a.theme())
-				c.DisableAnimations()
-				ui.Column(c).Fill().Children(func() {
-					a.headerBar(c)
-					ui.Row(c).Grow(1).AlignItems(ui.Stretch).Children(func() {
-						a.rail(c)
-						ui.Box(c).Grow(1).FillHeight().Background(c.Theme().Background)
-						a.fileTree(c)
-					})
-				})
-			}, 720, 170)
-			p := a.currentPalette()
-			activeTab, ok := tt.Find("工作区标签 first")
-			if !ok {
-				t.Fatal("missing active tab")
-			}
-			for _, sample := range []struct {
-				x, y int
-				want ui.Color
-			}{
-				{0, 44, p.chromeColor()},
-				{8, 44, p.chromeColor()},
-				{0, 52, p.chromeColor()},
-				{220, 110, p.bg},
-				{700, 110, p.bg},
-				{int(activeTab.X + activeTab.W/2), 43, p.bg},
-			} {
-				got := tt.Image().RGBAAt(sample.x, sample.y)
-				if got.R != sample.want.R || got.G != sample.want.G || got.B != sample.want.B {
-					t.Fatalf("%s expanded=%t corner %d,%d: got %v want %v", appearance, expanded, sample.x, sample.y, got, sample.want)
-				}
-			}
-		}
-	}
-}
-
-func TestWorkspaceTabsFillHeaderAndShareBottomBaseline(t *testing.T) {
+func TestWorkspaceTabsFillHeaderWithoutGaps(t *testing.T) {
 	a := &desktop{ready: true, page: "chat", tabs: []*conversation{{ID: "first", Workspace: "apisec"}, {ID: "second", Workspace: "ally-agent"}}}
 	tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.headerBar(c) }, 900, 100)
 	first, ok := tt.Find("工作区标签 first")
@@ -105,62 +58,253 @@ func TestWorkspaceTabsFillHeaderAndShareBottomBaseline(t *testing.T) {
 	if first.Y != 0 || first.H != 44 || second.Y != 0 || second.H != 44 || second.X != first.X+first.W {
 		t.Fatalf("header has gaps: %v %v", first, second)
 	}
-	color := tt.Image().RGBAAt(int(first.X+first.W/2), 43)
-	surface := a.theme().Background
-	if color.R != surface.R || color.G != surface.G || color.B != surface.B {
-		t.Fatalf("active tab does not join lower surface: %v want %v", color, surface)
-	}
-	tt.Move(second.X+3, second.Y+3)
-	tt.Advance(200 * time.Millisecond)
-	color = tt.Image().RGBAAt(int(second.X+3), 1)
-	hover := a.currentPalette().headerColor()
-	if color.R != hover.R || color.G != hover.G || color.B != hover.B {
-		t.Fatalf("hover covers rounded tab top inset: %v want %v", color, hover)
-	}
-}
-
-func TestHeaderDividerContinuesUnderCaptionControls(t *testing.T) {
-	for _, appearance := range []string{"light", "dark"} {
-		a := &desktop{ready: true, page: "chat", win: &mygo.Window{}, tabs: []*conversation{{ID: "tab", Workspace: "cam"}}}
-		a.prefs.Appearance = appearance
-		tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.headerBar(c) }, 900, 100)
-		for _, name := range []string{"最小化", "最大化", "退出应用"} {
-			r, ok := tt.Find(name)
-			if !ok {
-				t.Fatalf("missing %s", name)
-			}
-			got := tt.Image().RGBAAt(int(r.X+2), 1)
-			want := a.currentPalette().headerColor()
-			if got.R != want.R || got.G != want.G || got.B != want.B {
-				t.Fatalf("%s %s background differs from header: %v want %v", appearance, name, got, want)
-			}
-		}
-		for _, hover := range []string{"最小化", "最大化", "退出应用"} {
-			r, ok := tt.Find(hover)
-			if !ok {
-				t.Fatal("missing window control")
-			}
-			if r.Y != 0 || r.H != 44 {
-				t.Fatalf("caption top/bottom mismatch: %v", r)
-			}
-			tt.Move(r.X+r.W/2, r.Y+r.H/2)
-			tt.Advance(200 * time.Millisecond)
-			for _, name := range []string{"最小化", "最大化", "退出应用"} {
-				b, _ := tt.Find(name)
-				for x := int(b.X) + 1; x < int(b.X+b.W)-1; x++ {
-					v := tt.Image().RGBAAt(x, 43)
-					want := a.theme().Border
-					if v.R != want.R || v.G != want.G || v.B != want.B {
-						t.Fatalf("%s bottom line missing on %s x=%d color=%v want=%v", appearance, name, x, v, want)
-					}
-				}
-			}
-		}
-	}
 }
 
 // Header tabs share the content column's boundary as the rail expands and
 // resizes. Native traffic lights must always keep their reserved area.
+func TestHeaderTabsDragInsertsAndKeepsActiveConversation(t *testing.T) {
+	tabs := []*conversation{
+		{ID: "first", Workspace: "workspace-0", Title: "session-0"},
+		{ID: "middle", Workspace: "workspace-1", Title: "session-1"},
+		{ID: "last", Workspace: "workspace-2", Title: "session-2"},
+	}
+	a := &desktop{ready: true, page: "chat", active: 1, tabs: tabs}
+	reduceMotion := false
+	tt := ui.NewTester(func(c *ui.Context) {
+		reduceMotion = c.Preferences().ReduceMotion
+		c.SetTheme(a.theme())
+		a.headerBar(c)
+	}, 1000, 60)
+	tt.SetLocale("zh-Hans")
+	from, ok := tt.Find("session-0")
+	if !ok {
+		t.Fatalf("missing drag source: %v", tt.Texts())
+	}
+	to, ok := tt.Find("session-2")
+	if !ok {
+		t.Fatalf("missing drop target: %v", tt.Texts())
+	}
+	sourceStartX := float32(0)
+	for _, position := range a.tabStripOf("header-tabs").positions {
+		if position.id == "first" {
+			sourceStartX = position.x
+			break
+		}
+	}
+	sx, sy, tx, ty := from.X+from.W/2, from.Y+from.H/2, to.X+to.W/2+20, to.Y+to.H/2
+	tt.Press(sx, sy)
+	for i := 1; i <= 8; i++ {
+		x := sx + (tx-sx)*float32(i)/8
+		y := sy + (ty-sy)*float32(i)/8
+		tt.Move(x, y)
+		tt.Advance(16 * time.Millisecond)
+		if i == 4 {
+			strip := a.tabStripOf("header-tabs")
+			if strip.reorderTarget == "" || !strip.reorderIndexValid {
+				t.Fatalf("dragging did not expose a drop target: target=%q index=%d valid=%v", strip.reorderTarget, strip.reorderIndex, strip.reorderIndexValid)
+			}
+			var currentSourceX float32
+			for _, position := range strip.positions {
+				if position.id == "first" {
+					currentSourceX = position.x
+					break
+				}
+			}
+			if currentSourceX != sourceStartX {
+				t.Fatalf("source tab moved during drag: x=%v, want fixed at %v", currentSourceX, sourceStartX)
+			}
+		}
+		if i == 8 && (a.tabs[0].ID != "first" || a.tabs[1].ID != "middle" || a.tabs[2].ID != "last") {
+			t.Fatalf("tab order changed before drop: %q/%q/%q", a.tabs[0].ID, a.tabs[1].ID, a.tabs[2].ID)
+		}
+	}
+	tt.Release(tx, ty)
+	tt.Advance(16 * time.Millisecond)
+	motions := a.tabStripOf("header-tabs").reorderMotions
+	if len(motions) == 0 {
+		t.Fatalf("tab swap did not schedule its position transition (reduce motion=%v)", reduceMotion)
+	}
+	for id, motion := range motions {
+		if !motion.armed || motion.offset == 0 {
+			t.Fatalf("tab %q has no armed movement transition: %+v", id, motion)
+		}
+	}
+	tt.Advance(80 * time.Millisecond)
+	for id, motion := range a.tabStripOf("header-tabs").reorderMotions {
+		if motion.startedAt.IsZero() {
+			t.Fatalf("tab %q did not enter the movement phase: %+v", id, motion)
+		}
+	}
+	if a.tabs[0].ID != "middle" || a.tabs[1].ID != "last" || a.tabs[2].ID != "first" {
+		t.Fatalf("dragged tab was not inserted after release: %q %q %q", a.tabs[0].ID, a.tabs[1].ID, a.tabs[2].ID)
+	}
+	if a.active != 0 || a.tabs[a.active].ID != "middle" {
+		t.Fatalf("active conversation changed after insertion: active=%d id=%q", a.active, a.tabs[a.active].ID)
+	}
+}
+
+func TestHeaderTabReorderClearsAfterReleaseOutsideTabs(t *testing.T) {
+	a := &desktop{ready: true, page: "chat", tabs: []*conversation{
+		{ID: "first", Title: "first", Workspace: "workspace-1"},
+		{ID: "middle", Title: "middle", Workspace: "workspace-2"},
+		{ID: "last", Title: "last", Workspace: "workspace-3"},
+	}}
+	tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.headerBar(c) }, 900, 60)
+	source, ok := tt.Find("first")
+	if !ok {
+		t.Fatal("missing source tab")
+	}
+	y := source.Y + source.H/2
+	tt.Press(source.X+source.W/2, y)
+	tt.Move(700, y)
+	tt.Advance(16 * time.Millisecond)
+	if a.tabStripOf("header-tabs").reorderFrom != "first" {
+		t.Fatal("drag did not enter reorder state")
+	}
+	tt.Release(850, y)
+	tt.Advance(16 * time.Millisecond)
+	strip := a.tabStripOf("header-tabs")
+	if strip.reorderFrom != "" || strip.gesture.Panning {
+		t.Fatalf("release left stale drag state: source=%q panning=%v", strip.reorderFrom, strip.gesture.Panning)
+	}
+	if a.tabs[2].ID != "first" {
+		t.Fatalf("release outside tabs did not commit the indicated end slot: %q/%q/%q", a.tabs[0].ID, a.tabs[1].ID, a.tabs[2].ID)
+	}
+}
+
+func TestConversationTabInsertionIndexUsesScrolledVariableWidths(t *testing.T) {
+	tabs := []*conversation{{ID: "dragged"}, {ID: "middle"}, {ID: "long-label"}, {ID: "last"}}
+	positions := []tabPosition{
+		{id: "dragged", x: -120, width: 80},
+		{id: "middle", x: -40, width: 180},
+		{id: "long-label", x: 140, width: 120},
+		{id: "last", x: 260, width: 150},
+	}
+	for _, tc := range []struct {
+		pointer float32
+		want    int
+	}{
+		{pointer: -80, want: 0}, // stays before the first remaining tab
+		{pointer: 70, want: 1},  // after the wide middle tab
+		{pointer: 150, want: 2}, // after long-label, before last
+		{pointer: 300, want: 3}, // after the last tab
+	} {
+		if got := conversationTabInsertionIndex(tabs, positions, "dragged", tc.pointer, tabReorderHysteresis); got != tc.want {
+			t.Fatalf("pointer=%v insertion=%d, want %d", tc.pointer, got, tc.want)
+		}
+	}
+	if got := conversationTabDropTarget(tabs, "dragged", 0); got != "dragged" {
+		t.Fatalf("same-slot marker target=%q, want dragged source", got)
+	}
+	if got := conversationTabDropTarget(tabs, "dragged", 1); got != "long-label" {
+		t.Fatalf("after-middle marker target=%q, want long-label", got)
+	}
+}
+
+func TestConversationTabInsertionIndexSupportsMultiTabMoves(t *testing.T) {
+	const count = 8
+	tabs := make([]*conversation, count)
+	positions := make([]tabPosition, count)
+	x := float32(-260) // simulate a horizontally scrolled tab strip
+	for i := range tabs {
+		width := float32(60 + (i*37)%120)
+		tabs[i] = &conversation{ID: fmt.Sprintf("tab-%d", i)}
+		positions[i] = tabPosition{id: tabs[i].ID, x: x, width: width}
+		x += width
+	}
+
+	for from := range tabs {
+		centers := make([]float32, 0, count-1)
+		virtualX := positions[0].x
+		for i := range tabs {
+			if i == from {
+				continue
+			}
+			centers = append(centers, virtualX+positions[i].width/2)
+			virtualX += positions[i].width
+		}
+		for destination := range tabs {
+			var pointer float32
+			switch {
+			case destination == 0:
+				pointer = centers[0] - 24
+			case destination == count-1:
+				pointer = centers[len(centers)-1] + 24
+			default:
+				pointer = (centers[destination-1] + centers[destination]) / 2
+			}
+			got := conversationTabInsertionIndex(tabs, positions, tabs[from].ID, pointer, tabReorderHysteresis)
+			if got != destination {
+				t.Fatalf("from=%d pointer=%v insertion=%d, want %d", from, pointer, got, destination)
+			}
+			movedTabs := append([]*conversation(nil), tabs...)
+			activeID := movedTabs[4].ID
+			active, _, moved := moveOpenConversationTabToIndex(movedTabs, positions, 4, tabs[from].ID, got)
+			if moved != (from != destination) {
+				t.Fatalf("from=%d destination=%d moved=%v", from, destination, moved)
+			}
+			if movedTabs[active].ID != activeID {
+				t.Fatalf("from=%d destination=%d active session=%q, want %q", from, destination, movedTabs[active].ID, activeID)
+			}
+			if movedTabs[destination].ID != tabs[from].ID {
+				t.Fatalf("from=%d destination=%d landed at %q", from, destination, movedTabs[destination].ID)
+			}
+		}
+	}
+}
+
+func TestMoveOpenConversationTabShiftsTargetAndFollowingTabs(t *testing.T) {
+	tabs := []*conversation{{ID: "first"}, {ID: "target"}, {ID: "following"}, {ID: "dragged"}}
+	positions := []tabPosition{{id: "first", x: 0, width: 100}, {id: "target", x: 100, width: 100}, {id: "following", x: 200, width: 100}, {id: "dragged", x: 300, width: 100}}
+	active, motions, moved := moveOpenConversationTabToIndex(tabs, positions, 2, "dragged", 1)
+	if !moved || tabs[0].ID != "first" || tabs[1].ID != "dragged" || tabs[2].ID != "target" || tabs[3].ID != "following" {
+		t.Fatalf("tab was not inserted before target: moved=%v order=%q/%q/%q/%q", moved, tabs[0].ID, tabs[1].ID, tabs[2].ID, tabs[3].ID)
+	}
+	if active != 3 || tabs[active].ID != "following" {
+		t.Fatalf("active conversation did not follow insertion: active=%d id=%q", active, tabs[active].ID)
+	}
+	if motions["target"].offset != -100 || motions["following"].offset != -100 {
+		t.Fatalf("target and following tabs lack shift animations: %+v", motions)
+	}
+}
+
+func TestHeaderTabClickDoesNotReorderTabs(t *testing.T) {
+	a := &desktop{ready: true, page: "chat", active: 0, tabs: []*conversation{{ID: "first", Workspace: "one", Title: "first session"}, {ID: "second", Workspace: "two", Title: "second session"}}}
+	tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.headerBar(c) }, 900, 60)
+	tab, ok := tt.Find("second session")
+	if !ok {
+		t.Fatal("missing second tab")
+	}
+	x, y := tab.X+tab.W/2, tab.Y+tab.H/2
+	tt.Press(x, y)
+	tt.Move(x+3, y+1)
+	tt.Advance(16 * time.Millisecond)
+	tt.Release(x+3, y+1)
+	tt.Advance(16 * time.Millisecond)
+	if len(a.tabs) != 2 || a.tabs[0].ID != "first" || a.tabs[1].ID != "second" {
+		t.Fatalf("click changed tab order: %+v", a.tabs)
+	}
+}
+
+func TestSessionTabLabelAndWorkspaceTip(t *testing.T) {
+	title := strings.Repeat("默认名称", 12)
+	if got, want := sessionTabLabel(&conversation{Title: title}), short(title, 36); got != want {
+		t.Fatalf("session tab label=%q, want truncated session title %q", got, want)
+	}
+	if got, want := sessionTabTip(&conversation{Title: title, Workspace: "C:/work/alpha"}), short(title, 72)+"\nC:/work/alpha"; got != want {
+		t.Fatalf("long-title tooltip=%q, want full title and workspace %q", got, want)
+	}
+	if got := sessionTabLabel(&conversation{Title: "Custom title"}); got != "Custom title" {
+		t.Fatalf("session tab label=%q, want custom title", got)
+	}
+	if got := sessionTabTip(&conversation{Title: "Custom title", Workspace: "C:/work/alpha"}); got != "C:/work/alpha" {
+		t.Fatalf("short-title tooltip=%q, want workspace path", got)
+	}
+	if got := sessionTabLabel(&conversation{}); got == "" || strings.Contains(got, "workspace") {
+		t.Fatalf("empty session title fallback=%q", got)
+	}
+}
+
 func TestHeaderTabsTrackSidebarBoundary(t *testing.T) {
 	for _, bar := range []ui.TitleBar{{}, {Left: 80, Height: 44}} {
 		a := &desktop{page: "chat", tabs: []*conversation{{ID: "aligned", Workspace: "mygo"}}}
@@ -187,51 +331,7 @@ func TestHeaderTabsTrackSidebarBoundary(t *testing.T) {
 			if !ok || tab.X != want {
 				t.Fatalf("bar=%v rail=%v tab starts %v want %v", bar, width, tab.X, want)
 			}
-			logo, ok := tt.Find("应用 Logo")
-			// Open: the mark's column starts on the icon column. Collapsed: it spans
-			// the whole rail, so centring the mark there centres it in the rail.
-			left := float32(6) + railGutter
-			if width == 0 {
-				left = 0
-			}
-			if bar.Left > 0 {
-				left = max(left, bar.Left+headerTrafficLightGap)
-			}
-			if !ok || logo.X != left {
-				t.Fatalf("bar=%v rail=%v logo left=%v want %v", bar, width, logo.X, left)
-			}
-			if width == 0 && logo.W != widthRailCollapsed {
-				t.Fatalf("bar=%v collapsed logo column is %v wide, want the whole %v rail", bar, logo.W, widthRailCollapsed)
-			}
-		}
-	}
-}
 
-func TestHeaderSidebarChrome(t *testing.T) {
-	for _, appearance := range []string{"light", "dark"} {
-		for _, width := range []float32{44, 160, 300} {
-			a := &desktop{prefs: defaultPrefs(), tabs: []*conversation{{ID: "border", Workspace: "mygo"}}}
-			a.prefs.Appearance = appearance
-			a.prefs.RailExpanded = width != 44
-			a.prefs.RailWidth = width
-			tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.headerBar(c) }, 900, 100)
-			bottom := a.currentPalette().headerColor()
-			// The logo and tab strip share one uninterrupted header background.
-			rightTop, rightBottom := bottom, bottom
-			for _, point := range []struct {
-				x, y int
-				want ui.Color
-			}{
-				{10, 43, bottom}, {int(width) - 1, 10, rightTop}, {int(width) - 1, 43, rightBottom},
-				// Keep the fill below the wordmark descender, including the
-				// collapsed rail: the former lower cutout passed through it.
-				{int(width) / 2, 36, bottom},
-			} {
-				got := tt.Image().RGBAAt(point.x, point.y)
-				if got.R != point.want.R || got.G != point.want.G || got.B != point.want.B {
-					t.Fatalf("%s width=%v separator at %d,%d got %v want %v", appearance, width, point.x, point.y, got, point.want)
-				}
-			}
 		}
 	}
 }

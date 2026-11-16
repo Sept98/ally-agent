@@ -2,6 +2,7 @@
 package desktop
 
 import (
+	"ally-dev/locales"
 	"fmt"
 	"regexp"
 	"strings"
@@ -16,8 +17,8 @@ import (
 
 // chatSearch is the transcript's find bar: the editor's bar without replacing,
 // searching the messages' text instead of a buffer. The matches are message
-// ranges, so a hit can be counted, listed and scrolled to, but not painted
-// inside the rendered Markdown, which has no highlight hook.
+// ranges. Plain prose and code project these ranges into native highlighted
+// text; formatted inline content retains the Markdown renderer's layout.
 type chatSearch struct {
 	Open      bool
 	Query     string
@@ -46,9 +47,14 @@ type chatSearch struct {
 	byMessage map[int]bool
 	// pattern memoises the compiled query and the spans already found in a block:
 	// both were recomputed for every block of every frame while the bar was open.
-	patternKey string
-	pattern    *regexp.Regexp
-	patternErr error
+	patternKey       string
+	pattern          *regexp.Regexp
+	patternErr       error
+	literal          []rune
+	literalPrefix    []int
+	literalStarts    []int
+	literalQuery     string
+	literalMatchCase bool
 	// spanCache and codeCache memoise what a block of one message resolved to, and
 	// cacheQuery says which query they were filled for: a comparable key keeps the
 	// frame from formatting a string per block, and one generation field replaces
@@ -56,6 +62,7 @@ type chatSearch struct {
 	spanCache  map[chatSearchBlockKey][][2]int
 	codeCache  map[chatSearchCodeKey]chatSearchCode
 	cacheQuery string
+	queryKey   memoOf[chatSearchQueryOptions, string]
 	// lastQuery and lastCompute tell a new query, which is searched at once, from
 	// a transcript still streaming, which is re-searched at most this often.
 	lastQuery   string
@@ -76,6 +83,8 @@ type chatSearch struct {
 	// scanTruncated means the synchronous scan hit its byte budget before the end
 	// of the transcript; the status must not present a partial search as complete.
 	scanTruncated bool
+	// candidateTruncated distinguishes regexp candidate exhaustion from bytes.
+	candidateTruncated bool
 	// scanCount, scanPrefix and scanBytes describe the scan behind cache: how many
 	// messages it covered, the bytes before the last of them, and the bytes in all.
 	// A reply that keeps growing edits only its last message, so the frames during
@@ -84,6 +93,7 @@ type chatSearch struct {
 	scanPrefix int
 	scanBytes  int
 	tailOnly   bool
+	appendOnly bool
 	// frameDoc and frameDocMessage are the document and message the block hook
 	// was last asked about, so the code-block hook that runs right after it can
 	// address the block's lines without parsing the message again.
@@ -100,8 +110,9 @@ type chatSearchMatch struct {
 
 // chatSearchMaxMatches and chatSearchMaxBytes bound a query's synchronous scan.
 const (
-	chatSearchMaxMatches = 400
-	chatSearchMaxBytes   = 4 << 20
+	chatSearchMaxMatches         = 400
+	chatSearchMaxBytes           = 4 << 20
+	chatSearchMaxRegexCandidates = 8192
 )
 
 // chatSearchWaitFrames bounds how many frames a jump waits for the layout of the
@@ -118,6 +129,7 @@ const chatSearchNextFrame = 8 * time.Millisecond
 const (
 	chatSearchCodeMaxBytes = 64 << 10
 	chatSearchCodeMaxSpans = 200
+	chatSearchCodeMaxLines = 1000
 )
 
 // openChatSearch opens the bar and puts the caret in its field.
@@ -126,6 +138,7 @@ func (a *desktop) openChatSearch(t *conversation) {
 		return
 	}
 	st := t.uiState()
+	st.CmdOpen, st.Mention.Open, st.SessionsOpen = false, false, false
 	st.Search.Open = true
 	a.chatSearchFocus = t.ID + "-search-query"
 	// The composer has to look unfocused now, or closing the bar could not give its
@@ -143,12 +156,15 @@ func (a *desktop) closeChatSearch(t *conversation) {
 	s.Open = false
 	s.reveal = false
 	// The bar's per-frame caches describe a transcript that is no longer searched.
-	// The handles stay: they are pruned by the transcript's window every frame, and
-	// a handle handed back to the engine is never reclaimed before the window close.
+	// Row handles stay for this page and are recycled as it changes; the engine
+	// keeps each registered binding until window close.
 	s.blockBound = false
 	s.spanCache, s.byMessage, s.cache, s.cacheKey = nil, nil, nil, ""
 	s.codeCache = nil
 	s.frameDoc = nil
+	s.patternKey, s.pattern, s.patternErr = "", nil, nil
+	s.literal, s.literalPrefix, s.literalStarts, s.literalQuery = nil, nil, nil, ""
+	s.queryKey = memoOf[chatSearchQueryOptions, string]{}
 	a.chatSearchFocus = ""
 	// Both focus fields change in the frame the bar closes, and the engine walks
 	// them in map order: releasing the bar's field can clear the focus the composer
@@ -216,6 +232,25 @@ const chatSearchRestream = 150 * time.Millisecond
 // kept and one message is read again; any other change rescans everything.
 func (a *desktop) chatSearchScan(t *conversation, s *chatSearch) ([]chatSearchMatch, bool) {
 	query := chatSearchQueryKey(s)
+	if s.appendOnly && !s.tailOnly && s.cacheKey != "" && s.lastQuery == query && !s.scanTruncated &&
+		s.scanCount <= len(t.Messages) && len(s.cache) < chatSearchMaxMatches {
+		out := append([]chatSearchMatch(nil), s.cache...)
+		prefix, total, truncated := s.scanPrefix, s.scanBytes, false
+		for i := s.scanCount; i < len(t.Messages); i++ {
+			prefix = total
+			content := str(t.Messages[i], "content")
+			if content == "" {
+				continue
+			}
+			out, truncated = chatSearchScanMessage(t.Messages[i], i, s, chatSearchMaxBytes-total, out)
+			total = prefix + min(len(content), chatSearchMaxBytes-prefix)
+			if truncated || len(out) >= chatSearchMaxMatches {
+				break
+			}
+		}
+		s.scanCount, s.scanPrefix, s.scanBytes, s.appendOnly = len(t.Messages), prefix, total, false
+		return out, truncated
+	}
 	if s.tailOnly && s.cacheKey != "" && s.lastQuery == query && !s.scanTruncated &&
 		s.scanCount == len(t.Messages) && s.scanCount > 0 {
 		out, truncated := chatSearchScanTail(t, s, s.scanCount-1)
@@ -224,7 +259,7 @@ func (a *desktop) chatSearchScan(t *conversation, s *chatSearch) ([]chatSearchMa
 		return out, truncated
 	}
 	out, truncated, prefix, total := chatSearchScanAll(t, s)
-	s.scanCount, s.scanPrefix, s.scanBytes, s.tailOnly = len(t.Messages), prefix, total, false
+	s.scanCount, s.scanPrefix, s.scanBytes, s.tailOnly, s.appendOnly = len(t.Messages), prefix, total, false, false
 	return out, truncated
 }
 
@@ -245,8 +280,15 @@ func chatSearchScanTail(t *conversation, s *chatSearch, last int) ([]chatSearchM
 	return matches, truncated
 }
 
+type chatSearchQueryOptions struct {
+	query                        string
+	matchCase, wholeWord, regexp bool
+}
+
 func chatSearchQueryKey(s *chatSearch) string {
-	return fmt.Sprintf("%s\x00%t\x00%t\x00%t", s.Query, s.MatchCase, s.WholeWord, s.Regexp)
+	return s.queryKey.get(chatSearchQueryOptions{s.Query, s.MatchCase, s.WholeWord, s.Regexp}, func(key chatSearchQueryOptions) string {
+		return fmt.Sprintf("%s\x00%t\x00%t\x00%t", key.query, key.matchCase, key.wholeWord, key.regexp)
+	})
 }
 
 // chatSearchCacheKey combines the query with the transcript revision, so edits
@@ -267,7 +309,22 @@ func invalidateChatSearch(t *conversation) {
 	s.spanCache = nil
 	s.codeCache = nil
 	// The shape may have changed, so the next scan starts from the beginning.
-	s.scanCount, s.scanPrefix, s.scanBytes, s.tailOnly = 0, 0, 0, false
+	s.scanCount, s.scanPrefix, s.scanBytes, s.tailOnly, s.appendOnly = 0, 0, 0, false, false
+}
+
+// Tool records append without changing earlier searchable message content.
+func invalidateChatSearchAppend(t *conversation) {
+	if t == nil || t.UI == nil {
+		return
+	}
+	s := &t.UI.Search
+	if s.tailOnly || (s.scanCount != len(t.Messages) && !s.appendOnly) {
+		invalidateChatSearch(t)
+		return
+	}
+	s.transcriptRevision++
+	s.frameKey, s.spanCache, s.codeCache = "", nil, nil
+	s.appendOnly = true
 }
 
 // invalidateChatSearchTail is invalidateChatSearch for a reply that only grew its
@@ -295,7 +352,30 @@ func (s *chatSearch) chatSearchPattern() (*regexp.Regexp, error) {
 		return s.pattern, s.patternErr
 	}
 	s.patternKey, s.pattern, s.patternErr = key, nil, nil
-	if !s.Regexp || strings.TrimSpace(s.Query) == "" {
+	s.literal, s.literalPrefix = nil, nil
+	s.literalStarts = nil
+	s.literalQuery, s.literalMatchCase = s.Query, s.MatchCase
+	if strings.TrimSpace(s.Query) == "" {
+		return nil, nil
+	}
+	if !s.Regexp {
+		s.literal = []rune(s.Query)
+		if !s.MatchCase {
+			for i, r := range s.literal {
+				s.literal[i] = chatSearchFoldRune(r)
+			}
+		}
+		s.literalPrefix = make([]int, len(s.literal))
+		s.literalStarts = make([]int, len(s.literal))
+		for i, matched := 1, 0; i < len(s.literal); i++ {
+			for matched > 0 && s.literal[i] != s.literal[matched] {
+				matched = s.literalPrefix[matched-1]
+			}
+			if s.literal[i] == s.literal[matched] {
+				matched++
+			}
+			s.literalPrefix[i] = matched
+		}
 		return nil, nil
 	}
 	pattern := s.Query
@@ -324,6 +404,7 @@ func chatSearchComputeBounded(t *conversation, s *chatSearch) ([]chatSearchMatch
 // offsets: a visible result is always complete for its message, and later
 // messages may be outside the budget.
 func chatSearchScanAll(t *conversation, s *chatSearch) (out []chatSearchMatch, truncated bool, prefix, total int) {
+	s.candidateTruncated = false
 	if strings.TrimSpace(s.Query) == "" {
 		return nil, false, 0, 0
 	}
@@ -365,83 +446,112 @@ func chatSearchScanMessage(m map[string]any, index int, s *chatSearch, budget in
 	if len(text) == 0 {
 		return out, true
 	}
-	for _, span := range chatSearchSpans(text, s, re, chatSearchMaxMatches-len(out)) {
+	spans, limited := chatSearchSpansBounded(text, s, re, chatSearchMaxMatches-len(out))
+	s.candidateTruncated = limited
+	for _, span := range spans {
 		out = append(out, chatSearchMatch{Message: index, Start: span[0], End: span[1]})
 		if len(out) >= chatSearchMaxMatches {
 			return out, false
 		}
 	}
-	return out, truncated
+	return out, truncated || limited
 }
 
 // chatSearchSpans finds the byte ranges of the query in one message. The offsets
 // always address the original text: a lowercased copy changes length for a few
 // runes, which sliced the wrong bytes or even panicked.
 func chatSearchSpans(text string, s *chatSearch, re *regexp.Regexp, limit int) [][2]int {
-	if limit <= 0 {
-		return nil
-	}
-	if re != nil {
-		var spans [][2]int
-		for from := 0; from <= len(text) && len(spans) < limit; {
-			loc := re.FindStringIndex(text[from:])
-			if loc == nil {
-				break
-			}
-			start, end := from+loc[0], from+loc[1]
-			if start < end && (!s.WholeWord || chatSearchWordBoundary(text, start, end)) {
-				spans = append(spans, [2]int{start, end})
-			}
-			if end > from {
-				from = end
-			} else {
-				_, size := utf8.DecodeRuneInString(text[from:])
-				from += max(1, size) // progress past an empty regexp match
-			}
-		}
-		return spans
-	}
-	needle := s.Query
-	if needle == "" {
-		return nil
-	}
-	var spans [][2]int
-	for from := 0; from < len(text) && len(spans) < limit; {
-		end, ok := chatSearchMatchAt(text, from, needle, s.MatchCase)
-		if !ok {
-			_, size := utf8.DecodeRuneInString(text[from:])
-			from += max(1, size)
-			continue
-		}
-		if !s.WholeWord || chatSearchWordBoundary(text, from, end) {
-			spans = append(spans, [2]int{from, end})
-		}
-		from = end
-	}
+	spans, _ := chatSearchSpansBounded(text, s, re, limit)
 	return spans
 }
 
-// chatSearchMatchAt reports where the needle ends when it starts at text[from:],
-// comparing rune by rune so a case-insensitive match never moves the offsets.
-func chatSearchMatchAt(text string, from int, needle string, matchCase bool) (int, bool) {
-	at := from
-	for _, want := range needle {
-		if at >= len(text) {
-			return 0, false
-		}
-		got, size := utf8.DecodeRuneInString(text[at:])
-		if got != want {
-			if matchCase || !chatSearchSameRune(got, want) {
-				return 0, false
+func chatSearchSpansBounded(text string, s *chatSearch, re *regexp.Regexp, limit int) ([][2]int, bool) {
+	if limit <= 0 {
+		return nil, false
+	}
+	if re != nil {
+		var spans [][2]int
+		// Search the original string so ^, $ and word boundaries retain their
+		// context. Bound candidates too: zero-width or rejected whole-word hits
+		// must not allocate a result for every byte in a large message.
+		matches := re.FindAllStringIndex(text, chatSearchMaxRegexCandidates+1)
+		for i, loc := range matches {
+			if i == chatSearchMaxRegexCandidates {
+				return spans, true
+			}
+			start, end := loc[0], loc[1]
+			if start < end && (!s.WholeWord || chatSearchWordBoundary(text, start, end)) {
+				spans = append(spans, [2]int{start, end})
+				if len(spans) == limit {
+					return spans, false
+				}
 			}
 		}
-		at += size
+		return spans, false
 	}
-	return at, true
+	if s.Query == "" {
+		return nil, false
+	}
+	var spans [][2]int
+	if s.MatchCase {
+		for from := 0; from < len(text) && len(spans) < limit; {
+			at := strings.Index(text[from:], s.Query)
+			if at < 0 {
+				break
+			}
+			start := from + at
+			end := start + len(s.Query)
+			if !s.WholeWord || chatSearchWordBoundary(text, start, end) {
+				spans = append(spans, [2]int{start, end})
+			}
+			from = end
+		}
+		return spans, false
+	}
+	if s.literal == nil || s.literalQuery != s.Query || s.literalMatchCase != s.MatchCase {
+		s.chatSearchPattern()
+	}
+	needle := s.literal
+	if len(needle) == 0 {
+		return nil, false
+	}
+	// A prefix table avoids restarting a long near-match at every text rune.
+	// Keep source byte positions in a bounded ring instead of lowercasing text,
+	// which changes byte lengths for some Unicode characters.
+	starts := s.literalStarts
+	matched, count := 0, 0
+	for at, r := range text {
+		starts[count%len(starts)] = at
+		count++
+		r = chatSearchFoldRune(r)
+		for matched > 0 && r != needle[matched] {
+			matched = s.literalPrefix[matched-1]
+		}
+		if r == needle[matched] {
+			matched++
+		}
+		if matched == len(needle) {
+			start := starts[(count-len(needle))%len(starts)]
+			_, size := utf8.DecodeRuneInString(text[at:])
+			end := at + size
+			if !s.WholeWord || chatSearchWordBoundary(text, start, end) {
+				spans = append(spans, [2]int{start, end})
+				if len(spans) == limit {
+					break
+				}
+			}
+			matched = 0 // Match the non-overlapping ranges used by regexp.FindAll.
+		}
+	}
+	return spans, false
 }
 
-func chatSearchSameRune(got, want rune) bool {
-	return unicode.ToLower(got) == unicode.ToLower(want) || unicode.ToUpper(got) == unicode.ToUpper(want)
+func chatSearchFoldRune(r rune) rune {
+	canonical := r
+	for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+		canonical = min(canonical, next)
+	}
+	return canonical
 }
 
 // chatSearchWordBoundary reports whether the range stands as a word of its own.
@@ -500,18 +610,24 @@ func (a *desktop) chatSearchStatus(t *conversation) string {
 	case chatSearchIdle:
 		return ""
 	case chatSearchBadPattern:
-		return "正则有误"
+		return locales.Text("正则有误")
 	}
 	matches := a.chatSearchMatches(t)
+	if s.candidateTruncated {
+		if len(matches) == 0 {
+			return locales.Text("未找到（正则候选过多，搜索已截断）")
+		}
+		return fmt.Sprintf(locales.Text("%d of %d（正则候选过多，搜索已截断）"), min(max(s.Current, 0), len(matches)-1)+1, len(matches))
+	}
 	if len(matches) == 0 {
 		if s.scanTruncated {
-			return fmt.Sprintf("未找到（仅搜索前 %d MiB）", chatSearchMaxBytes>>20)
+			return fmt.Sprintf(locales.Text("未找到（仅搜索前 %d MiB）"), chatSearchMaxBytes>>20)
 		}
-		return "无结果"
+		return locales.Text("无结果")
 	}
 	current := min(max(s.Current, 0), len(matches)-1) + 1
 	if s.scanTruncated {
-		return fmt.Sprintf("%d of %d（仅搜索前 %d MiB）", current, len(matches), chatSearchMaxBytes>>20)
+		return fmt.Sprintf(locales.Text("%d of %d（仅搜索前 %d MiB）"), current, len(matches), chatSearchMaxBytes>>20)
 	}
 	if len(matches) >= chatSearchMaxMatches {
 		// Say so rather than passing the cap off as the total.
@@ -524,14 +640,14 @@ func (a *desktop) chatSearchStatus(t *conversation) string {
 func (a *desktop) chatSearchBar(c *ui.Context, t *conversation) {
 	s := &t.uiState().Search
 	th := c.Theme()
-	bar := ui.Row(c.Key(t.ID+"-search-bar")).Label("对话查找").AlignItems(ui.Center).Gap(th.Space(1)).
+	bar := ui.Row(c.Key(t.ID+"-search-bar")).Label(locales.Text("对话查找")).AlignItems(ui.Center).Gap(th.Space(1)).Wrap().
 		Padding(th.Space(1.5)).Background(th.Surface).Border(1, th.Border).Radius(th.Radius).
 		Shadow(0, 2, 8, 0, ui.RGBA(0, 0, 0, 0.18)).Shrink(0)
 	bar.Children(func() {
 		field := ui.TextInputBase(c.Key(t.ID+"-search-query"), &s.Query).
-			Width(th.Space(50)).Placeholder("在对话中查找").Padding(th.Space(1), th.Space(2)).
+			Width(th.Space(50)).MaxWidthPercent(100).MinWidth(80).Placeholder(locales.Text("在对话中查找")).Padding(th.Space(1), th.Space(2)).
 			Background(th.Background).Border(1, th.Border).Radius(th.Radius-2).FontSize(th.FontSize-1).
-			Label("在对话中查找").FocusBind(&a.chatSearchFocus, t.ID+"-search-query")
+			Label(locales.Text("在对话中查找")).FocusBind(&a.chatSearchFocus, t.ID+"-search-query")
 		field.OnTextKey(func(k ui.TextKey) bool {
 			switch k.Key {
 			case ui.KeyEscape:
@@ -565,14 +681,14 @@ func (a *desktop) chatSearchBar(c *ui.Context, t *conversation) {
 			}
 			b.Children(func() { ui.Text(c, label).FontSize(th.FontSize - 1) })
 		}
-		toggle(&s.MatchCase, "Aa", "区分大小写")
-		toggle(&s.WholeWord, "ab", "全词匹配")
-		toggle(&s.Regexp, ".*", "使用正则表达式")
+		toggle(&s.MatchCase, "Aa", locales.Text("区分大小写"))
+		toggle(&s.WholeWord, "ab", locales.Text("全词匹配"))
+		toggle(&s.Regexp, ".*", locales.Text("使用正则表达式"))
 		ui.Text(c, a.chatSearchStatus(t)).FontSize(th.FontSize - 2).TextColor(a.secondaryInk()).
 			FontFeatures("tnum").MinWidth(th.Space(16)).Role(ui.RoleStatus)
-		mutedIconAction(c, t.ID+"-search-prev", "上一个匹配", "arrowup", 24, func() { a.chatSearchStep(t, -1) }).Shrink(0)
-		mutedIconAction(c, t.ID+"-search-next", "下一个匹配", "arrowdown", 24, func() { a.chatSearchStep(t, 1) }).Shrink(0)
-		mutedIconAction(c, t.ID+"-search-close", "关闭查找（Esc）", "close", 24, func() { a.closeChatSearch(t) }).Shrink(0)
+		mutedIconAction(c, t.ID+"-search-prev", locales.Text("上一个匹配"), "arrowup", 24, func() { a.chatSearchStep(t, -1) }).Shrink(0)
+		mutedIconAction(c, t.ID+"-search-next", locales.Text("下一个匹配"), "arrowdown", 24, func() { a.chatSearchStep(t, 1) }).Shrink(0)
+		mutedIconAction(c, t.ID+"-search-close", locales.Text("关闭查找（Esc）"), "close", 24, func() { a.closeChatSearch(t) }).Shrink(0)
 	})
 }
 
@@ -598,12 +714,10 @@ func (a *desktop) beginChatSearchFrame(t *conversation) {
 // chatSearchBlock replaces the paragraph and heading blocks that hold a hit with
 // their text, matched runs carrying a background. The hook also reaches the
 // paragraphs of list items and quotes, which keep their markers and indentation
-// because only the text is replaced. Markdown offers no hook to mark ranges
-// inside its own layout, so those blocks give up their inline styling (bold,
-// links, inline code) while the bar is open; every other block, and every message
-// without a hit, renders exactly as always. A replaced block is not recorded in
-// the view's line map, so "Copy as Markdown" while the bar is open leaves the
-// paragraphs it drew out; closing the bar restores the whole map.
+// because only plain text is replaced. Formatted inline content keeps the
+// renderer's layout. Custom blocks have no Markdown line-map entry, so copying
+// a selection in them uses MyGo's plain-text fallback; copying the whole
+// document still uses its original source.
 func (a *desktop) chatSearchBlock(t *conversation, message int) func(c *ui.Context, doc *parser.Document, index int) bool {
 	return func(c *ui.Context, doc *parser.Document, index int) bool {
 		s := &t.uiState().Search
@@ -633,7 +747,8 @@ func chatSearchBlockSpans(doc *parser.Document, index, message int, s *chatSearc
 	// Do not replace formatted inline content with raw Markdown source. Plain
 	// prose and headings can be highlighted without exposing markup syntax.
 	for _, in := range doc.Inlines(index) {
-		if in.Kind != parser.Text && in.Kind != parser.SoftBreak && in.Kind != parser.LineBreak {
+		// Mentions and references render as literal text while Resolve is unset.
+		if in.Kind != parser.Text && in.Kind != parser.Mention && in.Kind != parser.Reference && in.Kind != parser.SoftBreak && in.Kind != parser.LineBreak {
 			return "", nil, 0, false
 		}
 	}
@@ -692,11 +807,7 @@ func chatSearchBlockText(raw string, message, start, end int, s *chatSearch) (st
 	if spans, ok := s.spanCache[key]; ok {
 		return text, spans, start + lead, len(spans) > 0
 	}
-	re, err := s.chatSearchPattern()
-	if err != nil {
-		return "", nil, 0, false
-	}
-	spans := chatSearchSpans(text, s, re, chatSearchMaxMatches)
+	spans := chatSearchRangeSpans(s.cache, message, start+lead, start+lead+len(text))
 	if s.spanCache == nil {
 		s.spanCache = map[chatSearchBlockKey][][2]int{}
 	}
@@ -744,7 +855,7 @@ func (a *desktop) chatSearchMark(c *ui.Context, t *conversation, message int, bl
 		}
 		run := ui.Span{Text: text[span[0]:span[1]], Background: p.accent.Alpha(0.38), Radius: 3}
 		if hasCurrent && current.Start == base+span[0] {
-			run.Background, run.Color, run.Weight = p.accent, c.Theme().Background, 600
+			run.Background, run.Color = p.accent, c.Theme().Background
 			pointed = i
 		}
 		parts = append(parts, run)
@@ -805,9 +916,9 @@ func (a *desktop) chatSearchTextStyle(block *parser.Block) (size float32, weight
 // block — and every block once the bar closes — keeps the renderer's own syntax
 // colouring, copy button and wrapping. fallback is what the theme installed.
 //
-// The drawn block carries no syntax colouring and is not recorded for the view's
-// "Copy as Markdown" line map: both come back with the renderer as soon as the
-// hit moves on or the bar closes.
+// The drawn block carries no syntax colouring and has no Markdown line-map
+// entry. Selection copying uses MyGo's plain-text fallback; closing the bar
+// restores the native renderer's colouring and line map.
 func (a *desktop) chatSearchCodeHook(t *conversation, message int, fallback func(*ui.Context, *markdown.CodeBlockView)) func(*ui.Context, *markdown.CodeBlockView) {
 	return func(c *ui.Context, block *markdown.CodeBlockView) {
 		if a.chatSearchCodeMark(c, t, message, block) {
@@ -832,6 +943,10 @@ func (a *desktop) chatSearchCodeMark(c *ui.Context, t *conversation, message int
 	p := a.currentPalette()
 	colors := a.readingColors()
 	base, codeSize := readingSizes(a.config.MessageFontSize, a.config.CodeFontSize)
+	codeFont := "monospace"
+	if options := t.MD[message]; options != nil && options.Theme != nil && options.Theme.CodeFont != "" {
+		codeFont = options.Theme.CodeFont
+	}
 	// The reading theme keeps MyGo's default code-block paddings, in ems of the
 	// body size, so the block measures as the one it stands in for.
 	pad := 0.85 * base
@@ -864,7 +979,7 @@ func (a *desktop) chatSearchCodeMark(c *ui.Context, t *conversation, message int
 					}
 					run := ui.Span{Text: line[span[0]:span[1]], Background: p.accent.Alpha(0.38), Radius: 3}
 					if hasCurrent && current.Start == starts[i]+span[0] {
-						run.Background, run.Color, run.Weight = p.accent, c.Theme().Background, 600
+						run.Background, run.Color = p.accent, c.Theme().Background
 						pointedAt = span[0]
 					}
 					parts = append(parts, run)
@@ -877,7 +992,7 @@ func (a *desktop) chatSearchCodeMark(c *ui.Context, t *conversation, message int
 					// A blank line still holds the row: the block keeps its height.
 					parts = append(parts, ui.Span{Text: " "})
 				}
-				view := ui.RichText(c, parts...).FillWidth().Font(nativeFontFamily()).FontSize(codeSize).
+				view := ui.RichText(c.Key(i), parts...).FillWidth().Font(codeFont).FontSize(codeSize).
 					LineHeight(readingCodeLineHeight).TextColor(colors.text)
 				if pointedAt >= 0 {
 					// Anchor the very line the hit is on, and how far into it the run sits:
@@ -946,14 +1061,26 @@ func chatSearchCodeAt(doc *parser.Document, index int, s *chatSearch, message, s
 	if !chatSearchBlockHasHit(s, message, start, end) {
 		return chatSearchCode{}
 	}
-	re, err := s.chatSearchPattern()
-	if err != nil {
+	if end-start > chatSearchCodeMaxBytes || end <= start {
 		return chatSearchCode{}
 	}
 	n := doc.LineCount(index)
+	if n > chatSearchCodeMaxLines {
+		return chatSearchCode{}
+	}
+	hits := 0
+	for _, hit := range s.cache {
+		if hit.Message == message && hit.Start < end && hit.End > start {
+			hits++
+		}
+	}
+	if hits > chatSearchCodeMaxSpans {
+		return chatSearchCode{}
+	}
 	src := doc.Source()
 	out := chatSearchCode{lines: make([]string, 0, n), starts: make([]int, 0, n), spans: make([][][2]int, 0, n)}
-	size, hits := 0, 0
+	size := 0
+	hits = 0
 	for k := 0; k < n; k++ {
 		line, at := doc.Line(index, k)
 		if size += len(line); size > chatSearchCodeMaxBytes {
@@ -963,7 +1090,7 @@ func chatSearchCodeAt(doc *parser.Document, index int, s *chatSearch, message, s
 		// so the offsets taken from it are shifted: report where the line starts in
 		// the source, not where the padded one does.
 		at -= chatSearchCodePad(src, line, at)
-		found := chatSearchSpans(line, s, re, chatSearchCodeMaxSpans-hits)
+		found := chatSearchRangeSpans(s.cache, message, at, at+len(line))
 		out.lines, out.starts, out.spans = append(out.lines, line), append(out.starts, at), append(out.spans, found)
 		hits += len(found)
 	}
@@ -972,6 +1099,23 @@ func chatSearchCodeAt(doc *parser.Document, index int, s *chatSearch, message, s
 	}
 	out.ok = true
 	return out
+}
+
+// Project the authoritative message matches onto a rendered range. Rescanning
+// individual lines or trimmed prose would change regexp anchors and boundaries,
+// miss multiline matches and highlight runs beyond the transcript's scan cap.
+func chatSearchRangeSpans(matches []chatSearchMatch, message, start, end int) [][2]int {
+	var spans [][2]int
+	for _, hit := range matches {
+		if hit.Message != message || hit.Start >= end || hit.End <= start {
+			continue
+		}
+		left, right := max(hit.Start, start), min(hit.End, end)
+		if left < right {
+			spans = append(spans, [2]int{left - start, right - start})
+		}
+	}
+	return spans
 }
 
 // chatSearchCodePad is how many spaces Document.Line put in front of a line that
@@ -994,9 +1138,9 @@ func chatSearchCodePad(src, line string, at int) int {
 // chatSearchCodeLabel names a code block for a screen reader, as the renderer does.
 func chatSearchCodeLabel(language string) string {
 	if language == "" {
-		return "Code"
+		return locales.Text("代码")
 	}
-	return "Code, " + language
+	return locales.Text("代码") + ", " + language
 }
 
 // chatSearchBlockHasHit reports whether one of the message's hits starts in the
@@ -1023,7 +1167,7 @@ func (a *desktop) chatSearchCurrent(t *conversation) (chatSearchMatch, bool) {
 // chatSearchReveal scrolls the frame's current match into view, once the row
 // that holds it has bounds from the last frame. A jump is one scroll: the bar waits
 // for the layout it needs, bounded, and then scrolls to the best anchor it has.
-func (a *desktop) chatSearchReveal(c *ui.Context, t *conversation, start, end int) {
+func (a *desktop) chatSearchReveal(c *ui.Context, t *conversation) {
 	st := t.uiState()
 	s := &st.Search
 	if !s.Open || !s.reveal {
@@ -1035,17 +1179,17 @@ func (a *desktop) chatSearchReveal(c *ui.Context, t *conversation, start, end in
 		return
 	}
 	target := matches[min(max(s.Current, 0), len(matches)-1)]
-	if target.Message < start || target.Message >= end {
-		// The message is outside the window: open the page around it and let the
-		// next frame scroll to the row this one builds. This wait has its own
-		// budget, so opening the page never eats the one the anchor needs.
+	if !st.built.holds(target.Message) {
+		// The list has not built this row: scroll to it and let the next frame
+		// lay out the block that holds the hit. This wait has its own budget, so
+		// reaching the row never eats the one the anchor needs.
 		if !a.awaitChatSearchFrame(c, &s.waitedWindow) {
 			a.endChatSearchJump(s)
 			return
 		}
-		st.VisibleStart = max(0, target.Message-min(40, a.messageWindowSize()/2)) + 1
-		st.Follow, st.FollowPending = false, false
-		t.Scroll.Y = 0
+		if row := t.rowOfMessage(target.Message); row >= 0 {
+			st.List.ScrollTo(row, ui.Start)
+		}
 		return
 	}
 	viewport := t.Scroll.Bounds(c)
@@ -1095,7 +1239,7 @@ func (a *desktop) endChatSearchJump(s *chatSearch) {
 // scrollChatSearch moves the transcript by delta, leaving the hit just below the
 // top edge, and ends the jump.
 func (a *desktop) scrollChatSearch(t *conversation, st *chatUI, delta float32) {
-	st.Follow, st.FollowPending = false, false
+	st.Follow = false
 	t.Scroll.Y = max(float32(0), t.Scroll.Y+delta)
 	a.endChatSearchJump(&st.Search)
 }

@@ -63,7 +63,7 @@ func option(c *ui.Context, item ui.Element, text string, selected bool, ink ...u
 	item.Children(func() {
 		label := text
 		if label == "" {
-			label = "自动"
+			label = kitText(c, "自动")
 		}
 		ink := t.Text
 		if selected {
@@ -107,7 +107,7 @@ func SelectField(c *ui.Context, value *string, options []Option, ink ...ui.Color
 			}
 		}
 		if label == "" {
-			label = "自动"
+			label = kitText(c, "自动")
 		}
 		ui.Text(c, label).FontSize(FontBody).SingleLine().Grow(1).MinWidth(0).Cursor(ui.CursorPointer)
 		ui.Box(c).Size(18, 18).Shrink(0).Center().Children(func() {
@@ -185,7 +185,7 @@ func ComboboxField(c *ui.Context, value *string, options []string, label, placeh
 		cb.Input.Height(ControlHeight).FillHeight().Grow(1).MinWidth(0).Padding(5, 10).
 			FontSize(FontBody).Border(0, ui.Transparent).Background(ui.Transparent).Radius(0).TextColor(c.Theme().Text).
 			Label(label).Placeholder(placeholder)
-		toggle := Tooltip(c, ui.Box(c).Size(32, ControlHeight).Shrink(0).Center().Cursor(ui.CursorPointer).Label("展开选项"), "选择或输入")
+		toggle := Tooltip(c, ui.Box(c).Size(32, ControlHeight).Shrink(0).Center().Cursor(ui.CursorPointer).Label(kitText(c, "展开选项")), kitText(c, "选择或输入"))
 		toggle.OnClick(func() {
 			cb.Input.Focus()
 			cb.SetOpen(true)
@@ -215,33 +215,6 @@ func ComboboxField(c *ui.Context, value *string, options []string, label, placeh
 		cb.Input.SetChanged()
 	}
 	return root
-}
-
-// TabRadius is the radius of one tab in a strip. The underline follows it, which
-// is why the line draws in at both ends instead of running edge to edge.
-const TabRadius float32 = 6
-
-// TabInk is the label colour of one tab: the text colour when chosen, a shade
-// darker than it otherwise. Weight, not colour, marks the chosen tab, so the
-// accent appears once in the strip rather than twice. secondary 传调用方的次要
-// 文字色（Theme.TextMuted 是占位淡色）。
-func TabInk(t *ui.Theme, active bool, secondary ...ui.Color) ui.Color {
-	if active {
-		return t.Text
-	}
-	return SecondaryInkOf(t, secondary...).Mix(t.Text, 0.22)
-}
-
-// TabUnderline is the legacy workspace-header treatment. Page navigation uses
-// TabsWithOptions in tabs.go; its straight underline never inherits this radius.
-func TabUnderline(e ui.Element, active bool, radius float32, t *ui.Theme) ui.Element {
-	e.Radius(radius).BorderWidth(0, 0, 2, 0)
-	if active {
-		e.BorderColor(t.Accent)
-	} else {
-		e.BorderColor(ui.Transparent)
-	}
-	return e
 }
 
 // OptionGroup is the compact neutral track shared by groups of choices.
@@ -358,9 +331,9 @@ func passwordInputInk(c *ui.Context, key, label string, value *string, tone []ui
 		if !*visible {
 			input.Password()
 		}
-		action, icon := "显示 "+label, eyeIcon
+		action, icon := kitText(c, "显示 ")+label, eyeIcon
 		if *visible {
-			action, icon = "隐藏 "+label, eyeOffIcon
+			action, icon = kitText(c, "隐藏 ")+label, eyeOffIcon
 		}
 		button := Tooltip(c, ui.ButtonBase(c.Key("visibility")).Size(32, ControlHeight).Shrink(0).Center().Cursor(ui.CursorPointer).Label(action), action)
 		button.Children(func() { ui.Icon(c, icon).Size(15, 15).TextColor(ink) })

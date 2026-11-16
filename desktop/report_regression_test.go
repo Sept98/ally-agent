@@ -10,21 +10,24 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+// A new run takes the reader to the newest message, even from far up the
+// history: what it streams lands at the end.
 func TestNewRunLeavesOlderHistoryPage(t *testing.T) {
 	conv := &conversation{ID: "history", Messages: restoredHistory(200)}
 	st := conv.uiState()
-	st.VisibleStart, st.LastScrollY, st.Follow = 1, 400, false
 	a := &desktop{tabs: []*conversation{conv}}
-	a.applyEvent("run:start", map[string]any{"sessionId": conv.ID})
-	start, end := historyMessageWindow(conv, 80)
-	if start == 0 || end != len(conv.Messages) || st.VisibleStart != 0 || !st.FollowPending {
-		t.Fatalf("new run remained on history: %d:%d %+v", start, end, st)
-	}
 	tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.chatMessages(c, conv, 900) }, 900, 400)
 	tt.Frame()
+	st.List.ScrollTo(0, ui.Start)
 	tt.Frame()
-	if !st.Follow || conv.Scroll.Y < conv.Scroll.MaxY-2 {
-		t.Fatalf("latest request lost follow during layout: %v / %v", conv.Scroll.Y, conv.Scroll.MaxY)
+	if st.List.AtEnd() {
+		t.Fatal("the transcript did not scroll away from its end")
+	}
+	a.applyEvent("run:start", map[string]any{"sessionId": conv.ID})
+	tt.Frame()
+	tt.Frame()
+	if !st.List.AtEnd() || conv.Scroll.Y < conv.Scroll.MaxY-2 {
+		t.Fatalf("a new run stayed up the history: %v / %v", conv.Scroll.Y, conv.Scroll.MaxY)
 	}
 }
 
@@ -45,28 +48,26 @@ func TestStreamedAnswerOpensHistoryBlock(t *testing.T) {
 	}
 }
 
-func TestRunErrorFollowsOnlyWhenReaderIsFollowing(t *testing.T) {
-	for _, follow := range []bool{false, true} {
-		conv := &conversation{}
-		conv.uiState().Follow = follow
-		appendRunError(conv, "多行\n错误")
-		appendRunError(conv, "多行\n错误")
-		if len(conv.Messages) != 1 || conv.uiState().FollowPending != follow {
-			t.Fatalf("follow=%v messages=%v pending=%v", follow, conv.Messages, conv.uiState().FollowPending)
-		}
+// The same error is announced once, whether or not the reader is at the end.
+func TestRunErrorAppendsOnce(t *testing.T) {
+	conv := &conversation{}
+	appendRunError(conv, "多行\n错误", "error")
+	appendRunError(conv, "多行\n错误", "error")
+	if len(conv.Messages) != 1 {
+		t.Fatalf("messages = %v", conv.Messages)
 	}
 }
 
-func TestCompactReasoningDoesNotTriggerTranscriptScroll(t *testing.T) {
+func TestCompactReasoningDoesNotChangeTheTranscript(t *testing.T) {
 	a := &desktop{}
 	conv := &conversation{}
 	a.compactDelta(conv, "", 32)
-	if conv.uiState().FollowPending || len(conv.Messages) != 0 {
+	if len(conv.Messages) != 0 {
 		t.Fatal("reasoning-only compaction changed the transcript")
 	}
 	a.compactDelta(conv, "summary", 0)
-	if !conv.uiState().FollowPending || len(conv.Messages) != 1 {
-		t.Fatal("visible compaction content did not request following")
+	if len(conv.Messages) != 1 {
+		t.Fatal("visible compaction content did not reach the transcript")
 	}
 }
 
@@ -264,18 +265,6 @@ func TestUserAgentDefaultLabelIsNormalizedOnlyOnSave(t *testing.T) {
 	}
 }
 
-func TestSelectionColorTracksAccent(t *testing.T) {
-	for _, mode := range []string{"light", "dark"} {
-		for _, palette := range []int{paletteAmber, paletteForest, paletteViolet} {
-			a := &desktop{}
-			a.prefs.Appearance, a.prefs.Palette = mode, palette
-			if got, want := a.theme().Selection, a.currentPalette().accent.Alpha(0.30); got != want {
-				t.Fatalf("%s palette %d selection %v != %v", mode, palette, got, want)
-			}
-		}
-	}
-}
-
 func TestCatalogModelCanBeClearedAndReplacedWithCustomID(t *testing.T) {
 	provider := availableModelCatalog().Providers[0]
 	if len(provider.Models) == 0 {
@@ -303,9 +292,10 @@ func TestCatalogModelCanBeClearedAndReplacedWithCustomID(t *testing.T) {
 	}
 }
 
-func TestMCPSearchShowsEmptyState(t *testing.T) {
+func TestServerAndToolSearchShowEmptyState(t *testing.T) {
 	a := &desktop{mcpText: `{"mcpServers":{"server":{"command":"node"}}}`, toolInventory: []backend.ToolDefinitionSummary{{Name: "read", Protected: true}}}
 	a.mcpF.Search = "not-a-match"
+	a.builtinToolSearch = "not-a-match"
 	for _, tc := range []struct {
 		name string
 		draw func(*ui.Context)

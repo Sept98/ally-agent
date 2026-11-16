@@ -4,6 +4,7 @@ package desktop
 import (
 	"ally-dev/desktop/uikit"
 	backend "ally-dev/internal/app"
+	"ally-dev/locales"
 	"bytes"
 	"encoding/base64"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -126,7 +128,7 @@ func prepareAttachment(path string) preparedAttachment {
 		return result
 	}
 	if !info.Mode().IsRegular() {
-		result.input.Error = "请选择普通文件"
+		result.input.Error = locales.Text("请选择普通文件")
 		return result
 	}
 	result.input.Size = info.Size()
@@ -140,7 +142,7 @@ func prepareAttachment(path string) preparedAttachment {
 	if isImage {
 		result.input.Kind = "image"
 		if info.Size() > maxOriginalImageBytes {
-			result.input.Error = "图片过大，无法读取（上限 64 MB）"
+			result.input.Error = locales.Text("图片过大，无法读取（上限 64 MB）")
 			return result
 		}
 		data, err := io.ReadAll(io.LimitReader(f, maxOriginalImageBytes+1))
@@ -154,7 +156,7 @@ func prepareAttachment(path string) preparedAttachment {
 		result.input.Kind = "text"
 		if info.Size() > maxAttachmentTextBytes {
 			result.input.Truncated = true
-			result.input.Error = "文本附件超过 200 KB，无法发送"
+			result.input.Error = locales.Text("文本附件超过 200 KB，无法发送")
 			return result
 		}
 		data, err := io.ReadAll(io.LimitReader(f, maxAttachmentTextBytes+1))
@@ -163,25 +165,25 @@ func prepareAttachment(path string) preparedAttachment {
 			return result
 		}
 		if !utf8.Valid(data) {
-			result.input.Error = "文本不是有效的 UTF-8 编码"
+			result.input.Error = locales.Text("文本不是有效的 UTF-8 编码")
 			return result
 		}
 		result.input.Text = string(data)
 		return result
 	}
 	result.input.Kind = "file"
-	result.input.Error = "暂不支持此类型的附件；请选择图片或文本文件"
+	result.input.Error = locales.Text("暂不支持此类型的附件；请选择图片或文本文件")
 	return result
 }
 func prepareImageData(result preparedAttachment, data []byte) preparedAttachment {
 	if len(data) > maxOriginalImageBytes {
-		result.input.Error = "图片过大，无法读取（上限 64 MB）"
+		result.input.Error = locales.Text("图片过大，无法读取（上限 64 MB）")
 		return result
 	}
 	var typ string
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
-		result.input.Error = "无法读取图片：" + err.Error()
+		result.input.Error = locales.Text("无法读取图片：") + err.Error()
 		return result
 	}
 	if e := oversizedImageError(cfg, format); e != nil {
@@ -190,10 +192,10 @@ func prepareImageData(result preparedAttachment, data []byte) preparedAttachment
 	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		result.input.Error = "无法读取图片：" + err.Error()
+		result.input.Error = locales.Text("无法读取图片：") + err.Error()
 		return result
 	}
-	result.preview = resizeImage(img, 256)
+	result.preview = resizeImage(img, attachmentChipEdge)
 	switch format {
 	case "jpeg":
 		typ = "image/jpeg"
@@ -212,14 +214,14 @@ func prepareImageData(result preparedAttachment, data []byte) preparedAttachment
 		var out bytes.Buffer
 		err = jpeg.Encode(&out, opaqueOnWhite(img, modelImageMaxEdge), &jpeg.Options{Quality: modelImageJPEGQuality})
 		if err != nil {
-			result.input.Error = "图片转换失败：" + err.Error()
+			result.input.Error = locales.Text("图片转换失败：") + err.Error()
 			return result
 		}
 		data = out.Bytes()
 		typ = "image/jpeg"
 	}
 	if len(data) > maxModelImageBytes {
-		result.input.Error = "压缩后的图片超过 5 MB，无法发送"
+		result.input.Error = locales.Text("压缩后的图片超过 5 MB，无法发送")
 		return result
 	}
 	result.input.DataURL = "data:" + typ + ";base64," + base64.StdEncoding.EncodeToString(data)
@@ -272,7 +274,7 @@ const decodeBudgetBytes = 100 << 20
 // by pixels follows the format rather than rejecting large photos outright.
 func oversizedImageError(cfg image.Config, format string) error {
 	if cfg.Width <= 0 || cfg.Height <= 0 {
-		return fmt.Errorf("图片尺寸无效")
+		return fmt.Errorf("%s", locales.Text("图片尺寸无效"))
 	}
 	bytesPerPixel := int64(4)
 	if format == "jpeg" {
@@ -283,7 +285,7 @@ func oversizedImageError(cfg image.Config, format string) error {
 	if pixels <= limit {
 		return nil
 	}
-	return fmt.Errorf("图片过大（%d 万像素），请先裁剪或缩小后再发送", pixels/10000)
+	return fmt.Errorf(locales.Text("图片过大（%d 万像素），请先裁剪或缩小后再发送"), pixels/10000)
 }
 
 func (a *desktop) chooseAttachments(t *conversation) {
@@ -292,7 +294,7 @@ func (a *desktop) chooseAttachments(t *conversation) {
 	}
 	t.AttachmentLoading = true
 	go func() {
-		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: a.win, Title: "添加附件", Multiple: true})
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: a.win, Title: locales.Text("添加附件"), Multiple: true})
 		if err != nil {
 			a.win.Update(func() { t.AttachmentLoading = false; a.notify(err.Error()) })
 			return
@@ -315,7 +317,7 @@ func (a *desktop) prepareAttachmentPaths(t *conversation, paths []string) {
 func (a *desktop) dropAttachments(t *conversation, paths []string) {
 	if !canAddAttachments(t, a.closing) {
 		if t != nil && t.AttachmentLoading && len(paths) > 0 {
-			a.notify("附件仍在准备，请稍后重新拖入")
+			a.notify(locales.Text("附件仍在准备，请稍后重新拖入"))
 		}
 		return
 	}
@@ -359,7 +361,7 @@ func (a *desktop) pasteImageFromClipboard(c *ui.Context, t *conversation) bool {
 		return false
 	}
 	if t.AttachmentLoading {
-		a.notify("附件仍在准备，请稍后重新粘贴图片")
+		a.notify(locales.Text("附件仍在准备，请稍后重新粘贴图片"))
 		return true
 	}
 	a.pasteAttachment(t, data)
@@ -372,7 +374,7 @@ func (a *desktop) pasteAttachment(t *conversation, data []byte) {
 	}
 	t.AttachmentLoading = true
 	go func() {
-		input := backend.AttachmentInput{ID: uuid.NewString(), Name: "剪贴板图片.png", Type: "image/png", Kind: "image", Size: int64(len(data))}
+		input := backend.AttachmentInput{ID: uuid.NewString(), Name: locales.Text("剪贴板图片.png"), Type: "image/png", Kind: "image", Size: int64(len(data))}
 		prepared := prepareImageData(preparedAttachment{input: input}, data)
 		a.win.Update(func() { a.finishAttachments(t, []preparedAttachment{prepared}, 1) })
 	}()
@@ -384,7 +386,7 @@ func (a *desktop) finishAttachments(t *conversation, prepared []preparedAttachme
 	}
 	for _, p := range prepared {
 		if len(t.PendingAttachments) >= maxAttachments {
-			a.notify("每条消息最多添加 8 个附件")
+			a.notify(locales.Text("每条消息最多添加 8 个附件"))
 			break
 		}
 		t.PendingAttachments = append(t.PendingAttachments, p.input)
@@ -399,22 +401,20 @@ func (a *desktop) finishAttachments(t *conversation, prepared []preparedAttachme
 		}
 	}
 	if count > maxAttachments {
-		a.notify("每条消息最多添加 8 个附件")
+		a.notify(locales.Text("每条消息最多添加 8 个附件"))
 	}
 }
 
-// commitPendingPreviews moves the previews of just-sent attachments into the
-// transcript image cache, where message tiles read them. Unsent previews live
-// outside that LRU-managed cache, so evicting history bitmaps never drops the
-// thumbnail of an attachment that is still waiting to be sent.
-func commitPendingPreviews(t *conversation) {
-	if len(t.PendingAttachmentImages) > 0 {
-		ensureAttachmentMaps(t)
-		for id, bm := range t.PendingAttachmentImages {
-			t.AttachmentImages[id] = bm
+// loadSentAttachmentImages loads the transcript's own copy of the pictures a
+// just-sent message carries. The composer's chips are 256px copies for a 36×32
+// slot and go with the message, so a tile never draws one and an open preview is
+// never left with it.
+func (a *desktop) loadSentAttachmentImages(t *conversation, inputs []backend.AttachmentInput) {
+	for _, input := range inputs {
+		if input.Kind == "image" {
+			a.loadAttachmentImage(t, input.ID, input.ImageRef, input.DataURL)
 		}
 	}
-	t.PendingAttachmentImages = nil
 }
 
 func ensureAttachmentMaps(t *conversation) {
@@ -436,13 +436,19 @@ func (a *desktop) activateTab(index int) {
 	previous := a.current()
 	next := a.tabs[index]
 	if previous != nil && previous != next {
+		a.hideFilePreview()
 		a.touchAttachmentImageCache(previous.ID)
 	}
 	a.active = index
+	a.rememberWorkspace(next.Workspace)
+	a.selectFileTree(next.Workspace)
 	a.ensureSSHWorkspaceLoaded(next.Workspace)
 	a.touchAttachmentImageCache(next.ID)
 	a.trimAttachmentImageCache()
 	a.restoreAttachmentImages(next)
+	if a.win != nil {
+		a.syncMediaOptions(a.activeFile())
+	}
 }
 
 func (a *desktop) restoreAttachmentImages(t *conversation) {
@@ -558,6 +564,7 @@ func (a *desktop) discardAttachmentImagesOnShutdown() {
 	}
 	a.attachmentImageCacheSessions = nil
 	a.attachmentImageJobSessions = nil
+	a.closeImagePreview()
 }
 
 func (a *desktop) shouldCacheAttachmentImages(t *conversation) bool {
@@ -594,7 +601,7 @@ func (a *desktop) finishAttachmentImageJob(t *conversation) {
 func (a *desktop) pendingAttachmentRow(c *ui.Context, t *conversation) {
 	ui.Row(c).Gap(gapInline).Wrap().Children(func() {
 		for _, att := range t.PendingAttachments {
-			ui.Row(c.Key(att.ID)).Padding(5, 8).Gap(7).AlignItems(ui.Center).Shrink(0).Background(c.Theme().Surface).Border(1, c.Theme().Border).Radius(radiusSmall).Label("待发送附件 " + att.Name).Children(func() {
+			ui.Row(c.Key(att.ID)).Padding(5, 8).Gap(7).AlignItems(ui.Center).Shrink(0).Background(c.Theme().Surface).Border(1, c.Theme().Border).Radius(radiusSmall).Label(locales.Text("待发送附件 ") + att.Name).Children(func() {
 				if bm := t.PendingAttachmentImages[att.ID]; bm != nil {
 					ui.Image(c, bm).Size(36, 32).Shrink(0).Fit(ui.Contain)
 				}
@@ -604,10 +611,10 @@ func (a *desktop) pendingAttachmentRow(c *ui.Context, t *conversation) {
 						uikit.Tooltip(c, ui.Text(c, short(att.Error, 18)).FontSize(fsMicro).TextColor(c.Theme().Danger), att.Error)
 					}
 				})
-				dangerIconAction(c, "attach-remove-"+att.ID, "移除 "+att.Name, "close", 20, func() {
+				dangerIconAction(c, "attach-remove-"+att.ID, locales.Text("移除 ")+att.Name, "close", 20, func() {
 					for i, item := range t.PendingAttachments {
 						if item.ID == att.ID {
-							t.PendingAttachments = append(t.PendingAttachments[:i], t.PendingAttachments[i+1:]...)
+							t.PendingAttachments = slices.Delete(t.PendingAttachments, i, i+1)
 							delete(t.PendingAttachmentImages, att.ID)
 							break
 						}
@@ -652,19 +659,25 @@ func messageAttachmentCount(m map[string]any) int {
 // size — on a HiDPI screen that is twice the window wide — and the transcript
 // used to draw it FillWidth at a fixed 300 height, which Fit(Contain) then blew
 // up to the full column. One image gets the larger box, several share a
-// thumbnail row, and a click opens one bigger. The box is computed from the
-// picture here, never enlarged past it.
+// thumbnail row, and a click opens the picture in the full-window preview (see
+// imagePreview). The box is computed from the picture here, never enlarged past
+// it.
 const (
 	attachmentLoneW  float32 = 460
 	attachmentLoneH  float32 = 340
 	attachmentThumbW float32 = 220
 	attachmentThumbH float32 = 150
-	attachmentOpenW  float32 = 900
-	attachmentOpenH  float32 = 800
+	// attachmentChipEdge is the longer edge of the copy the composer draws in its
+	// 36×32 pending chip. It is never the message's copy: a tile or an open preview
+	// loading it would show a 256px picture.
+	attachmentChipEdge = 256
+	// attachmentThumbEdge is the longer edge of the copy a message keeps; only an
+	// open preview decodes a larger one.
+	attachmentThumbEdge = 1024
 )
 
 // fitBox scales w×h into maxW×maxH keeping the ratio, and never scales up: a small
-// clipboard image stays small instead of filling the transcript.
+// picture paints at its own size, in the transcript and in a full-window preview.
 func fitBox(w, h, maxW, maxH float32) (float32, float32) {
 	if w <= 0 || h <= 0 {
 		return maxW, maxH
@@ -700,31 +713,21 @@ func (a *desktop) messageAttachmentTile(c *ui.Context, t *conversation, att map[
 	id := str(att, "id")
 	name := str(att, "name")
 	if name == "" {
-		name = "图片"
+		name = locales.Text("图片")
 	}
-	key := "image-" + id
-	expanded := t.uiState().ToolOpen[key]
 	maxW, maxH := attachmentThumbW, attachmentThumbH
 	if lone {
 		maxW, maxH = attachmentLoneW, attachmentLoneH
-	}
-	if expanded {
-		maxW, maxH = attachmentOpenW, attachmentOpenH
 	}
 	ui.Column(c.Key("attachment-" + id)).Gap(5).Shrink(0).Children(func() {
 		switch bm := t.AttachmentImages[id]; {
 		case bm != nil:
 			w, h := bm.Size()
 			dw, dh := fitBox(float32(w), float32(h), maxW, maxH)
-			tip := fmt.Sprintf("%s\n%d×%d", name, w, h)
-			if expanded {
-				tip += " · 点击收小"
-			} else {
-				tip += " · 点击放大"
-			}
+			tip := fmt.Sprintf("%s\n%d×%d", name, w, h) + locales.Text(" · 点击放大")
 			uikit.Tooltip(c, ui.Image(c, bm).Size(dw, dh).MaxWidthPercent(100).Fit(ui.Contain).
 				Cursor(ui.CursorPointer), tip).
-				OnClick(func() { t.uiState().ToolOpen[key] = !expanded })
+				OnClick(func() { a.openImagePreview(t, att) })
 		case !attachmentHasImage(att):
 			// A text file sent with the message has no picture to decode; it used
 			// to sit on "Loading image…" forever next to a button that returned
@@ -732,7 +735,7 @@ func (a *desktop) messageAttachmentTile(c *ui.Context, t *conversation, att map[
 		case str(att, "error") == "":
 			ui.Row(c).Gap(gapField).AlignItems(ui.Center).Children(func() {
 				fieldNote(c, "Loading image…", a.secondaryInk())
-				flat(c, "加载图片").OnClick(func() {
+				flat(c, locales.Text("加载图片")).OnClick(func() {
 					if a.core != nil && a.win != nil {
 						a.loadAttachmentImage(t, id, str(att, "imageRef"), str(att, "dataUrl"))
 					}
@@ -750,11 +753,11 @@ func (a *desktop) messageAttachmentTile(c *ui.Context, t *conversation, att map[
 				uikit.Tooltip(c, ui.Text(c, short(err, 18)).FontSize(fsAux).TextColor(c.Theme().Danger), err)
 			}
 			if ref := str(att, "imageRef"); ref != "" {
-				mutedIconAction(c, "attachment-save-"+id, "保存图片", "download", 18, func() {
+				mutedIconAction(c, "attachment-save-"+id, locales.Text("保存图片"), "download", 18, func() {
 					a.job(func() error {
 						path, err := a.core.ExportGeneratedImage(ref)
 						if err == nil && path != "" {
-							a.win.Update(func() { a.notify("已导出：" + path) })
+							a.win.Update(func() { a.notify(locales.Text("已导出：") + path) })
 						}
 						return err
 					})
@@ -805,7 +808,7 @@ func (a *desktop) recordGeneratedImage(t *conversation, p map[string]any) {
 		}
 	}
 	if att == nil {
-		att = map[string]any{"id": id, "name": "生成的图片", "kind": "image", "generated": true}
+		att = map[string]any{"id": id, "name": locales.Text("生成的图片"), "kind": "image", "generated": true}
 		m["attachments"] = appendAttachment(m["attachments"], att)
 		// The row draws an image now, where a text-only row may draw nothing.
 		t.markHistory()
@@ -870,84 +873,92 @@ func (a *desktop) loadAttachmentImage(t *conversation, id, ref, dataURL string) 
 	}
 	a.attachmentImageJobSessions[t] = struct{}{}
 	go func() {
-		var data []byte
-		var err error
-		defer func() {
-			if err != nil {
-				reason := err.Error()
-				a.win.Update(func() {
-					if t.AttachmentImageVersions[id] == version {
-						for _, m := range t.Messages {
-							for _, att := range messageAttachmentList(m) {
-								if str(att, "id") == id {
-									att["error"] = reason
-								}
+		bitmap, err := a.decodeAttachmentBitmap(ref, dataURL, attachmentThumbEdge)
+		if err != nil {
+			reason := err.Error()
+			a.win.Update(func() {
+				defer a.finishAttachmentImageJob(t)
+				if t.AttachmentImageVersions[id] == version {
+					for _, m := range t.Messages {
+						for _, att := range messageAttachmentList(m) {
+							if str(att, "id") == id {
+								att["error"] = reason
 							}
 						}
 					}
-					a.finishAttachmentImageJob(t)
-				})
-				return
-			}
-			a.win.Update(func() { a.finishAttachmentImageJob(t) })
-		}()
-		if ref != "" {
-			data, err = a.core.ReadNativeGeneratedImage(ref)
-		} else if comma := strings.IndexByte(dataURL, ','); comma >= 0 && strings.HasPrefix(dataURL, "data:image/") {
-			data, err = base64.StdEncoding.DecodeString(dataURL[comma+1:])
-		} else {
-			err = fmt.Errorf("图片预览来源无效")
-			return
-		}
-		if err != nil || len(data) > maxOriginalImageBytes {
-			if err == nil {
-				err = fmt.Errorf("图片超过预览大小上限")
-			}
-			return
-		}
-		cfg, format, decodeErr := image.DecodeConfig(bytes.NewReader(data))
-		err = decodeErr
-		if err == nil {
-			err = oversizedImageError(cfg, format)
-		}
-		if err != nil {
-			return
-		}
-		img, _, err := image.Decode(bytes.NewReader(data))
-		if err != nil {
-			return
-		}
-		// Keep the encoded picture, not its pixels: a bitmap DecodeBitmap made
-		// can drop the CPU copies once they have shown, and decodes them again
-		// from this data if a renderer asks. The data costs a fraction of them.
-		var encoded bytes.Buffer
-		if err = png.Encode(&encoded, resizeImage(img, 1024)); err != nil {
-			return
-		}
-		bitmap, err := ui.DecodeBitmap(encoded.Bytes())
-		if err != nil {
+				}
+			})
 			return
 		}
 		a.win.Update(func() {
-			if a.closing || t.AttachmentImages == nil || t.AttachmentImageVersions[id] != version {
-				return
-			}
-			if !a.shouldCacheAttachmentImages(t) {
-				a.releaseAttachmentImages(t)
-				return
-			}
-			if len(t.AttachmentImages) >= 24 {
-				for oldID := range t.AttachmentImages {
-					if oldID != id {
-						delete(t.AttachmentImages, oldID)
-						break
-					}
-				}
-			}
-			t.AttachmentImages[id] = bitmap
-			a.releaseAttachmentPixels(t, id, bitmap)
+			a.completeAttachmentImage(t, id, version, bitmap)
 		})
 	}()
+}
+
+func (a *desktop) completeAttachmentImage(t *conversation, id string, version uint64, bitmap *ui.Bitmap) {
+	defer a.finishAttachmentImageJob(t)
+	if a.closing || t.AttachmentImages == nil || t.AttachmentImageVersions[id] != version {
+		return
+	}
+	if !a.shouldCacheAttachmentImages(t) {
+		a.releaseAttachmentImages(t)
+		return
+	}
+	if len(t.AttachmentImages) >= 24 {
+		for oldID := range t.AttachmentImages {
+			if oldID != id {
+				delete(t.AttachmentImages, oldID)
+				break
+			}
+		}
+	}
+	t.AttachmentImages[id] = bitmap
+	a.releaseAttachmentPixels(t, id, bitmap)
+}
+
+// decodeAttachmentBitmap reads the picture behind an attachment and decodes it
+// with its longer edge at most limit. DecodeBitmap keeps the encoded picture
+// rather than its pixels, so a shown bitmap can drop the CPU copies once they
+// have shown and decode them again from that data if a renderer asks, which
+// costs a fraction of the pixels.
+func (a *desktop) decodeAttachmentBitmap(ref, dataURL string, limit int) (*ui.Bitmap, error) {
+	var data []byte
+	var err error
+	switch {
+	case a.core == nil:
+		return nil, fmt.Errorf("%s", locales.Text("图片预览来源无效"))
+	case ref != "":
+		data, err = a.core.ReadNativeGeneratedImage(ref)
+	default:
+		if comma := strings.IndexByte(dataURL, ','); comma >= 0 && strings.HasPrefix(dataURL, "data:image/") {
+			data, err = base64.StdEncoding.DecodeString(dataURL[comma+1:])
+		} else {
+			return nil, fmt.Errorf("%s", locales.Text("图片预览来源无效"))
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxOriginalImageBytes {
+		return nil, fmt.Errorf("%s", locales.Text("图片超过预览大小上限"))
+	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	if err := oversizedImageError(cfg, format); err != nil {
+		return nil, err
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, resizeImage(img, limit)); err != nil {
+		return nil, err
+	}
+	return ui.DecodeBitmap(encoded.Bytes())
 }
 
 // attachmentPixelReleaseDelay gives a preview the frames that paint it before

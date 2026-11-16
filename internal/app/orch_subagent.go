@@ -319,7 +319,7 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 			toolIDs[i] = assistantMessage.ToolCalls[i].ID
 		}
 		messages = append(messages, assistantMessage)
-		toolConflicts := detectToolBatchConflicts(cfg, assistantMessage.ToolCalls)
+		toolConflicts := detectToolBatchConflicts(cfg, assistantMessage.ToolCalls, toolPurposeFields(ctx))
 
 		// Register all tool calls as running and emit start events
 		for i, call := range assistantMessage.ToolCalls {
@@ -332,7 +332,7 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 				run.ToolCalls = append([]SubToolEvent(nil), run.ToolCalls[len(run.ToolCalls)-maxSubagentToolCalls:]...)
 			}
 			a.subRunsMu.Unlock()
-			a.emit("sub:tool:start", map[string]any{"id": subID, "sessionId": sessionID, "toolCallId": cid, "name": name, "args": args})
+			a.emit("sub:tool:start", map[string]any{"id": subID, "sessionId": sessionID, "toolCallId": cid, "name": name, "args": args, "purposeField": toolPurposeFields(ctx)[normalizeToolName(name)]})
 		}
 
 		// Shared stage scheduler; model-facing outcomes remain in call order.
@@ -416,6 +416,7 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 			messages = append(messages, openai.ChatCompletionMessage{
 				Role: openai.ChatMessageRoleTool, ToolCallID: o.callID, Content: o.modelJSON,
 			})
+			a.reasoningStash.recordToolStatus(reasoningReplayScope(cfg), messages[len(messages)-1], o.result)
 		}
 		// Inject images read by this sub-agent tool batch into multimodal model
 		// context, same contract as the main loop.
@@ -686,6 +687,7 @@ func subagentSystemPrompt(role string) string {
 
 	return roleLine + "You are an Ally sub-agent. Complete the delegated task using available tools, then return a concise summary.\n\n" +
 		"# Tool Use\n\n" +
+		"Use only tools declared for this run; guidance about other tools does not make them available.\n\n" +
 		sharedRemoteAccessRules() +
 		"Prefer dedicated tools over shell commands: `grep` for search, `read` for file content, `edit`/`create`/`delete` for file changes, `list_files` for directory listings.\n\n" +
 		sharedBatchStrategy() +
@@ -697,8 +699,9 @@ func subagentSystemPrompt(role string) string {
 		sharedSafetyBoundaries() +
 		"- Do not ask the user questions — the user cannot see you.\n" +
 		"- Do not call `subagent` — nested delegation is not supported.\n" +
-		"- MCP tools are available when connected. Use them when they materially help the delegated task, and treat their results like any other tool output.\n" +
-		"- Do not write global memories. The parent agent owns durable memory decisions.\n" +
+		"- Use declared MCP tools when they materially help the delegated task; treat their results like other tool output.\n" +
+		"- Do not write the global user profile or memories. Report durable facts to the parent agent instead.\n" +
+		"- If user input or authorization is missing, report the blocker to the parent agent.\n" +
 		"- Use network tools only when the delegated task explicitly requires external information.\n" +
 		"- When creating intermediate artifacts (scripts, drafts, test fixtures) that are not final deliverables, place them under a `.tmp/` directory within the workspace.\n\n" +
 		"# Agent Blackboard\n\n" +
@@ -708,8 +711,7 @@ func subagentSystemPrompt(role string) string {
 		"# Output\n\n" +
 		"- Be concise. The parent agent only sees your final summary.\n" +
 		"- Report findings and evidence, files changed, verification, and anything incomplete or blocked. Do not imply an unfinished task is complete.\n" +
-		"- Use `wait` only for a concrete short delay after asynchronous work has started. When it shares a response with other calls, it runs last, after they finished.\n" +
-		"- For remote work, every remote tool call must include an explicit target such as host:/absolute/workspace.\n" +
+		"- Use `wait` only for active asynchronous work or an expected external condition. Assign a later stage to wait after other calls; then check the condition.\n" +
 		"- " + platformNote + ". Use command syntax appropriate for this platform."
 }
 
@@ -718,7 +720,11 @@ func (a *App) buildSubagentEnv(cfg ConfigState) string {
 	var b strings.Builder
 	b.WriteString("Workspace: " + cfg.Workspace + "\n")
 
-	entries, err := a.listFilesWithConfig(cfg, ListFilesRequest{MaxDepth: 2, Limit: 60, ModelFacing: true})
+	var entries ListFilesResult
+	var err error
+	if cfg.ContextEnabled("workspace_map") {
+		entries, err = a.listFilesWithConfig(cfg, ListFilesRequest{MaxDepth: 2, Limit: 60, ModelFacing: true})
+	}
 	if err == nil && len(entries.Entries) > 0 {
 		b.WriteString("\n## Project files\n")
 		for _, e := range entries.Entries {
@@ -729,7 +735,7 @@ func (a *App) buildSubagentEnv(cfg ConfigState) string {
 			b.WriteString(e.Path + tag + "\n")
 		}
 	}
-	if lessons := projectLessonsPromptPart(cfg.Workspace); lessons != "" {
+	if lessons := optionalContext(cfg, "project_lessons", func() string { return projectLessonsPromptPart(cfg.Workspace) }); lessons != "" {
 		b.WriteString(lessons)
 	}
 	return b.String()
@@ -741,13 +747,13 @@ func (a *App) buildSubagentEnv(cfg ConfigState) string {
 func (a *App) buildSubagentInstructionContext(cfg ConfigState, withProjectMap bool) string {
 	var b strings.Builder
 	if cfg.Workspace != "" {
-		if md := loadAgentsMd(cfg.Workspace); strings.TrimSpace(md) != "" {
+		if md := loadAgentsMd(cfg.Workspace, cfg.DisabledContext); strings.TrimSpace(md) != "" {
 			b.WriteString("## Lower-priority project instructions\n")
 			b.WriteString("Follow these project instructions when they do not conflict with the sub-agent system rules or the delegated task.\n\n")
 			b.WriteString(md)
 			b.WriteString("\n")
 		}
-		if withProjectMap {
+		if withProjectMap && cfg.ContextEnabled("code_graph") {
 			if cg := buildCodeGraphPromptPart(cfg.Workspace); cg != "" {
 				if b.Len() > 0 {
 					b.WriteString("\n")
@@ -759,7 +765,7 @@ func (a *App) buildSubagentInstructionContext(cfg ConfigState, withProjectMap bo
 			}
 		}
 	}
-	if custom := strings.TrimSpace(cfg.CustomPrompt); custom != "" {
+	if custom := strings.TrimSpace(cfg.CustomPrompt); cfg.ContextEnabled("custom_prompt") && custom != "" {
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
@@ -778,7 +784,6 @@ func (a *App) buildSubagentInstructionContext(cfg ConfigState, withProjectMap bo
 // any of these outside an explicit prohibition line.
 var subagentBlockedTools = map[string]bool{
 	"subagent":       true,
-	"agent_delegate": true,
 	"plan":           true,
 	"skill":          true,
 	"scheduled_task": true,
@@ -820,7 +825,7 @@ func trackFileFromToolResult(name string, args string, result *toolResult, files
 	switch name {
 	case "read", "remote_read":
 		var target struct {
-			Target string `json:"target"`
+			Alias string `json:"alias"`
 		}
 		if name == "remote_read" {
 			_ = json.Unmarshal([]byte(args), &target)
@@ -830,8 +835,8 @@ func trackFileFromToolResult(name string, args string, result *toolResult, files
 			for _, file := range read.Files {
 				if file.Error == "" {
 					path := file.Path
-					if target.Target != "" {
-						path = target.Target + " :: " + path
+					if target.Alias != "" {
+						path = target.Alias + " :: " + path
 					}
 					addPath(filesRead, seenReads, path)
 				}
@@ -844,11 +849,11 @@ func trackFileFromToolResult(name string, args string, result *toolResult, files
 		}
 	case "remote_edit", "remote_create_file":
 		var req struct {
-			Target string `json:"target"`
-			Path   string `json:"path"`
+			Alias string `json:"alias"`
+			Path  string `json:"path"`
 		}
-		if json.Unmarshal([]byte(args), &req) == nil && req.Target != "" && req.Path != "" {
-			addPath(filesEdited, seenEdits, req.Target+" :: "+req.Path)
+		if json.Unmarshal([]byte(args), &req) == nil && req.Alias != "" && req.Path != "" {
+			addPath(filesEdited, seenEdits, req.Alias+" :: "+req.Path)
 		}
 	case "create", "replace_exact", "replace_lines":
 		var req struct {

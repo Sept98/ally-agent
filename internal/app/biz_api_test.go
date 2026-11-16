@@ -16,7 +16,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +65,42 @@ func apiRequest(t *testing.T, handler http.Handler, method, path, token string, 
 	req := httptest.NewRequest(method, path, reader)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	// Model mutations require the identity from the current list, as real clients do.
+	index := -1
+	if method == "DELETE" && strings.HasPrefix(path, "/api/v1/models/") {
+		index, _ = strconv.Atoi(strings.TrimPrefix(path, "/api/v1/models/"))
+	} else if method == "POST" {
+		var input struct {
+			Index      *int `json:"index"`
+			ModelIndex *int `json:"modelIndex"`
+		}
+		if json.Unmarshal([]byte(body), &input) == nil {
+			if (path == "/api/v1/models" || path == "/api/v1/models/activate") && input.Index != nil {
+				index = *input.Index
+			}
+			if input.ModelIndex != nil {
+				index = *input.ModelIndex
+			}
+		}
+	}
+	if index >= 0 {
+		listReq := httptest.NewRequest("GET", "/api/v1/models", nil)
+		if token != "" {
+			listReq.Header.Set("Authorization", "Bearer "+token)
+		}
+		listRec := httptest.NewRecorder()
+		handler.ServeHTTP(listRec, listReq)
+		var list struct {
+			Data struct {
+				Models []struct {
+					Identity string `json:"identity"`
+				} `json:"models"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(listRec.Body.Bytes(), &list) == nil && index < len(list.Data.Models) {
+			req.Header.Set("X-Model-Identity", list.Data.Models[index].Identity)
+		}
 	}
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -429,6 +467,42 @@ func TestApiMcpConfigRejectsEmptyPayload(t *testing.T) {
 	}
 }
 
+func TestApiMcpConfigRoundTripIgnoresServerStatus(t *testing.T) {
+	handler, app, token := newApiTestHandler(t)
+	app.ctx = context.Background()
+	t.Cleanup(func() {
+		if manager := app.activeMcpManager(); manager != nil {
+			manager.Shutdown()
+		}
+	})
+	const original = `{"mcpServers":{"keep":{"command":"unused","disabled":true,"disabledTools":["one"],"extra":"preserved"}}}`
+	if err := app.SaveMcpConfig(original); err != nil {
+		t.Fatal(err)
+	}
+	rec, payload := apiRequest(t, handler, "GET", "/api/v1/mcp", token, "")
+	data := apiRequireOK(t, rec, payload)
+	body, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, payload = apiRequest(t, handler, "PUT", "/api/v1/mcp/config", token, string(body))
+	apiRequireOK(t, rec, payload)
+	config, err := app.GetMcpConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal([]byte(config), &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(original), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MCP round trip changed configuration: %s", config)
+	}
+}
+
 func TestApiSessionMessagesTodosAndDelete(t *testing.T) {
 	handler, app, token := newApiTestHandler(t)
 
@@ -573,23 +647,29 @@ func TestApiSettingsPersistenceAndListenerLifecycle(t *testing.T) {
 		t.Fatalf("unexpected normalized settings: %+v", state)
 	}
 
-	// 真实 listener 生命周期：先借 127.0.0.1:0 拿一个空闲高位端口。
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Skipf("cannot probe a free port: %v", err)
-	}
-	port := probe.Addr().(*net.TCPAddr).Port
-	probe.Close()
-	if port < 1024 {
-		t.Skipf("probed port %d is privileged", port)
-	}
-
-	if _, err := app.SaveApiSettings(ApiSettingsRequest{Port: port, Token: "tok-lifecycle"}); err != nil {
-		t.Fatal(err)
-	}
-	state, err = app.SetApiServiceEnabled(true)
-	if err != nil {
-		t.Fatal(err)
+	// 真实 listener 生命周期：先借 127.0.0.1:0 拿一个空闲高位端口。包并行时，
+	// 刚释放的端口可能被别的测试立刻抢走，抢不到就换一个重试，不停等也不放宽断言。
+	var port int
+	for attempt := 0; ; attempt++ {
+		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Skipf("cannot probe a free port: %v", err)
+		}
+		port = probe.Addr().(*net.TCPAddr).Port
+		probe.Close()
+		if port < 1024 {
+			t.Skipf("probed port %d is privileged", port)
+		}
+		if _, err := app.SaveApiSettings(ApiSettingsRequest{Port: port, Token: "tok-lifecycle"}); err != nil {
+			t.Fatal(err)
+		}
+		state, err = app.SetApiServiceEnabled(true)
+		if err == nil {
+			break
+		}
+		if attempt == 4 {
+			t.Fatalf("could not bind a probed port: %v", err)
+		}
 	}
 	if !state.Enabled {
 		t.Fatalf("expected enabled after start: %+v", state)
@@ -618,6 +698,7 @@ func TestApiSettingsPersistenceAndListenerLifecycle(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port), nil)
+	req.Close = true
 	req.Header.Set("Authorization", "Bearer tok-lifecycle")
 	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 	if err != nil {
@@ -630,6 +711,7 @@ func TestApiSettingsPersistenceAndListenerLifecycle(t *testing.T) {
 
 	// 错误 token 被拒。
 	badReq, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port), nil)
+	badReq.Close = true
 	badResp, err := (&http.Client{Timeout: 5 * time.Second}).Do(badReq)
 	if err != nil {
 		t.Fatal(err)
@@ -650,10 +732,13 @@ func TestApiSettingsPersistenceAndListenerLifecycle(t *testing.T) {
 		t.Fatal("disabled choice must persist")
 	}
 	app.restoreApiService()
-	_, err = (&http.Client{Timeout: 2 * time.Second}).Get(fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port))
-	if err == nil {
-		t.Fatal("listener still accepting after stop")
+	// Binding the port proves shutdown released it without waiting for Windows'
+	// refused-connection retries to expire.
+	rebound, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("listener did not release its port after stop: %v", err)
 	}
+	rebound.Close()
 }
 
 func TestApiValidationAndMissingSessions(t *testing.T) {
@@ -712,7 +797,7 @@ func TestApiBusySessionAndQuestions(t *testing.T) {
 	if len(app.pendingAsks["ask"].answers) != 1 {
 		t.Fatal("answer not delivered")
 	}
-	app.finishRun("run")
+	app.releaseRun("run")
 	app.compactingSessions[sid] = struct{}{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

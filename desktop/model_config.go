@@ -3,6 +3,7 @@ package desktop
 
 import (
 	backend "ally-dev/internal/app"
+	"ally-dev/locales"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -42,10 +43,10 @@ func parseModelNumberInput(text string, max int, label string) (int, error) {
 	}
 	value, err := strconv.Atoi(text)
 	if err != nil || value < 0 {
-		return 0, fmt.Errorf("%s 必须是非负整数，可使用 K 或 M 后缀", label)
+		return 0, fmt.Errorf(locales.Text("%s 必须是非负整数，可使用 K 或 M 后缀"), label)
 	}
 	if value > max/multiplier {
-		return 0, fmt.Errorf("%s 不能超过 %d", label, max)
+		return 0, fmt.Errorf(locales.Text("%s 不能超过 %d"), label, max)
 	}
 	return value * multiplier, nil
 }
@@ -93,16 +94,21 @@ func (a *desktop) editModel(index int) {
 	a.invalidateModelFetch()
 	a.modelForm.AdvancedOpen = false
 	a.modelPrevious = nil
+	a.modelBaseline = nil
 	a.modelProviderPreset = customProviderPreset
 	a.modelProviderModel = ""
 	if index >= 0 && index < len(a.config.Models) {
 		a.modelDraft = a.config.Models[index]
+		rawBaseline, _ := json.Marshal(a.modelDraft)
+		var baseline backend.ModelConfig
+		_ = json.Unmarshal(rawBaseline, &baseline)
+		a.modelBaseline = &baseline
 		a.modelPrevious = modelIdentityPtr(a.modelDraft)
 		if a.modelDraft.AuthType == "" {
 			a.modelDraft.AuthType = "api_key"
 		}
 	} else {
-		a.modelDraft = backend.ModelConfig{AuthType: "api_key", ProviderName: customProviderName, APIFormat: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", MaxTokens: 131072, ContextWindow: 1000000}
+		a.modelDraft = backend.ModelConfig{AuthType: "api_key", ProviderName: customProviderName, APIFormat: backend.APIFormatOpenAIChat, BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", MaxTokens: 131072, ContextWindow: 1000000}
 	}
 	if a.modelDraft.TokenParam == "" {
 		a.modelDraft.TokenParam = "auto"
@@ -117,7 +123,7 @@ func (a *desktop) editModel(index int) {
 	}
 	a.modelAuthChoice = "API Key"
 	if a.modelDraft.AuthType == "chatgpt_oauth" {
-		a.modelAuthChoice = "ChatGPT 登录"
+		a.modelAuthChoice = locales.Text("ChatGPT 登录")
 	}
 	a.modelKeys = append([]string(nil), a.modelDraft.APIKeys...)
 	if len(a.modelKeys) == 0 {
@@ -161,7 +167,7 @@ func (a *desktop) preparedModelDraft() (backend.ModelConfig, error) {
 	if err != nil {
 		return m, err
 	}
-	contextWindow, err := parseModelNumberInput(a.modelForm.ContextInput, 10_000_000, "上下文窗口")
+	contextWindow, err := parseModelNumberInput(a.modelForm.ContextInput, 10_000_000, locales.Text("上下文窗口"))
 	if err != nil {
 		return m, err
 	}
@@ -184,13 +190,13 @@ func (a *desktop) preparedModelDraft() (backend.ModelConfig, error) {
 		m.CustomHeaders = nil
 		if strings.TrimSpace(a.modelHeaders) != "" {
 			if err := json.Unmarshal([]byte(a.modelHeaders), &m.CustomHeaders); err != nil || m.CustomHeaders == nil {
-				return m, fmt.Errorf("自定义请求头必须是字符串到字符串的 JSON 对象")
+				return m, fmt.Errorf("%s", locales.Text("自定义请求头必须是字符串到字符串的 JSON 对象"))
 			}
 		}
 	}
 	if m.AuthType == "chatgpt_oauth" {
 		if strings.TrimSpace(m.Model) == "" || strings.TrimSpace(m.OAuthAccountID) == "" {
-			return m, fmt.Errorf("请先选择已授权的 ChatGPT 账号和模型")
+			return m, fmt.Errorf("%s", locales.Text("请先选择已授权的 ChatGPT 账号和模型"))
 		}
 		authorized := false
 		available := false
@@ -209,14 +215,14 @@ func (a *desktop) preparedModelDraft() (backend.ModelConfig, error) {
 			}
 		}
 		if !authorized {
-			return m, fmt.Errorf("该账号尚未授权套餐调用")
+			return m, fmt.Errorf("%s", locales.Text("该账号尚未授权套餐调用"))
 		}
 		current := backend.ModelIdentity{ProviderName: "ChatGPT Official", Model: m.Model, OAuthAccountID: m.OAuthAccountID}
 		if !available && (a.modelPrevious == nil || !sameModelIdentity(*a.modelPrevious, current)) {
-			return m, fmt.Errorf("请刷新并选择该账号可用的模型")
+			return m, fmt.Errorf("%s", locales.Text("请刷新并选择该账号可用的模型"))
 		}
 		m.ProviderName = "ChatGPT Official"
-		m.APIFormat = "openai_responses"
+		m.APIFormat = backend.APIFormatOpenAIResponses
 		m.BaseURL = "https://api.openai.com/v1"
 		m.APIKey = ""
 		m.APIKeys = nil
@@ -225,7 +231,7 @@ func (a *desktop) preparedModelDraft() (backend.ModelConfig, error) {
 			m.ContextWindow = 512000
 		}
 	} else if strings.TrimSpace(m.Model) == "" || strings.TrimSpace(m.BaseURL) == "" {
-		return m, fmt.Errorf("请填写模型 ID 和 API 地址")
+		return m, fmt.Errorf("%s", locales.Text("请填写模型 ID 和 API 地址"))
 	}
 	return m, nil
 }
@@ -245,6 +251,7 @@ func (a *desktop) saveModelDraft() {
 		v := *previous
 		old = &v
 	}
+	baseline := a.modelBaseline
 	first := a.config.LastUsedModel == nil
 	target := a.current()
 	a.modelSaving = true
@@ -252,7 +259,7 @@ func (a *desktop) saveModelDraft() {
 	go func() {
 		defer close(done)
 		waitConfigWrite(prevWrite)
-		err := a.core.SaveNativeModel(m, old)
+		err := a.core.SaveNativeModelIfUnchanged(m, baseline)
 		var cfg backend.ConfigState
 		if err == nil {
 			cfg, err = a.core.GetConfig()
@@ -305,7 +312,7 @@ func (a *desktop) saveModelDraft() {
 			}
 			a.modelForm.Open = false
 			a.cancelOAuthWhenLeaving()
-			a.notifySuccess("模型已保存")
+			a.notifySuccess(locales.Text("模型已保存"))
 		})
 	}()
 }
@@ -336,7 +343,7 @@ func (a *desktop) useModel(m backend.ModelConfig) {
 					t.Reasoning = "auto"
 				}
 			}
-			a.notify("已选择 " + m.Model)
+			a.notify(locales.Text("已选择 ") + m.Model)
 		})
 	}()
 }

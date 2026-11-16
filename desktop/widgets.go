@@ -7,6 +7,7 @@ package desktop
 
 import (
 	"ally-dev/desktop/uikit"
+	"ally-dev/locales"
 	"fmt"
 	"strconv"
 	"strings"
@@ -51,6 +52,50 @@ func widgetKey(prefix, id string, n int) string {
 	b.WriteByte('-')
 	b.Write(digits)
 	return b.String()
+}
+
+// rowKey names one cached row identity: the prefix, the row, and whether the
+// conversation id is part of it.
+type rowKey struct {
+	prefix string
+	index  int
+	withID bool
+}
+
+// rowKeyCacheLimit bounds what a conversation keeps of row identities: a long
+// transcript visited page by page would otherwise hold one set of strings for
+// every message ever shown. Past it the cache starts over.
+const rowKeyCacheLimit = 2048
+
+func (t *conversation) keepRowKey(key rowKey, value string) {
+	if t.rowKeys == nil || len(t.rowKeys) >= rowKeyCacheLimit {
+		t.rowKeys = make(map[rowKey]string, 16)
+	}
+	t.rowKeys[key] = value
+}
+
+// transcriptKey is widgetKey(prefix, t.ID, i), built once per row instead of
+// once per frame. UI thread only.
+func (t *conversation) transcriptKey(prefix string, i int) string {
+	key := rowKey{prefix: prefix, index: i, withID: true}
+	if cached, ok := t.rowKeys[key]; ok {
+		return cached
+	}
+	built := widgetKey(prefix, t.ID, i)
+	t.keepRowKey(key, built)
+	return built
+}
+
+// roundKey is widgetKey(prefix, "", i): the keys a round's controls carry,
+// which do not name the conversation. UI thread only.
+func (t *conversation) roundKey(prefix string, i int) string {
+	key := rowKey{prefix: prefix, index: i}
+	if cached, ok := t.rowKeys[key]; ok {
+		return cached
+	}
+	built := widgetKey(prefix, "", i)
+	t.keepRowKey(key, built)
+	return built
 }
 
 func sectionTitle(c *ui.Context, s string) ui.Element {
@@ -146,6 +191,7 @@ func choiceChip(c *ui.Context, key, text string, selected bool, tone ui.Color, t
 // accent ink, bold label and a reserved accent rail, so the text never shifts
 // when the choice changes. Used by the settings rail and any other one-of-N list.
 func selectionRow(c *ui.Context, key any, text string, selected bool, ink ...ui.Color) ui.Element {
+	text = locales.Text(text)
 	t := c.Theme()
 	b := ui.ButtonBase(c.Key(key)).FillWidth().Height(heightControl+2).Padding(0, 8).
 		Justify(ui.Start).Radius(radiusControl).Label(text).Cursor(ui.CursorPointer)
@@ -336,7 +382,7 @@ func checkRow(c *ui.Context, id, name, note string, value *bool) {
 }
 
 func selectField(c *ui.Context, id, name string, value *string, options []string, width float32) ui.Element {
-	e := uikit.Select(c.Key(id), value, options).Label(name)
+	e := localizedSelect(c.Key(id), value, options).Label(name)
 	if width > 0 {
 		e.Width(width)
 	}
@@ -359,9 +405,29 @@ func tabsBarInk(c *ui.Context, ink ui.Color, selected *int, labels ...string) ui
 
 // tabStrip is one scrollable strip of tabs: where it shows them, and the
 // press dragging it.
+type tabPosition struct {
+	id       string
+	x, width float32
+}
+
+type tabReorderMotion struct {
+	offset    float32
+	startedAt time.Time
+	armed     bool
+}
+
 type tabStrip struct {
-	scroll  ui.ScrollState
-	gesture uikit.TabGesture
+	scroll            ui.ScrollState
+	gesture           uikit.TabGesture
+	reorderFrom       string
+	reorderTarget     string
+	reorderIndex      int
+	reorderIndexValid bool
+	pressID           string
+	pressDX           float32
+	pressDY           float32
+	positions         []tabPosition
+	reorderMotions    map[string]tabReorderMotion
 }
 
 // tabWheelStep scales a wheel's notches along a strip: a notch moves a page
@@ -597,7 +663,7 @@ func formDialog(c *ui.Context, open *bool, width, preferredHeight float32, title
 						fieldNote(c, subtitle)
 					}
 				})
-				iconAction(c, "dialog-close-"+title, "关闭", "close", 24, func() {
+				iconAction(c, "dialog-close-"+title, locales.Text("关闭"), "close", 24, func() {
 					*open = false
 					if len(onClose) > 0 {
 						onClose[0]()
@@ -717,9 +783,9 @@ func mcpSummary(servers []map[string]any) string {
 		}
 	}
 	if len(servers) == 0 {
-		return "无 MCP 服务"
+		return locales.Text("无 MCP 服务")
 	}
-	return fmt.Sprintf("%d/%d 个服务，%d 个工具", connected, len(servers), tools)
+	return fmt.Sprintf(locales.Text("%d/%d 个服务，%d 个工具"), connected, len(servers), tools)
 }
 
 func enabledToolCount(tools []backend.ToolDefinitionSummary) int {
@@ -739,6 +805,7 @@ func tokenCount(n int) string { return fmtK(n) }
 func popoverPanel(c *ui.Context, anchor ui.Element, open *bool, width float32, build func()) {
 	ui.PopoverBase(c, anchor, open, func(panel ui.Element) {
 		popoverChrome(c, panel, width)
+		panel.Column().Transition(uikit.PopupTransition())
 		ui.Column(c).FillWidth().Children(build)
 	})
 }
@@ -769,7 +836,7 @@ func popoverItem(c *ui.Context, key, text, detail string, selected bool, action 
 }
 
 func windowAction(c *ui.Context, id, tip, icon string, background ui.Color, action func(), ink ...ui.Color) ui.Element {
-	return windowButton(c, id, tip, icon, background, strings.HasPrefix(tip, "关闭"), action, ink...)
+	return windowButton(c, id, tip, icon, background, icon == "close", action, ink...)
 }
 
 func footerBadge(c *ui.Context, id, name, value string, color ui.Color, tip string, action func(), ink ...ui.Color) ui.Element {
@@ -799,7 +866,7 @@ func (a *desktop) popupFlag(key string) *bool {
 
 func (a *desktop) linkMenu(c *ui.Context, key string, links [][2]string) {
 	services := c.Services()
-	disclosureMenu(c, key+"-button", "市场", disclosureFlat, 240, false, func(m ui.MenuParts) {
+	disclosureMenu(c, key+"-button", locales.Text("市场"), disclosureFlat, 240, false, func(m ui.MenuParts) {
 		for _, entry := range links {
 			entry := entry
 			uikit.MenuItem(c, m, entry[1], entry[0], uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() {
@@ -818,7 +885,7 @@ func fieldExample(id, name string) string {
 	case strings.Contains(id, "user"):
 		return "root"
 	case strings.Contains(id, "alias"):
-		return "例如：开发服务器"
+		return locales.Text("例如：开发服务器")
 	case strings.Contains(id, "host"):
 		return "192.168.1.10"
 	case strings.Contains(id, "port"):
@@ -826,11 +893,11 @@ func fieldExample(id, name string) string {
 	case strings.Contains(id, "command"):
 		return "npx -y @modelcontextprotocol/server-filesystem"
 	case strings.Contains(id, "name"):
-		return "例如：我的配置"
+		return locales.Text("例如：我的配置")
 	case strings.Contains(id, "model"):
 		return "provider/model-name"
 	default:
-		return "请输入" + name
+		return locales.Text("请输入") + name
 	}
 }
 
@@ -851,7 +918,7 @@ func cardDanger(c *ui.Context, s string) ui.Element {
 
 // disclosureIcon uses a stable slot before folding labels, without changing on hover.
 func disclosureIcon(c *ui.Context, name string, ink ui.Color) {
-	iconGlyph(c, name, 15).Shrink(0).TextColor(ink).Unselectable().PassThrough().Label("折叠图标 " + name)
+	iconGlyph(c, name, 15).Shrink(0).TextColor(ink).Unselectable().PassThrough().Label(locales.Text("折叠图标 ") + name)
 }
 
 // Transcript navigation stays subordinate to the conversation content.

@@ -1000,6 +1000,7 @@ func TestSkillValidYAMLRetainsAliasesAndQuotedMultiline(t *testing.T) {
 // 带脚本的内置技能加载时必须报出数据目录里的真实路径：模型靠它 read 并运行
 // 脚本。只有 SKILL.md 的技能不报目录，免得模型拿到一个打不开的别名。
 func TestBuiltinSkillLoadDir(t *testing.T) {
+	t.Parallel()
 	a := newIsolatedChatTestApp(t)
 	// 直接问内置清单：用户目录里装过同名技能时，ListSkills 会按 user > builtin
 	// 的优先级把内置那份藏掉，这个测试关心的不是优先级。
@@ -1038,5 +1039,19 @@ func TestBuiltinSkillLoadDir(t *testing.T) {
 
 	if dir, err := a.skillLoadDir(builtin("anydoc")); err != nil || dir != "" {
 		t.Fatalf("a skill with only SKILL.md reported dir=%q err=%v", dir, err)
+	}
+}
+
+func TestWriteNewSkillFileDoesNotReplaceExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "SKILL.md")
+	if err := writeNewSkillFile(path, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNewSkillFile(path, []byte("second")); err == nil {
+		t.Fatal("existing skill was replaced")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "first" {
+		t.Fatalf("skill content %q: %v", data, err)
 	}
 }

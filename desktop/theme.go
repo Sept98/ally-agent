@@ -8,6 +8,7 @@ package desktop
 import (
 	"ally-dev/desktop/uikit"
 	backend "ally-dev/internal/app"
+	"ally-dev/locales"
 	"fmt"
 	"math"
 	"strconv"
@@ -36,6 +37,7 @@ func fadeColor(e ui.Element, key string, target ui.Color) ui.Color {
 
 const (
 	chatMaxWidth         float32 = 1120
+	chatContentMaxWidth  float32 = chatMaxWidth - 40
 	settingsMaxWidth     float32 = 1040
 	settingsControlWidth         = uikit.FormControlWidth
 	settingsNumberWidth  float32 = 200
@@ -148,7 +150,8 @@ func colFaint() ui.Color  { return faint }
 func selectionFill(tone ui.Color) ui.Color { return uikit.SelectedFill(tone) }
 func selectionEdge(tone ui.Color) ui.Color { return uikit.SelectedStrokeColor(tone) }
 
-// palette is one appearance preset: a neutral surface pair plus an accent.
+// palette supplies an accent and optional light-mode surfaces. Existing accents
+// share the neutral bases; a complete light preset can override them together.
 //
 // The index into palettes is what native-ui.json stores as "palette", so an
 // entry may be retired but never deleted or reordered — an old value still has
@@ -164,6 +167,13 @@ type palette struct {
 	// chrome is the header's neutral base before its accent tint. The rail,
 	// explorer and active workspace tab share the main content background.
 	chrome ui.Color
+	// header, when set, replaces the derived header tint in light mode.
+	header ui.Color
+	// Complete presets can supply literal website colors instead of derived tints.
+	wordmark, accentHover, accentPressed, selection ui.Color
+	// light overrides the entire light surface set, without another preference
+	// or changing the existing appearance-mode switch.
+	light *palette
 }
 
 // chromeColor keeps both sidebars continuous with the main content surface.
@@ -177,6 +187,9 @@ func (p palette) headerColor() ui.Color {
 		// from the background-filled active workspace tab, and keep window
 		// controls on the same surface.
 		return ui.Hex("#353535")
+	}
+	if p.header.A != 0 {
+		return p.header
 	}
 	base := p.chrome
 	if base.A == 0 {
@@ -205,18 +218,24 @@ const (
 	paletteOcean  = 3 // 海洋 — retired, remapped to paletteBlue
 	paletteForest = 4 // 森林
 	paletteViolet = 5 // 紫罗兰
+	paletteMeadow = 6 // 青禾 — the website's paper, ink and sage in light mode
+	paletteNative = 7 // 原生
+	paletteTeal   = 8
+	paletteRose   = 9
+	paletteIndigo = 10
 
 	// defaultPalette is the accent a profile without a saved choice starts on.
 	defaultPalette = paletteBlue
 )
 
-// The accents Settings → 外观 offers are paletteBlue, paletteAmber,
-// paletteForest and paletteViolet. paletteBlue doubles as the dark surface base
-// and paletteLight as the light one, so their bg/panel/line are in use even
-// when another entry supplies the accent.
+// paletteChoices is presentation order only; persisted palette IDs stay stable.
+var paletteChoices = [...]int{paletteNative, paletteBlue, paletteAmber, paletteForest, paletteViolet, paletteTeal, paletteRose, paletteIndigo}
+
+// paletteBlue and paletteLight supply the shared dark/light surface bases.
+// A preset with light surfaces replaces the light base as a complete set.
 var palettes = []palette{
 	// paletteBlue: dark base surface, and the default accent.
-	{name: "蓝色", dark: true, bg: ui.Hex("#1b1b1b"), panel: ui.Hex("#212122"), line: ui.Hex("#303031"), accent: ui.Hex("#8da5df"), accentText: ui.Hex("#15171d"), text: ui.Hex("#d4d4d4"), muted: ui.Hex("#909093"), hover: ui.Hex("#2b2b2e"), hint: ui.Hex("#5d5d62")},
+	{name: "蓝色", dark: true, bg: ui.Hex("#1b1b1b"), panel: ui.Hex("#212122"), line: ui.Hex("#303031"), accent: ui.Hex("#8da5df"), accentText: ui.Hex("#15171d"), text: ui.Hex("#cccccc"), muted: ui.Hex("#909093"), hover: ui.Hex("#2b2b2e"), hint: ui.Hex("#5d5d62")},
 	// paletteLight: light base surface; its accent is never used, lightAccents
 	// supplies it.
 	{name: "亮色", dark: false, bg: ui.Hex("#f5f6f8"), panel: ui.Hex("#ffffff"), line: ui.Hex("#d9dce3"), accent: ui.Hex("#4d6bd8"), accentText: ui.Hex("#ffffff"), text: ui.Hex("#24262d"), muted: ui.Hex("#535b68"), hover: ui.Hex("#eef0f5"), chrome: ui.Hex("#f9fafb"), hint: ui.Hex("#8b929e")},
@@ -228,6 +247,12 @@ var palettes = []palette{
 	{name: "森林", dark: true, bg: ui.Hex("#151a17"), panel: ui.Hex("#1a201c"), line: ui.Hex("#29362d"), accent: ui.Hex("#6fbf8f"), accentText: ui.Hex("#0e1511"), text: ui.Hex("#c4d2c8"), muted: ui.Hex("#889a8e"), hover: ui.Hex("#212b24"), hint: ui.Hex("#5a6960")},
 	// paletteViolet
 	{name: "紫罗兰", dark: true, bg: ui.Hex("#191722"), panel: ui.Hex("#1f1c29"), line: ui.Hex("#312c42"), accent: ui.Hex("#a68bea"), accentText: ui.Hex("#141019"), text: ui.Hex("#cfc8de"), muted: ui.Hex("#948aa8"), hover: ui.Hex("#292436"), hint: ui.Hex("#645c76")},
+	// Retired ID remains reserved for existing preference files.
+	{name: "青禾", dark: true, accent: ui.Hex("#9dbb9f")},
+	{name: "原生", dark: true, accent: ui.Hex("#a8bdd2"), header: ui.Hex("#e5ebf2")},
+	{name: "青瓷", dark: true, accent: ui.Hex("#72bbb5")},
+	{name: "玫瑰", dark: true, accent: ui.Hex("#d69a9f")},
+	{name: "靛蓝", dark: true, accent: ui.Hex("#a8a9e0")},
 }
 
 // lightAccents is the light-mode accent for the same indices. The dark pastels
@@ -240,6 +265,11 @@ var lightAccents = []ui.Color{
 	ui.Hex("#126f91"), // ocean
 	ui.Hex("#247649"), // forest
 	ui.Hex("#7850b8"), // violet
+	ui.Hex("#25624a"), // meadow
+	ui.Hex("#536d87"), // native
+	ui.Hex("#176e69"), // teal
+	ui.Hex("#a24753"), // rose
+	ui.Hex("#5557a0"), // indigo
 }
 
 func (a *desktop) currentPalette() palette {
@@ -247,7 +277,7 @@ func (a *desktop) currentPalette() palette {
 	if idx < 0 || idx >= len(palettes) {
 		idx = defaultPalette
 	}
-	if idx == paletteOcean {
+	if idx == paletteOcean || idx == paletteMeadow {
 		// Retired: an old choice lands on the blue accent instead of a colour
 		// the settings page can no longer show as selected.
 		idx = paletteBlue
@@ -258,19 +288,28 @@ func (a *desktop) currentPalette() palette {
 		base = paletteLight
 	}
 	p := palettes[base]
+	if base == paletteLight && palettes[idx].light != nil {
+		p = *palettes[idx].light
+	}
+	p.name = palettes[idx].name
 	p.accent = palettes[idx].accent
+	if palettes[idx].header.A != 0 {
+		p.header = palettes[idx].header
+	}
 	if !p.dark {
 		// Light accents have their own saturated palette. Mixing a pastel dark
 		// accent with neutral text made every theme look grey-blue.
 		p.accent = lightAccents[idx]
 	}
-	p.accentText = palettes[base].accentText
 	return p
 }
 
 // wordmarkGradientColor approximates the original silver → accent → cool
 // silver → silver gradient at a point across the four-letter wordmark.
 func wordmarkGradientColor(p palette, at float32) ui.Color {
+	if p.wordmark.A != 0 {
+		return p.wordmark
+	}
 	silver := ui.Hex("#f8fafc")
 	coolSilver := ui.Hex("#d7dde8")
 	if !p.dark {
@@ -326,6 +365,12 @@ func (a *desktop) theme() *ui.Theme {
 		t.AccentHover = p.accent.Mix(p.text, 0.18)
 		t.AccentPressed = p.accent.Mix(p.text, 0.26)
 	}
+	if p.accentHover.A != 0 {
+		t.AccentHover = p.accentHover
+	}
+	if p.accentPressed.A != 0 {
+		t.AccentPressed = p.accentPressed
+	}
 	t.AccentText = p.accentText
 	t.Text = p.text
 	// TextMuted carries the placeholder tone: MyGo paints empty inputs in it.
@@ -342,6 +387,9 @@ func (a *desktop) theme() *ui.Theme {
 	}
 	t.Focus = p.accent
 	t.Selection = p.accent.Alpha(0.30)
+	if p.selection.A != 0 {
+		t.Selection = p.selection
+	}
 	t.Font = nativeFontFamily()
 	t.FontSize = 13
 	t.Radius = radiusControl
@@ -368,7 +416,6 @@ var (
 
 var iconPaths = map[string]string{
 	"chat":        `<path d="M4 5h16v11H9l-5 4z"/><path d="M8 9h8M8 12.5h5"/>`,
-	"kb":          `<path d="M13 2 5 14h5l-1 8 9-13h-5z"/>`,
 	"skills":      `<path d="m9 15-2 2a4 4 0 0 1-5-5l4-4a4 4 0 0 1 5 0m2 1 2-2a4 4 0 0 1 5 5l-4 4a4 4 0 0 1-5 0M8 16l8-8"/>`,
 	"mcp":         `<rect x="4" y="3" width="16" height="16" rx="2"/><path d="M4 15h16M8 7v3m8-3v3M8 22h8"/>`,
 	"models":      `<rect x="8" y="2" width="8" height="5" rx="1"/><path d="M12 7v5M4 12h16M4 12v4m8-4v4m8-4v4"/><rect x="1" y="16" width="6" height="5" rx="1"/><rect x="9" y="16" width="6" height="5" rx="1"/><rect x="17" y="16" width="6" height="5" rx="1"/>`,
@@ -383,10 +430,12 @@ var iconPaths = map[string]string{
 	"addfolder":   `<path d="M3 6h7l2 2h9v5M3 6V4h7l2 2h7v2M3 6v13h8m7-5v8m-4-4h8"/>`,
 	"history":     `<path d="M3 5v5h5M3 10a9 9 0 1 1 1 8M12 6v6l4 2"/>`,
 	"plus":        `<path d="M12 4v16M4 12h16"/>`,
+	"home":        `<path d="m4 9 8-6 8 6v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2zM9 15h6"/>`,
 	"menu":        `<path d="M4 6h16M4 12h16M4 18h16"/>`,
 	"expand":      `<path d="m5 5 7 7-7 7m7-14 7 7-7 7"/>`,
 	"collapse":    `<path d="m19 5-7 7 7 7M12 5 5 12l7 7"/>`,
 	"close":       `<path d="m6 6 12 12M6 18 18 6"/>`,
+	"power":       `<path d="M6 5.3a9 9 0 1 0 12 0M12 3v9"/>`,
 	"min":         `<path d="M5 12h14"/>`,
 	"max":         `<rect x="5" y="5" width="14" height="14" rx="1"/>`,
 	"restore":     `<rect x="4" y="7" width="12" height="12" rx="1"/><path d="M8 7V4h12v12h-4"/>`,
@@ -456,6 +505,27 @@ func fmtK(n int) string {
 		return fmt.Sprintf("%.1fk", float64(n)/1_000)
 	}
 	return strconv.Itoa(n)
+}
+
+// tokenUnits renders a token estimate in thousands: 28 → "0.0k", 816 → "0.8k",
+// 26_045 → "26k". The estimate is rough, so one decimal below 1k is as fine as
+// the panel needs, and everything above it stays whole.
+func tokenUnits(n int) string {
+	switch {
+	case n >= 999_500_000: // rounds up to one gigatoken
+		return "1G"
+	case n >= 999_500: // rounds up to one megatoken
+		return strconv.Itoa((n+500_000)/1_000_000) + "M"
+	case n >= 1_000:
+		return strconv.Itoa((n+500)/1_000) + "k"
+	case n <= 0:
+		return "0k"
+	}
+	text := fmt.Sprintf("%.1f", float64(n)/1_000)
+	if text == "1.0" { // 999 rounds up to a whole thousand
+		return "1k"
+	}
+	return text + "k"
 }
 
 func trimZero(v float64) string {
@@ -547,9 +617,9 @@ func firstLine(s string) string {
 
 func yesNo(v bool) string {
 	if v {
-		return "是"
+		return locales.Text("是")
 	}
-	return "否"
+	return locales.Text("否")
 }
 
 func boolValue(p *bool) bool { return p != nil && *p }

@@ -8,6 +8,7 @@
 package app
 
 import (
+	"ally-dev/internal/tools/schemautil"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -484,11 +485,11 @@ func (m *McpManager) ReconcileConfigs(ctx context.Context) (int, error) {
 	// 摘除、读路径不再触达，迟几秒 Close 不影响正确性；stdio 进程另有
 	// KILL_ON_JOB_CLOSE 兜底，退出时不会被这批后台 Close 拖住。
 	if len(closing) > 0 {
-		go func() {
+		GoSafe("mcp close stale clients", func() {
 			for _, staleClient := range closing {
 				m.closeClient(staleClient)
 			}
-		}()
+		})
 	}
 	if len(stale) > 0 {
 		m.notifyChange()
@@ -511,7 +512,7 @@ func (m *McpManager) ReconcileConfigs(ctx context.Context) (int, error) {
 			m.registerDisabledServer(name, cfg)
 			continue
 		}
-		go m.connectOne(ctx, name, cfg)
+		GoSafe("mcp connect "+name, func() { m.connectOne(ctx, name, cfg) }, func() { m.markConnectPanicked(name) })
 	}
 	return len(touched), nil
 }
@@ -1070,7 +1071,24 @@ func (m *McpManager) markToolsListDirty(serverName string, token *mcpConnToken) 
 	slot.running = true
 	refresh := m.toolRefresher
 	m.refreshMu.Unlock()
-	go m.runToolRefresh(serverName, slot, refresh)
+	GoSafe("mcp tool refresh "+serverName, func() { m.runToolRefresh(serverName, slot, refresh) }, func() {
+		m.refreshMu.Lock()
+		slot.running = false
+		m.refreshMu.Unlock()
+	})
+}
+
+// markConnectPanicked releases a dial that crashed before it could settle: the
+// panel must not sit on "connecting" forever, and the next call has to be able
+// to dial again.
+func (m *McpManager) markConnectPanicked(name string) {
+	m.mu.Lock()
+	if handle, ok := m.clients[name]; ok && handle.Status == "connecting" {
+		handle.Status = "failed"
+		handle.Error = "connection setup failed unexpectedly"
+	}
+	m.mu.Unlock()
+	m.notifyChange()
 }
 
 // runToolRefresh 是一轮"防抖 + 不丢"的刷新循环：refresh 收到的是最新一次通知
@@ -1605,11 +1623,7 @@ func (m *McpManager) CallToolByFunctionName(ctx context.Context, functionName st
 	ref, ok := m.toolLookup[functionName]
 	m.mu.RUnlock()
 	if !ok {
-		serverName, toolName, ok := parseLegacyMcpFunctionName(functionName)
-		if !ok {
-			return "", fmt.Errorf("MCP tool function %s not found", functionName)
-		}
-		ref = mcpToolRef{ServerName: serverName, ToolName: toolName}
+		return "", fmt.Errorf("MCP tool function %s not found", functionName)
 	}
 	return m.CallTool(ctx, ref.ServerName, ref.ToolName, args)
 }
@@ -1618,14 +1632,7 @@ func (m *McpManager) DescribeFunctionTool(functionName string) (mcpToolRef, bool
 	m.mu.RLock()
 	ref, ok := m.toolLookup[functionName]
 	m.mu.RUnlock()
-	if ok {
-		return ref, true
-	}
-	serverName, toolName, ok := parseLegacyMcpFunctionName(functionName)
-	if !ok {
-		return mcpToolRef{}, false
-	}
-	return mcpToolRef{ServerName: serverName, ToolName: toolName}, true
+	return ref, ok
 }
 
 // exitingNow 报告进程是否已经进入退出流程。
@@ -1868,14 +1875,6 @@ func safeMcpFunctionPart(value string) string {
 	return base + "_" + hex.EncodeToString(sum[:])[:6]
 }
 
-func parseLegacyMcpFunctionName(name string) (string, string, bool) {
-	parts := strings.SplitN(name, "__", 3)
-	if len(parts) != 3 || parts[0] != "mcp" || parts[1] == "" || parts[2] == "" {
-		return "", "", false
-	}
-	return parts[1], parts[2], true
-}
-
 const (
 	// mcpStatusToolDescriptionLimit bounds each tool description inside the
 	// mcp:status payload / GetMcpServers binding; the UI only previews it.
@@ -2114,7 +2113,7 @@ func builtinToolsForConfig(cfg ConfigState) []openai.Tool {
 
 // buildToolsForConfig is the live set for stateless callers and new sessions.
 func (a *App) buildToolsForConfig(cfg ConfigState) []openai.Tool {
-	return a.buildToolsWithMcp(withoutGoalUpdateTool(builtinToolsForConfig(cfg)))
+	return withToolPurposes(a.buildToolsWithMcp(withoutGoalUpdateTool(builtinToolsForConfig(cfg))))
 }
 
 func withoutGoalUpdateTool(tools []openai.Tool) []openai.Tool {
@@ -2133,11 +2132,19 @@ type builtinToolAvailabilityKey struct{}
 // runs. Later settings changes cannot change an existing conversation's tools.
 func withBuiltinToolAvailability(ctx context.Context, tools []openai.Tool) context.Context {
 	enabled := make(map[string]bool, len(tools))
+	purposes := make(map[string]string, len(tools))
 	for _, tool := range tools {
 		if tool.Function != nil {
-			enabled[normalizeToolName(tool.Function.Name)] = true
+			name := normalizeToolName(tool.Function.Name)
+			enabled[name] = true
+			if schema, ok := tool.Function.Parameters.(map[string]any); ok {
+				if field, ok := schema[schemautil.PurposeFieldKey].(string); ok {
+					purposes[name] = field
+				}
+			}
 		}
 	}
+	ctx = context.WithValue(ctx, toolPurposeContextKey{}, purposes)
 	return context.WithValue(ctx, builtinToolAvailabilityKey{}, enabled)
 }
 
@@ -2162,6 +2169,7 @@ func builtinToolDisabled(ctx context.Context, cfg ConfigState, name string) bool
 // for the rationale). Stateless callers (sub-agents, scheduled tasks) use
 // buildToolsForConfig instead and always see the live set.
 func (a *App) buildToolsForSession(sessionID string, cfg ConfigState) []openai.Tool {
+	cfg = a.contextSettingsForSession(sessionID, cfg, true)
 	if strings.TrimSpace(sessionID) == "" {
 		return a.buildToolsForConfig(cfg)
 	}
@@ -2195,6 +2203,7 @@ func (a *App) buildToolsForSession(sessionID string, cfg ConfigState) []openai.T
 // that (peek semantics — footer polling must not pin the session's toolset
 // ahead of the first real request).
 func (a *App) sessionToolsetForBreakdown(sessionID string, cfg ConfigState) []openai.Tool {
+	cfg = a.contextSettingsForSession(sessionID, cfg, false)
 	if strings.TrimSpace(sessionID) != "" {
 		a.mu.Lock()
 		frozen, ok := a.sessionToolsets[sessionID]

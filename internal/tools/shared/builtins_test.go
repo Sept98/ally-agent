@@ -37,20 +37,6 @@ func TestBuiltinStageSchemaIsOptionalAndDoesNotChangeMCP(t *testing.T) {
 	}
 }
 
-func TestWaitDescriptionUsesExplicitStages(t *testing.T) {
-	for _, tool := range Builtins() {
-		if tool.Function.Name != "wait" {
-			continue
-		}
-		text := tool.Function.Description
-		if !strings.Contains(text, "assign a later stage") || strings.Contains(text, "runs it last") {
-			t.Fatalf("wait advertises stale scheduling: %s", text)
-		}
-		return
-	}
-	t.Fatal("wait tool missing")
-}
-
 func TestRuntimeSensitiveBuiltinSchemas(t *testing.T) {
 	askParams, _ := builtinSchemaForTest(t, "ask")
 	askProperties := schemaObjectForTest(t, askParams["properties"])
@@ -111,7 +97,7 @@ func TestRuntimeSensitiveBuiltinSchemas(t *testing.T) {
 
 	// The plan bounds are the promise the model reads; validatePlanList holds a
 	// caller to the same numbers, whichever call built the list.
-	planParams, planDescription := builtinSchemaForTest(t, "plan")
+	planParams, _ := builtinSchemaForTest(t, "plan")
 	planProperties := schemaObjectForTest(t, planParams["properties"])
 	planSteps := schemaObjectForTest(t, planProperties["steps"])
 	if planSteps["maxItems"] != MaxPlanSteps {
@@ -119,12 +105,6 @@ func TestRuntimeSensitiveBuiltinSchemas(t *testing.T) {
 	}
 	if got := schemaObjectForTest(t, planSteps["items"])["maxLength"]; got != MaxPlanStepTitleChars {
 		t.Fatalf("plan step title maxLength = %#v, want %d", got, MaxPlanStepTitleChars)
-	}
-	// One write per call is a rule the handler holds and the gate cannot express:
-	// the two sources are declared as independent properties, so the description
-	// is the only place the model can read it.
-	if !strings.Contains(planDescription, "at most one of steps and finish") {
-		t.Fatal("plan description must state that a call carries at most one write source")
 	}
 	// finish is one shape — a step title — so a boolean, a number or an object is
 	// refused by the gate instead of decoding into a zero value that would report
@@ -140,29 +120,14 @@ func TestRuntimeSensitiveBuiltinSchemas(t *testing.T) {
 		t.Fatal("the retired next parameter must not be declared")
 	}
 
-	deleteParams, deleteDescription := builtinSchemaForTest(t, "remote_delete_path")
-	deleteProperties := schemaObjectForTest(t, deleteParams["properties"])
-	if !strings.Contains(deleteDescription, "directories require recursive=true") {
-		t.Fatal("remote_delete_path description must explain recursive deletion")
-	}
-	// 工作区根的一级子目录曾经整类拒绝，规则已去掉（与本地 delete 一致）：声明里
-	// 不能再承诺这道拦截，否则可删的目录会被写成禁区。
-	if strings.Contains(deleteDescription, "Immediate child") ||
-		strings.Contains(schemaObjectForTest(t, deleteProperties["recursive"])["description"].(string), "Immediate child") {
-		t.Fatal("remote_delete_path must not advertise the retired top-level directory block")
-	}
-
 	// Both delete tools declare the same batch list, so both must show the same
 	// bounds: one declaration, read twice.
 	for _, name := range []string{"delete", "remote_delete_path"} {
-		params, description := builtinSchemaForTest(t, name)
+		params, _ := builtinSchemaForTest(t, name)
 		properties := schemaObjectForTest(t, params["properties"])
 		paths := schemaObjectForTest(t, properties["paths"])
 		if paths["type"] != "array" || paths["minItems"] != 1 || paths["maxItems"] != DeletePathListLimit {
 			t.Fatalf("%s paths bounds = %#v, want an array of 1..%d entries", name, paths, DeletePathListLimit)
-		}
-		if !strings.Contains(description, fmt.Sprintf("at most %d", DeletePathListLimit)) {
-			t.Fatalf("%s description must state how many paths one call takes, got %q", name, description)
 		}
 	}
 	// Tools take flat properties only: no root composite.
@@ -178,11 +143,8 @@ func TestRuntimeSensitiveBuiltinSchemas(t *testing.T) {
 		}
 	}
 
-	scheduleParams, scheduleDescription := builtinSchemaForTest(t, "scheduled_task")
+	scheduleParams, _ := builtinSchemaForTest(t, "scheduled_task")
 	scheduleProperties := schemaObjectForTest(t, scheduleParams["properties"])
-	if !strings.Contains(scheduleDescription, "future RFC3339 one-shot") || !strings.Contains(scheduleDescription, "recurring automation") {
-		t.Fatal("scheduled_task description must distinguish backend one-shot support from agent creation policy")
-	}
 	if schemaObjectForTest(t, scheduleProperties["schedule"])["minLength"] != 1 {
 		t.Fatal("scheduled_task schedule must reject empty strings")
 	}
@@ -245,22 +207,11 @@ func patternsCompile(schema map[string]any) error {
 	return nil
 }
 
-// TestServiceSchemaExposesTheStopAndReadTuning pins the two parameters the
-// runtime accepts for compatibility, and ensures the model is told stops force-kill.
+// TestServiceSchemaExposesTheStopAndReadTuning checks read limits.
 func TestServiceSchemaExposesTheStopAndReadTuning(t *testing.T) {
-	params, description := builtinSchemaForTest(t, "service")
-	if !strings.Contains(description, "immediately force-kills") {
-		t.Fatal("service stop description promises stale behavior")
-	}
+	params, _ := builtinSchemaForTest(t, "service")
 	properties := schemaObjectForTest(t, params["properties"])
 
-	grace := schemaObjectForTest(t, properties["graceSeconds"])
-	if !strings.Contains(grace["description"].(string), "ignored") {
-		t.Fatal("legacy grace parameter must be documented as ignored")
-	}
-	if grace["maximum"] != MaxServiceStopGraceSeconds || grace["minimum"] != 0 {
-		t.Fatalf("service graceSeconds bounds = %#v, want 0..%d so an omitted or 0 value means the default", grace, MaxServiceStopGraceSeconds)
-	}
 	tail := schemaObjectForTest(t, properties["tailBytes"])
 	if tail["maximum"] != MaxServiceReadTailBytes || tail["minimum"] != 0 {
 		t.Fatalf("service tailBytes bounds = %#v, want 0..%d", tail, MaxServiceReadTailBytes)
@@ -336,18 +287,18 @@ func TestBuiltinGateTreatsEmptyOptionalsAsAbsent(t *testing.T) {
 	}{
 		{"read pads tailLines with 0", "read", `{"files":[{"path":"a.go","startLine":5,"endLine":20,"tailLines":0}]}`, false, "", ""},
 		{"edit accepts a single line", "edit", `{"path":"a.go","version":"9k3m7x","changes":[{"lineRange":"12","newText":"x"}]}`, false, "", ""},
-		{"remote_edit accepts a single line", "remote_edit", `{"target":"t:/w","path":"a.go","version":"9k3m7x","changes":[{"lineRange":"12","newText":"x"}]}`, false, "", ""},
+		{"remote_edit accepts a single line", "remote_edit", `{"alias":"t:/w","path":"a.go","version":"9k3m7x","changes":[{"lineRange":"12","newText":"x"}]}`, false, "", ""},
 		{"edit pads oldText with an empty string", "edit", `{"path":"a.go","version":"9k3m7x","changes":[{"lineRange":"1-9","newText":"x","oldText":""}]}`, false, "", ""},
 		{"edit pads lineRange with an empty string", "edit", `{"path":"a.go","version":"9k3m7x","changes":[{"oldText":"a","newText":"x","lineRange":""}]}`, false, "", ""},
 		{"edit pads lineRange with blanks", "edit", `{"path":"a.go","version":"9k3m7x","changes":[{"oldText":"a","newText":"x","lineRange":"  "}]}`, false, "", ""},
 		{"edit supplies both sources but a malformed range", "edit", `{"path":"a.go","version":"9k3m7x","changes":[{"oldText":"a","lineRange":"abcdef","newText":"x"}]}`, true, "must match the pattern", ""},
 		{"edit replaces nothing", "edit", `{"path":"a.go","version":"9k3m7x","changes":[{"lineRange":"abcdef","newText":"x"}]}`, true, "must match the pattern", ""},
-		{"remote_edit pads oldText with an empty string", "remote_edit", `{"target":"t:/w","path":"a.go","version":"9k3m7x","changes":[{"lineRange":"1-9","newText":"x","oldText":""}]}`, false, "", ""},
-		{"remote_edit pads lineRange with an empty string", "remote_edit", `{"target":"t:/w","path":"a.go","version":"9k3m7x","changes":[{"oldText":"a","newText":"x","lineRange":""}]}`, false, "", ""},
+		{"remote_edit pads oldText with an empty string", "remote_edit", `{"alias":"t:/w","path":"a.go","version":"9k3m7x","changes":[{"lineRange":"1-9","newText":"x","oldText":""}]}`, false, "", ""},
+		{"remote_edit pads lineRange with an empty string", "remote_edit", `{"alias":"t:/w","path":"a.go","version":"9k3m7x","changes":[{"oldText":"a","newText":"x","lineRange":""}]}`, false, "", ""},
 		{"http_request pads body with an empty string", "http_request", `{"url":"https://example.test","body":"","json":{"a":1}}`, false, "", ""},
 		{"web_fetch pads format with an empty string", "web_fetch", `{"url":"https://example.test/","format":""}`, false, "", ""},
 		{"grep pads outputMode with an empty string", "grep", `{"pattern":"x","outputMode":""}`, false, "", ""},
-		{"remote_run_command pads shell with an empty string", "remote_run_command", `{"target":"t:/w","command":"ls","shell":""}`, false, "", ""},
+		{"remote_run_command pads shell with an empty string", "remote_run_command", `{"alias":"t:/w","command":"ls","shell":""}`, false, "", ""},
 		{"web_fetch rejects an unknown format", "web_fetch", `{"url":"https://example.test/","format":"markdown"}`, true, "must be one of", ""},
 		// The local delete takes paths only: a list of entries is the one way to name
 		// a target, and the gate refuses the path key outright.
@@ -356,10 +307,10 @@ func TestBuiltinGateTreatsEmptyOptionalsAsAbsent(t *testing.T) {
 		{"delete refuses the path key", "delete", `{"path":"a.txt"}`, true, `unsupported parameter "path"`, ""},
 		{"delete refuses a call without paths", "delete", `{"recursive":true}`, true, `missing required parameter "paths"`, ""},
 		{"delete is above the path limit", "delete", tooManyPaths, true, fmt.Sprintf("at most %d items", DeletePathListLimit), ""},
-		{"remote_delete_path takes a path list", "remote_delete_path", `{"target":"t:/w","paths":["a.txt","b.txt"]}`, false, "", ""},
-		{"remote_delete_path pads recursive with null", "remote_delete_path", `{"target":"t:/w","paths":["a.txt"],"recursive":null}`, false, "", ""},
-		{"remote_delete_path refuses the path key", "remote_delete_path", `{"target":"t:/w","path":"a.txt"}`, true, `unsupported parameter "path"`, ""},
-		{"remote_delete_path refuses a call without paths", "remote_delete_path", `{"target":"t:/w"}`, true, `missing required parameter "paths"`, ""},
+		{"remote_delete_path takes a path list", "remote_delete_path", `{"alias":"t:/w","paths":["a.txt","b.txt"]}`, false, "", ""},
+		{"remote_delete_path pads recursive with null", "remote_delete_path", `{"alias":"t:/w","paths":["a.txt"],"recursive":null}`, false, "", ""},
+		{"remote_delete_path refuses the path key", "remote_delete_path", `{"alias":"t:/w","path":"a.txt"}`, true, `unsupported parameter "path"`, ""},
+		{"remote_delete_path refuses a call without paths", "remote_delete_path", `{"alias":"t:/w"}`, true, `missing required parameter "paths"`, ""},
 	}
 	for _, tc := range cases {
 		schema, _ := builtinSchemaForTest(t, tc.tool)

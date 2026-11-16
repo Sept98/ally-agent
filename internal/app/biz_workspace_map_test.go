@@ -59,30 +59,24 @@ func TestWorkspaceMapRootPlaceholderIndent(t *testing.T) {
 	}
 }
 
-// TestWorkspaceMapExcludesSensitiveEnv 验证 .env/.env.* 敏感文件被排除，
-// .env.example/.sample/.template 模板保留（与原 isWorkspaceMapSensitiveFile
-// 语义一致，rg 路径和 walkdir 回退都应满足）。
-func TestWorkspaceMapExcludesSensitiveEnv(t *testing.T) {
+// The automatically injected tree exposes paths and sizes, never file bodies.
+func TestWorkspaceMapEnvFilesAreOrdinaryPaths(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	for _, name := range []string{".env", ".env.local", ".env.production", ".env.example", ".env.sample", ".env.template"} {
-		if err := os.WriteFile(filepath.Join(root, name), []byte("SECRET=1"), 0o644); err != nil {
+	names := []string{".env", ".env.local", ".env.production", ".env.example"}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("SECRET=never-inject-this"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ctx := buildWorkspaceMapContext(root)
-	for _, secret := range []string{".env.local", ".env.production"} {
-		if strings.Contains(ctx, secret) {
-			t.Fatalf("sensitive %s must be excluded, got:\n%s", secret, ctx)
+	output := buildWorkspaceMapContext(root)
+	for _, name := range names {
+		if !strings.Contains(output, name) {
+			t.Fatalf("missing file path %s", name)
 		}
 	}
-	if strings.Contains(ctx, "\n- .env ") {
-		t.Fatalf("sensitive .env must be excluded, got:\n%s", ctx)
-	}
-	for _, keep := range []string{".env.example", ".env.sample", ".env.template"} {
-		if !strings.Contains(ctx, keep) {
-			t.Fatalf("template %s must be kept, got:\n%s", keep, ctx)
-		}
+	if strings.Contains(output, "SECRET=never-inject-this") {
+		t.Fatal("tree exposed file contents")
 	}
 }
 
@@ -144,10 +138,7 @@ func TestListFilesSkipsIgnoredByDefault(t *testing.T) {
 	}
 }
 
-// TestListFilesModelFacingAlwaysPrunesVCSDirs 验证模型侧调用即使显式传
-// includeHidden+includeIgnored 也永远剪掉 .git（对模型纯噪声且挤占条目
-// 限额），而 UI 文件浏览器（ModelFacing=false）仍能看到 .git。
-func TestListFilesModelFacingAlwaysPrunesVCSDirs(t *testing.T) {
+func TestListFilesMetadataUsesHiddenDirectoryRules(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	for _, dir := range []string{".git/hooks", ".git/objects", "src"} {
@@ -164,7 +155,7 @@ func TestListFilesModelFacingAlwaysPrunesVCSDirs(t *testing.T) {
 	app := newIsolatedTestApp(t)
 	cfg := ConfigState{Workspace: root}
 
-	modelView, err := app.listFilesWithConfig(cfg, ListFilesRequest{IncludeHidden: true, IncludeIgnored: true, ModelFacing: true})
+	modelView, err := app.listFilesWithConfig(cfg, ListFilesRequest{Path: ".git", IncludeHidden: true, IncludeIgnored: true, ModelFacing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,11 +163,8 @@ func TestListFilesModelFacingAlwaysPrunesVCSDirs(t *testing.T) {
 	for _, e := range modelView.Entries {
 		joined += e.Path + "\n"
 	}
-	if strings.Contains(joined, ".git") {
-		t.Fatalf("model-facing listing must prune .git even with includeHidden/includeIgnored, got:\n%s", joined)
-	}
-	if !strings.Contains(joined, "src") || !strings.Contains(joined, "main.js") {
-		t.Fatalf("regular files must stay visible, got:\n%s", joined)
+	if !strings.Contains(joined, ".git/config") {
+		t.Fatalf("metadata must be visible with includeHidden/includeIgnored, got:\n%s", joined)
 	}
 
 	explorerView, err := app.listFilesWithConfig(cfg, ListFilesRequest{IncludeHidden: true, IncludeIgnored: true})
@@ -342,5 +330,122 @@ func TestListFilesMarksSymlinks(t *testing.T) {
 	}
 	if !linkFile.Symlink {
 		t.Fatalf("link-file must be Symlink=true, got %+v", linkFile)
+	}
+}
+
+// TestListFilesListsInsideIgnoredDirectory 验证工具契约：把 path 指到被
+// .gitignore 忽略的目录里面（提示词让模型把中间产物放 .tmp/，正是这种情形）
+// 时列举出里面的内容，而不是一张空表；工作区根列举仍然整棵跳过该目录。
+func TestListFilesListsInsideIgnoredDirectory(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".tmp/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".tmp", "scratch"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".tmp", "scratch", "note.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := newIsolatedTestApp(t)
+	cfg := ConfigState{Workspace: root}
+
+	atRoot, err := app.listFilesWithConfig(cfg, ListFilesRequest{ModelFacing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range atRoot.Entries {
+		if strings.HasPrefix(e.Path, ".tmp") {
+			t.Fatalf("workspace root listing must still prune the ignored subtree, got %q", e.Path)
+		}
+	}
+
+	inside, err := app.listFilesWithConfig(cfg, ListFilesRequest{ModelFacing: true, Path: ".tmp/scratch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range inside.Entries {
+		paths = append(paths, e.Path)
+	}
+	if !strings.Contains(strings.Join(paths, "\n"), "note.md") {
+		t.Fatalf("listing an ignored directory must show its contents, got %v", paths)
+	}
+}
+
+// TestListFilesFollowsSymlinkedDirectoryRoot 验证把 path 指到符号链接目录时
+// 列出链接目标的内容：WalkDir 对根只做 Lstat，不修的话一个有内容的目录会静默
+// 返回空表。Windows 上创建符号链接需要特权，跳过。
+func TestListFilesFollowsSymlinkedDirectoryRoot(t *testing.T) {
+	t.Parallel()
+	if goruntime.GOOS == "windows" {
+		t.Skip("creating symlinks on Windows requires elevated privileges")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "real", "inner.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "real", "private.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("link/private.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	app := newIsolatedTestApp(t)
+	cfg := ConfigState{Workspace: root}
+
+	got, err := app.listFilesWithConfig(cfg, ListFilesRequest{Path: "link", ModelFacing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range got.Entries {
+		paths = append(paths, e.Path)
+	}
+	if !strings.Contains(strings.Join(paths, "\n"), "link/inner.txt") {
+		t.Fatalf("a symlinked directory root must list its target's contents under the named path, got %v", paths)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("listing must apply ignore rules to the named path, got %v", paths)
+	}
+}
+
+func TestListFilesChecksSymlinkTargetScope(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("creating symlinks on Windows requires elevated privileges")
+	}
+	root, home, temp := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	// Keep the fake home outside os.TempDir's traversal exception.
+	t.Setenv("TMPDIR", temp)
+	if err := os.WriteFile(filepath.Join(home, "personal.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(home, filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(home), filepath.Join(root, "parent")); err != nil {
+		t.Fatal(err)
+	}
+	app := newIsolatedTestApp(t)
+	cfg := ConfigState{Workspace: root}
+	for _, path := range []string{home, "alias", filepath.Join("parent", filepath.Base(home))} {
+		_, err := app.listFilesWithConfig(cfg, ListFilesRequest{Path: path, ModelFacing: true})
+		if toolErrorCode(err) != "E_SEARCH_ROOT_BLOCKED" {
+			t.Fatalf("listing %q must block the home traversal, got %v", path, err)
+		}
+	}
+	// A workspace selected through a symlink retains its own traversal scope.
+	got, err := app.listFilesWithConfig(ConfigState{Workspace: filepath.Join(root, "alias")}, ListFilesRequest{ModelFacing: true})
+	if err != nil || len(got.Entries) != 1 || got.Entries[0].Name != "personal.txt" {
+		t.Fatalf("symlinked workspace must remain listable: %+v, %v", got, err)
 	}
 }

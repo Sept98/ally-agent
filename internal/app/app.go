@@ -175,8 +175,9 @@ type skillListCacheEntry struct {
 
 // App is the Wails-bound application module.
 type App struct {
-	runtime  runtimeLifecycle
-	stopping bool // guarded by mu; rejects work during graceful shutdown
+	sessionContextSettings map[string]contextSettingsSnapshot
+	runtime                runtimeLifecycle
+	stopping               bool // guarded by mu; rejects work during graceful shutdown
 
 	chatGPT *chatgpt.Manager // guarded by mu; initialized lazily, no credential IO at startup
 	ctx     context.Context
@@ -579,17 +580,12 @@ type ConfigState struct {
 	APIKeys []string `json:"apiKeys,omitempty"`
 	Model   string   `json:"model,omitempty"`
 	// Workspace 不是模型字段：它同时是设置项与运行时的请求上下文。
-	Workspace  string   `json:"workspace"`
-	ExtraRoots []string `json:"extraRoots,omitempty"`
-	// KBRoot is the user-configured knowledge-base root directory. When a run
-	// resolves its workspace to this path (SamePath), the session runs in
-	// knowledge-base mode: the KB system-prompt part is injected and the
-	// sources/ subdirectory becomes read-only for model tools.
-	KBRoot        string `json:"kbRoot,omitempty"`
-	MaxTokens     int    `json:"maxTokens,omitempty"`
-	ContextWindow int    `json:"contextWindow,omitempty"`
-	TokenParam    string `json:"tokenParam,omitempty"`
-	CustomPrompt  string `json:"customPrompt"`
+	Workspace     string   `json:"workspace"`
+	ExtraRoots    []string `json:"extraRoots,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	TokenParam    string   `json:"tokenParam,omitempty"`
+	CustomPrompt  string   `json:"customPrompt"`
 	// AllowPrivateNetwork is a pointer only so the load path can tell an explicit
 	// false (the user turned the SSRF guard off) from a field a legacy config.json
 	// never carried; nil means "never set" and must not open the guard (see
@@ -627,13 +623,14 @@ type ConfigState struct {
 	LastUsedModel  *ModelIdentity `json:"lastUsedModel,omitempty"`
 	DisabledSkills []string       `json:"disabledSkills,omitempty"`
 	// DisabledTools lists built-in tools the user turned off in Settings →
-	// Advanced → Built-in tools. Disabled names are dropped from the tool
+	// General → Context loading. Disabled names are dropped from the tool
 	// schemas injected for NEW sessions (sessionToolsets freezes a session's
 	// set at its first request, so existing sessions keep what they were
 	// frozen with); MCP tools are never covered by this list. The local
 	// read/edit/create/delete/command core is protected: the Settings UI
 	// offers no switch and the filter/sanitizers refuse those names.
-	DisabledTools []string `json:"disabledTools,omitempty"`
+	DisabledTools   []string `json:"disabledTools,omitempty"`
+	DisabledContext []string `json:"disabledContext,omitempty"`
 	// DisabledPlugins 是用户在插件页关掉的插件 id。被禁用的插件从侧栏消失且不可
 	// 进入（页面可见性判定与隐藏页面同源）。清洗收口在 persistableConfig，所以
 	// 每条落盘路径共用同一条规则；加载侧直接读配置，不另设内存镜像。
@@ -822,11 +819,8 @@ type ListFilesRequest struct {
 	Limit          int    `json:"limit"`
 	IncludeHidden  bool   `json:"includeHidden"`
 	IncludeIgnored bool   `json:"includeIgnored"`
-	// ModelFacing marks requests originating from the model's list_files
-	// tool call; the UI explorer leaves it false. Model-facing listings
-	// always skip VCS internals (.git/.svn/.hg) even when includeHidden or
-	// includeIgnored are set — they are pure noise for the model. json:"-"
-	// keeps the model from forging it via extra JSON fields.
+	// ModelFacing selects model-facing limits and hidden/ignored defaults.
+	// The UI explorer leaves it false. It cannot be set through tool JSON.
 	ModelFacing bool `json:"-"`
 }
 
@@ -859,7 +853,7 @@ type ListFilesResult struct {
 
 type WorkspacePathSearchRequest struct {
 	// Workspace pins the search root. UI workspace explorers pass the active
-	// Tab's path so a knowledge-base Tab searches the KB root, not the chat
+	// Tab's path so background browsing does not search the active chat
 	// workspace. An empty value preserves the legacy active-config behavior.
 	Workspace string `json:"workspace,omitempty"`
 	Query     string `json:"query"`
@@ -996,6 +990,8 @@ type DeleteResult struct {
 // （路径不合法、越界、重复、包含、超过条数上限）时不返回结果而是直接报错——那时
 // 一条路径也没动；能返回结果就意味着执行阶段已经逐条进行过了。
 type DeletePathsResult struct {
+	// RemoteAlias is set only by remote_delete_path.
+	RemoteAlias  string         `json:"remoteAlias,omitempty"`
 	Paths        []DeleteResult `json:"paths"`
 	DeletedCount int            `json:"deletedCount"`
 	FailedCount  int            `json:"failedCount"`
@@ -1020,8 +1016,6 @@ type StartServiceRequest struct {
 
 type StopServiceRequest struct {
 	ID string `json:"id"`
-	// Deprecated: accepted for compatibility, ignored. Stop immediately kills the owned tree.
-	GraceSeconds int `json:"graceSeconds,omitempty"`
 }
 
 type BackgroundProcessRequest struct {
@@ -1033,7 +1027,6 @@ type BackgroundProcessRequest struct {
 	Cwd             string `json:"cwd,omitempty"`
 	ID              string `json:"id,omitempty"`
 	TailBytes       int    `json:"tailBytes,omitempty"`
-	GraceSeconds    int    `json:"graceSeconds,omitempty"`
 }
 
 // ServiceReadRequest is the model-facing read payload for the service tool.
@@ -1182,6 +1175,10 @@ type ServiceOutputResult struct {
 }
 
 type CommandResult struct {
+	// RemoteAlias names the SSH host this result came from; empty for a local
+	// command. Remote and local commands share one renderer, so this is the
+	// only thing that lets a later replay say which machine produced the output.
+	RemoteAlias          string `json:"remoteAlias,omitempty"`
 	Command              string `json:"command"`
 	Cwd                  string `json:"cwd"`
 	Shell                string `json:"shell"`
@@ -1286,20 +1283,16 @@ type WebFetchResult struct {
 }
 
 type RemoteReadFileRequest struct {
-	Target string                 `json:"target"`
-	Files  []BatchReadFileRequest `json:"files"`
-	// Compatibility fields for legacy single-file reads
-	Path      string `json:"path,omitempty"`
-	StartLine int    `json:"startLine,omitempty"`
-	EndLine   int    `json:"endLine,omitempty"`
+	Alias string                 `json:"alias"`
+	Files []BatchReadFileRequest `json:"files"`
 }
 
 // RemoteEditRequest is the flat model-facing remote_edit request: exactly one
-// file per call, path/version/changes at the top level under the SSH target —
-// the same shape local edit uses, prefixed with `target`. Multi-file changes
-// are parallel remote_edit calls in one model response.
+// file per call, path/version/changes at the top level under the SSH alias —
+// the same shape local edit uses, with an SSH server `alias` and absolute path.
+// Multi-file changes are parallel remote_edit calls in one model response.
 type RemoteEditRequest struct {
-	Target  string       `json:"target"`
+	Alias   string       `json:"alias"`
 	Path    string       `json:"path"`
 	Version string       `json:"version"`
 	Changes []TextChange `json:"changes"`
@@ -1310,7 +1303,7 @@ func (req RemoteEditRequest) file() FileTextEdits {
 }
 
 type RemoteCreateFileRequest struct {
-	Target    string `json:"target"`
+	Alias     string `json:"alias"`
 	Path      string `json:"path"`
 	Content   string `json:"content"`
 	Overwrite bool   `json:"overwrite"`
@@ -1318,24 +1311,23 @@ type RemoteCreateFileRequest struct {
 }
 
 type RemoteDeletePathRequest struct {
-	Target    string   `json:"target"`
+	Alias     string   `json:"alias"`
 	Paths     []string `json:"paths"`
 	Recursive bool     `json:"recursive"`
 }
 
 type RemoteRunCommandRequest struct {
-	Target  string `json:"target"`
+	Alias   string `json:"alias"`
 	Command string `json:"command"`
-	Cwd     string `json:"cwd,omitempty"`
 	Timeout int    `json:"timeout,omitempty"`
 	Shell   string `json:"shell,omitempty"`
 }
 
 type remoteTarget struct {
-	Raw           string
-	Host          string
-	Port          string
-	WorkspaceRoot string
+	Raw        string
+	Host       string
+	Port       string
+	credential *sshCredentialEntry
 }
 
 type remoteRawFile struct {
@@ -1399,6 +1391,8 @@ type GitDiffResult struct {
 }
 
 type EditResult struct {
+	// RemoteAlias is set only by the remote file tools.
+	RemoteAlias       string   `json:"remoteAlias,omitempty"`
 	Path              string   `json:"path"`
 	BeforeSHA256      string   `json:"beforeSha256"`
 	AfterSHA256       string   `json:"afterSha256"`
@@ -1449,6 +1443,8 @@ type TextChange struct {
 }
 
 type MultiEditResult struct {
+	// RemoteAlias is set only by remote_edit.
+	RemoteAlias  string       `json:"remoteAlias,omitempty"`
 	Files        []EditResult `json:"files"`
 	FileCount    int          `json:"fileCount"`
 	Replacements int          `json:"-"`
@@ -1474,15 +1470,9 @@ type SkillDefinition struct {
 	embeddedContent string
 }
 
-// BatchReadRequest is the model-facing read payload. A line range belongs to one
-// entry (BatchReadFileRequest); there is deliberately no request-level range: the
-// read schema never declared one, so the argument gate refuses it, and the
-// per-entry fallback that used to apply it was therefore unreachable. Path/Paths
-// are the legacy single-file forms kept for old callers; they carry no range.
+// BatchReadRequest carries per-file paths and optional line ranges.
 type BatchReadRequest struct {
-	Path  string                 `json:"path,omitempty"`
-	Paths []string               `json:"paths,omitempty"`
-	Files []BatchReadFileRequest `json:"files,omitempty"`
+	Files []BatchReadFileRequest `json:"files"`
 }
 
 type BatchReadFileRequest struct {
@@ -1525,8 +1515,10 @@ type BatchReadResultItem struct {
 }
 
 type BatchReadResult struct {
-	Files   []BatchReadResultItem `json:"files"`
-	Missing []ReadPathStatus      `json:"missing,omitempty"`
+	// RemoteAlias is set only by remote_read.
+	RemoteAlias string                `json:"remoteAlias,omitempty"`
+	Files       []BatchReadResultItem `json:"files"`
+	Missing     []ReadPathStatus      `json:"missing,omitempty"`
 }
 
 type ReadPathStatus struct {
@@ -1694,6 +1686,18 @@ func (a *App) ensureInitialized() error {
 		var loaded ConfigState
 		if loaded, err = readConfigFile(loadPath); err == nil {
 			a.config = loadedConfig(loaded)
+			tokenParamsMigrated := false
+			for i, model := range loaded.Models {
+				if model.TokenParam != a.config.Models[i].TokenParam {
+					tokenParamsMigrated = true
+					break
+				}
+			}
+			if tokenParamsMigrated || loaded.Model != "" || loaded.APIKey != "" || len(loaded.APIKeys) > 0 {
+				if err := persistConfigFile(a.configPath, a.config); err != nil {
+					return fmt.Errorf("migrate model configuration: %w", err)
+				}
+			}
 		} else {
 			// 内容坏掉的配置不能留在原地：这次用了默认值，之后任意一次保存都会把
 			// 默认值写回同一个文件，用户的原设置就永久消失了。改名保留 + 记一行
@@ -1812,7 +1816,10 @@ func (a *App) startChatWithConfig(req ChatRequest, cfg ConfigState) (string, err
 	if req.GoalID != "" {
 		if err := a.attachGoalRun(req.GoalID, req.SessionID, runID); err != nil {
 			cancel()
-			a.finishRun(runID)
+			a.finishRun(runFinish{
+				ctx: ctx, runID: runID, sessionID: req.SessionID, workspace: cfg.Workspace,
+				started: time.Now(), syncIndex: req.syncSessionIndex, goalID: req.GoalID,
+			}, nil, runOutcome{kind: "error", message: err.Error()})
 			return "", err
 		}
 	}
@@ -1869,13 +1876,113 @@ func (a *App) CancelRun(runID string) error {
 	return nil
 }
 
-func (a *App) finishRun(runID string) {
+// runOutcome is how a run finished. A return branch only records it; finishRun
+// is the one place that saves, syncs, reports and releases.
+type runOutcome struct {
+	kind    string         // "done", "cancelled" or "error"
+	message string         // error text; empty on success
+	extra   map[string]any // extra event fields such as stopReason
+}
+
+// event names the end event this outcome emits.
+func (o runOutcome) event() string {
+	if o.kind == "done" {
+		return "run:done"
+	}
+	return "run:error"
+}
+
+// runFinish is what finishRun needs beyond the run's final history and outcome.
+type runFinish struct {
+	ctx       context.Context
+	runID     string
+	sessionID string
+	workspace string
+	started   time.Time
+	syncIndex bool
+	goalID    string
+}
+
+// finishRun is the single end-of-run exit: one line per step, in the order the
+// steps depend on each other. Independent steps run concurrently.
+func (a *App) finishRun(f runFinish, messages []openai.ChatCompletionMessage, outcome runOutcome) {
+	// History: the final version on success, the checkpoint save otherwise.
+	if outcome.kind == "done" || len(sanitizeHistoryMessages(messages)) > 0 {
+		a.saveHistory(f.sessionID, messages)
+	}
+	// These three read the saved history and touch different state: run them
+	// together instead of one after another. A failing step is logged, not fatal.
+	runParallel("run finish",
+		func() { a.restoreSavedHistoryBreakdown(f.sessionID) },     // context breakdown
+		func() { a.syncRunSessionIndex(f.sessionID, f.syncIndex) }, // session index
+		func() { a.invalidateGitStatus(f.workspace) },              // Git status cache
+	)
+	// These stay in order: record the result, announce it, then free the run.
+	a.recordRunOutcome(f.runID, f.sessionID, outcome)
+	a.emitRunEnd(f, outcome)
+	a.clearLiveCommandContext(f.sessionID)
+	a.releaseRun(f.runID)
+	// The usage sample belongs to this run: write it now instead of waiting for
+	// a timer to rewrite the day file while nothing new happened.
+	a.stats.flushNow()
+}
+
+// syncRunSessionIndex refreshes the index only for runs without a UI writer.
+func (a *App) syncRunSessionIndex(sessionID string, needed bool) {
+	if !needed {
+		return
+	}
+	if err := a.syncSessionIndexFromHistory(sessionID); err != nil {
+		a.logAppError("session index sync failed", "sessionId", sessionID, "error", err.Error())
+	}
+}
+
+// recordRunOutcome keeps the result that /result and status queries read.
+func (a *App) recordRunOutcome(runID, sessionID string, outcome runOutcome) {
+	a.mu.Lock()
+	if a.sessionRunOutcomes == nil {
+		a.sessionRunOutcomes = map[string]sessionRunOutcome{}
+	}
+	a.sessionRunOutcomes[sessionID] = sessionRunOutcome{
+		RunID: runID, Status: outcome.kind, Error: outcome.message, UpdatedAt: time.Now().UnixMilli(),
+	}
+	a.mu.Unlock()
+}
+
+// clearLiveCommandContext drops the command context the next run rebuilds.
+func (a *App) clearLiveCommandContext(sessionID string) {
+	a.mu.Lock()
+	delete(a.liveCommandContext, sessionID)
+	a.mu.Unlock()
+}
+
+// emitRunEnd sends run:done or run:error with this run's duration and usage.
+func (a *App) emitRunEnd(f runFinish, outcome runOutcome) {
+	payload := make(map[string]any, len(outcome.extra)+6)
+	for key, value := range outcome.extra {
+		payload[key] = value
+	}
+	payload["runId"] = f.runID
+	payload["status"] = outcome.kind
+	payload["sessionId"] = f.sessionID
+	payload["workspace"] = f.workspace
+	payload["durationMs"] = time.Since(f.started).Milliseconds()
+	if outcome.message != "" {
+		payload["error"] = outcome.message
+	}
+	publishRunModelUsage(f.ctx, payload)
+	a.finishGoalRun(f.goalID, f.runID, outcome.kind, outcome.message)
+	a.emit(outcome.event(), payload)
+}
+
+// releaseRun drops the run's live registrations. The input queue is dropped,
+// not closed: closing a channel while a concurrent InjectRunMessage is sending
+// would panic, and dropping the only reference lets the channel (plus any
+// queued messages) be GC'd with the run.
+func (a *App) releaseRun(runID string) {
 	a.mu.Lock()
 	delete(a.runs, runID)
 	delete(a.runSessions, runID)
-	// The queue is dropped, not closed: closing a channel while a concurrent
-	// InjectRunMessage is sending would panic, and dropping the only reference
-	// lets the channel (plus any queued messages) be GC'd with the run.
 	delete(a.runInputs, runID)
 	a.mu.Unlock()
 }
@@ -1990,6 +2097,7 @@ func (a *App) releaseSession(sessionID string, deleteHistory bool) error {
 	delete(a.liveBreakdown, sessionID)
 	delete(a.sessionWorkspaceMaps, sessionID)
 	delete(a.sessionSystemPrompts, sessionID)
+	delete(a.sessionContextSettings, sessionID)
 	delete(a.sessionSkills, sessionID)
 	delete(a.sessionToolsets, sessionID)
 	delete(a.sessionWorkspaces, sessionID)
@@ -2160,7 +2268,7 @@ func (a *App) stripSessionReasoning(sessionID string) {
 	a.mu.Unlock()
 
 	if a.reasoningStash != nil {
-		a.reasoningStash.clearSession(sessionID)
+		a.reasoningStash.clearReasoningScope(openAIResponsesPromptCacheKey(sessionID))
 	}
 
 	if len(cloned) > 0 {
@@ -2173,6 +2281,7 @@ func (a *App) stripSessionReasoning(sessionID string) {
 }
 
 func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg ConfigState) {
+	cfg = a.contextSettingsForSession(req.SessionID, cfg, true)
 	ctx, closeBlackboard := newRunBlackboard(ctx)
 	ctx = withModelRunUsage(ctx)
 	ctx, finishPerf := beginPerfRun(ctx, runID)
@@ -2181,13 +2290,12 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 	cfg.responsesPromptCacheKey = openAIResponsesPromptCacheKey(sessionID)
 	// Knowledge-base runs mark their sources/ subtree read-only for every
 	// tool call in this run; sub-agents inherit the policy via ctx.
-	ctx = withKBDenyRoots(ctx, kbDenyRootsForConfig(cfg))
-	// success marks a run that already persisted its history on the normal
-	// run:done path. Interrupted runs (ESC/cancel, provider errors, stop
-	// reasons, step limits) fall through to the deferred checkpoint save so
-	// work completed before the interruption survives into the next request.
-	success := false
+	// end records how this run finished (see runOutcome). Interrupted runs
+	// (ESC/cancel, provider errors, stop reasons, step limits) fall through to
+	// the same checkpoint save, so work completed before the interruption
+	// survives into the next request.
 	var messages []openai.ChatCompletionMessage
+	end := runOutcome{kind: "error"}
 	startTime := time.Now()
 	// End-of-run plan check: planUnreportedWork is set by a batch that did work
 	// (a file mutation or a command) while the plan did not move, and cleared by
@@ -2212,44 +2320,15 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			}
 		}
 	}
-	emitRunEnd := func(event string, kind string, payload map[string]any) {
-		a.invalidateGitStatus(cfg.Workspace)
-		if payload == nil {
-			payload = map[string]any{}
-		}
-		payload["runId"] = runID
-		payload["status"] = kind
-		payload["sessionId"] = sessionID
-		payload["workspace"] = cfg.Workspace
-		payload["durationMs"] = time.Since(startTime).Milliseconds()
-		publishRunModelUsage(ctx, payload)
-		a.mu.Lock()
-		if a.sessionRunOutcomes == nil {
-			a.sessionRunOutcomes = map[string]sessionRunOutcome{}
-		}
-		a.sessionRunOutcomes[sessionID] = sessionRunOutcome{
-			RunID: runID, Status: kind, Error: stringValue(payload["error"]), UpdatedAt: time.Now().UnixMilli(),
-		}
-		a.mu.Unlock()
-		a.finishGoalRun(req.GoalID, runID, kind, stringValue(payload["error"]))
-		a.emit(event, payload)
-
+	finish := runFinish{
+		ctx: ctx, runID: runID, sessionID: sessionID, workspace: cfg.Workspace,
+		started: startTime, syncIndex: req.syncSessionIndex, goalID: req.GoalID,
 	}
 	defer func() {
 		closeBlackboard() // The synchronous tool/child execution barrier has drained.
-		if !success && len(sanitizeHistoryMessages(messages)) > 0 {
-			a.saveHistory(req.SessionID, messages)
-		}
-		a.restoreSavedHistoryBreakdown(sessionID)
-		if req.syncSessionIndex {
-			if err := a.syncSessionIndexFromHistory(sessionID); err != nil {
-				a.logAppError("session index sync failed", "sessionId", sessionID, "error", err.Error())
-			}
-		}
-		a.mu.Lock()
-		delete(a.liveCommandContext, sessionID)
-		a.mu.Unlock()
-		a.finishRun(runID)
+		// Every end-of-run step lives in finishRun: nothing else may run after
+		// it, so an interrupted run cannot leave the session half-written.
+		a.finishRun(finish, messages, end)
 	}()
 	// Panic 兜底：runChat 在独立 goroutine 里运行，逃逸的 panic 会直接击穿
 	// 整个桌面进程。这里把它转换成常规 run:error 结束路径。注册在上面的清理
@@ -2258,7 +2337,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 	defer func() {
 		if r := recover(); r != nil {
 			a.logAppError("runChat panicked", "runId", runID, "panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
-			emitRunEnd("run:error", "error", map[string]any{"error": fmt.Sprintf("agent 内部错误: %v", r)})
+			end = runOutcome{kind: "error", message: fmt.Sprintf("agent 内部错误: %v", r)}
 		}
 	}()
 
@@ -2266,28 +2345,30 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 
 	if cfg.ImageGeneration != nil && cfg.ImageGeneration.Enabled {
 		if err := a.persistRunImageAttachments(&req, runID); err != nil {
-			emitRunEnd("run:error", "error", map[string]any{"error": err.Error()})
+			end = runOutcome{kind: "error", message: err.Error()}
 			return
 		}
 	}
 	messages = a.buildMessages(req, cfg, a.listCachedSkillsForConfig(cfg))
+	a.beginHistoryTask(sessionID, messages)
 	if err := a.waitForSessionMcp(ctx, runID, sessionID); err != nil {
 		kind := "error"
 		if ctx.Err() != nil {
 			kind = "cancelled"
 		}
-		emitRunEnd("run:error", kind, map[string]any{"error": err.Error()})
+		end = runOutcome{kind: kind, message: err.Error()}
 		return
 	}
 	// This run sends the same immutable tool list on every step. Count it once
 	// from that exact list, including across in-run history compaction.
 	tools := a.buildToolsForSession(sessionID, cfg)
 	if req.GoalID != "" && !toolListHasName(tools, "goal_update") {
-		emitRunEnd("run:error", "error", map[string]any{"error": "goal_update is not available in this session's frozen tool set; start the goal in a fresh session"})
+		end = runOutcome{kind: "error", message: "goal_update is not available in this session's frozen tool set; start the goal in a fresh session"}
 		return
 	}
 	ctx = withBuiltinToolAvailability(ctx, tools)
-	toolSchemaTokens := estimateToolSchemaTokens(tools)
+	toolEventMeta := func(name string) map[string]any { return a.toolEventMeta(ctx, name) }
+	toolSchemaTokens, mcpSchemaTokens := estimateToolSchemaTokenParts(tools)
 	breakdownAcc := newLiveBreakdownAccumulator(messages)
 	// Read de-duplication is scoped to the session, not to this run: a file range
 	// the conversation already carries is omitted instead of re-sent, until a
@@ -2302,6 +2383,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		}
 		b := breakdownAcc.update(msgs)
 		b.ToolSchemas = toolSchemaTokens
+		b.MCPToolSchemas = mcpSchemaTokens
 		b.SystemPrompt, _ = a.sessionPrefixBreakdown(sessionID, cfg, nil)
 		a.finalizeSessionBreakdown(sessionID, &b, msgs)
 		a.mu.Lock()
@@ -2318,12 +2400,12 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			// 记录用户主动取消标记，让下一轮模型能区分"用户中断"与
 			// provider 报错等其他原因导致的未完成回合。
 			messages = append(messages, cancelledTurnMarker())
-			emitRunEnd("run:error", "cancelled", map[string]any{"error": "已取消"})
+			end = runOutcome{kind: "cancelled", message: "已取消"}
 			return
 		default:
 		}
 		if req.GoalID != "" && step >= maxGoalStepsPerRun {
-			emitRunEnd("run:error", "error", map[string]any{"error": "目标单次 run 达到步骤上限；目标已暂停，可检查进展后继续。"})
+			end = runOutcome{kind: "error", message: "目标单次 run 达到步骤上限；目标已暂停，可检查进展后继续。"}
 			return
 		}
 		// Inject user messages queued while this run was working: they wait
@@ -2334,7 +2416,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		var inputErr error
 		messages, injected, inputErr = a.appendPendingRunInputs(runID, sessionID, cfg, messages)
 		if inputErr != nil {
-			emitRunEnd("run:error", "error", map[string]any{"error": inputErr.Error()})
+			end = runOutcome{kind: "error", message: inputErr.Error()}
 			return
 		}
 		if injected {
@@ -2445,7 +2527,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 					emittedEvents = true
 					streamDeltas.flush()
 					toolCalls = cloneToolCalls(event.ToolCalls)
-					for _, toolEvent := range toolProgress.events(runID, sessionID, toolBatchID, toolCalls, a.mcpToolEventMeta) {
+					for _, toolEvent := range toolProgress.events(runID, sessionID, toolBatchID, toolCalls, toolEventMeta) {
 						a.emit(toolEvent.Name, toolEvent.Payload)
 					}
 				}
@@ -2462,14 +2544,14 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			}
 			if errors.Is(err, context.Canceled) {
 				messages = append(messages, cancelledTurnMarker())
-				emitRunEnd("run:error", "cancelled", map[string]any{"error": "已取消"})
+				end = runOutcome{kind: "cancelled", message: "已取消"}
 				return
 			}
 			if isProvider400Error(err) && !sanitizedThisStep {
 				sanitizedThisStep = true
 				if isAnthropicSignatureRejectionError(err) {
 					requestTrigger = "signature_recovery"
-					a.reasoningStash.clearSession(sessionID)
+					a.reasoningStash.clearReasoningScope(reasoningReplayScope(cfg))
 					messages = stripReasoningContent(messages)
 					requestMessages = messages
 					a.emit("run:retry", map[string]any{"runId": runID, "sessionId": sessionID, "attempt": 1, "maxAttempts": 1, "reason": "reasoning signature cleared after provider 400"})
@@ -2497,7 +2579,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 				requestTrigger = "overflow_recovery"
 				newMessages, payload, compactErr := a.compactRunHistory(ctx, cfg, sessionID, compactReasonOverflow, req, messages, usedTokens)
 				if compactErr != nil {
-					emitRunEnd("run:error", "error", map[string]any{"error": fmt.Sprintf("%v；上下文超出模型窗口且压缩失败(%v)，请删除部分历史或改用窗口更大的模型后重试", err, compactErr)})
+					end = runOutcome{kind: "error", message: fmt.Sprintf("%v；上下文超出模型窗口且压缩失败(%v)，请删除部分历史或改用窗口更大的模型后重试", err, compactErr)}
 					return
 				}
 				messages = newMessages
@@ -2511,13 +2593,12 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			// pre-stream 失败已在 streamModelResponse 内部按同一预算退避重试过,
 			// 这里直接失败,避免同一请求被两层循环重复重试。
 			if turnAttempt >= maxTurnRetries || !retryModelTurn(err, emittedEvents) {
-				failure := map[string]any{"error": err.Error()}
 				// 上游模型服务的报错带来源标记，界面据此提示"这是服务方返回的错误"，
 				// 与 Ally 自身的报错区分开(见 upstreamError)。
+				end = runOutcome{kind: "error", message: err.Error()}
 				if isUpstreamError(err) {
-					failure["errorSource"] = upstreamErrorSource
+					end.extra = map[string]any{"errorSource": upstreamErrorSource}
 				}
-				emitRunEnd("run:error", "error", failure)
 				return
 			}
 			wait := llmRetryDelayForError(turnAttempt+1, err)
@@ -2530,7 +2611,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			})
 			if waitErr := a.waitLLMRetry(ctx, wait); waitErr != nil {
 				messages = append(messages, cancelledTurnMarker())
-				emitRunEnd("run:error", "cancelled", map[string]any{"error": "已取消"})
+				end = runOutcome{kind: "cancelled", message: "已取消"}
 				return
 			}
 		}
@@ -2543,7 +2624,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		var toolExecutionArgs []string
 		toolCalls, toolExecutionArgs = prepareToolCallsForExecution(modelResp.ToolCalls)
 		if len(toolCalls) > 0 && toolProgress != nil {
-			for _, toolEvent := range toolProgress.forceEvents(runID, sessionID, toolBatchID, toolCalls, a.mcpToolEventMeta) {
+			for _, toolEvent := range toolProgress.forceEvents(runID, sessionID, toolBatchID, toolCalls, toolEventMeta) {
 				a.emit(toolEvent.Name, toolEvent.Payload)
 			}
 		}
@@ -2563,7 +2644,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 				})
 				a.recordContextAnchor(sessionID, messages, modelResp.Usage)
 			}
-			emitRunEnd("run:error", "error", map[string]any{"error": stopErr.Error(), "stopReason": modelResp.StopReason})
+			end = runOutcome{kind: "error", message: stopErr.Error(), extra: map[string]any{"stopReason": modelResp.StopReason}}
 			return
 		}
 		if len(toolCalls) == 0 {
@@ -2579,7 +2660,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			var inputErr error
 			messages, injected, inputErr = a.appendPendingRunInputs(runID, sessionID, cfg, messages)
 			if inputErr != nil {
-				emitRunEnd("run:error", "error", map[string]any{"error": inputErr.Error()})
+				end = runOutcome{kind: "error", message: inputErr.Error()}
 				return
 			}
 			if injected {
@@ -2604,14 +2685,13 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 					continue
 				}
 			}
-			a.saveHistory(req.SessionID, messages)
-			success = true
-			emitRunEnd("run:done", "done", nil)
+			// finishRun saves this history, then emits run:done.
+			end = runOutcome{kind: "done"}
 			return
 		}
 
 		mintMissingToolCallIDs(runID, toolCalls)
-		for _, event := range toolProgress.forceEvents(runID, sessionID, toolBatchID, toolCalls, a.mcpToolEventMeta) {
+		for _, event := range toolProgress.forceEvents(runID, sessionID, toolBatchID, toolCalls, toolEventMeta) {
 			a.emit(event.Name, event.Payload)
 		}
 		messages = append(messages, openai.ChatCompletionMessage{
@@ -2643,7 +2723,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		// paused would otherwise be judged against the old list and only take
 		// effect in the next run.
 		toolCfg := a.cfgWithLiveExtraRoots(sessionID, cfg)
-		toolConflicts := detectToolBatchConflicts(toolCfg, toolCalls)
+		toolConflicts := detectToolBatchConflicts(toolCfg, toolCalls, toolPurposeFields(ctx))
 		blackboardNames, toolConflicts := a.reserveBlackboardDelegates(ctx, toolCfg, toolCalls, toolConflicts)
 
 		// emitOutcome pushes a single tool's result/error to the frontend as
@@ -2714,6 +2794,9 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 				ToolCallID: o.callID,
 				Content:    o.modelJSON,
 			})
+			call := toolCalls[o.index]
+			meta := toolHistoryMetadataFor(call, toolPurposeFields(ctx)[normalizeToolName(call.Function.Name)], o.result, o.modelJSON)
+			a.reasoningStash.recordToolStatus(reasoningReplayScope(cfg), messages[len(messages)-1], o.result, meta)
 		}
 		// Inject image files read by this tool batch into multimodal model
 		// context (read of a .png/.jpg/... returns a base64 DataURL). The
@@ -2740,20 +2823,19 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			var inputErr error
 			messages, injected, inputErr = a.appendPendingRunInputs(runID, sessionID, cfg, messages)
 			if inputErr != nil {
-				emitRunEnd("run:error", "error", map[string]any{"error": inputErr.Error()})
+				end = runOutcome{kind: "error", message: inputErr.Error()}
 				return
 			}
 			if injected {
 				a.emit("run:inject", map[string]any{"runId": runID, "sessionId": sessionID})
 				continue
 			}
-			a.saveHistory(req.SessionID, messages)
-			success = true
-			emitRunEnd("run:done", "done", nil)
+			// finishRun saves this history, then emits run:done.
+			end = runOutcome{kind: "done"}
 			return
 		}
 	}
-	emitRunEnd("run:error", "error", map[string]any{"error": "达到最大 agent 步数，已停止"})
+	end = runOutcome{kind: "error", message: "达到最大 agent 步数，已停止"}
 	return
 }
 
@@ -2837,6 +2919,8 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 			fmt.Errorf("tool arguments were truncated during streaming; please re-send the call with complete parameters (merge small changes, split large edits into separate calls)")))
 	}
 
+	args = prepareToolPurpose(ctx, name, args)
+
 	var data any
 	var err error
 	// Lenient decode: unknown argument keys and auto-repaired argument values
@@ -2878,9 +2962,6 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 			err = validateModelEditToolRequest([]FileTextEdits{req})
 		}
 		if err == nil {
-			err = kbDenyCheckPaths(ctx, cfg, req.Path)
-		}
-		if err == nil {
 			data, err = a.editFilesWithContext(ctx, cfg, []FileTextEdits{req})
 			if err == nil {
 				data = attachValidation(data, a.validateChangedFilesForCall(ctx, cfg, []string{req.Path}))
@@ -2891,9 +2972,6 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 	case "create":
 		var req CreateFileRequest
 		err, argWarnings = decodeJSON(&req)
-		if err == nil {
-			err = kbDenyCheckPaths(ctx, cfg, req.Path)
-		}
 		if err == nil {
 			a.withFileOpsLock(func() { data, err = a.createFileWithConfig(cfg, req) })
 			if err == nil {
@@ -2908,9 +2986,6 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		var deletePaths []string
 		if err == nil {
 			deletePaths, err = resolveDeletePathList(req.Paths)
-		}
-		if err == nil {
-			err = kbDenyCheckPaths(ctx, cfg, deletePaths...)
 		}
 		if err == nil {
 			a.withFileOpsLock(func() { data, err = a.deletePathsWithConfig(cfg, deletePaths, req.Recursive) })
@@ -2935,18 +3010,6 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		if err == nil {
 			switch strings.ToLower(strings.TrimSpace(req.Action)) {
 			case "start":
-				// 沙箱生效时 KB 禁写由内核 DenyWriteRoots 兜底，字面检查只在
-				// 围栏全量生效（沙箱关闭/降级）时执行。检查的结果必须落到 err
-				// 上：只把它当条件判断会让拦截退化成「成功 + 空结果」，模型读
-				// 到的是一次什么都没发生的成功启动。
-				var denyErr error
-				if !kernelOwnsBoundary() {
-					denyErr = kbDenyCheckCommand(ctx, cfg, req.Command)
-				}
-				if denyErr != nil {
-					err = denyErr
-					break
-				}
 				data, err = a.startServiceWithConfig(ctx, cfg, StartServiceRequest{
 					Name:        req.Name,
 					Description: req.Description,
@@ -2955,7 +3018,7 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 				})
 			case "stop":
 				if err = a.checkServiceWorkspace(cfg, req.ID); err == nil {
-					data, err = a.stopService(StopServiceRequest{ID: req.ID, GraceSeconds: req.GraceSeconds})
+					data, err = a.stopService(StopServiceRequest{ID: req.ID})
 				}
 			case "restart":
 				data, err = a.restartServiceWithConfig(ctx, cfg, req.ID)
@@ -3014,9 +3077,6 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 			}
 		}
 		if err == nil {
-			err = kbDenyCheckPaths(ctx, cfg, req.SaveTo)
-		}
-		if err == nil {
 			data, err = a.httpRequestToolWithConfig(ctx, cfg, req)
 		}
 	case "web_fetch":
@@ -3029,13 +3089,15 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		var req SSHClusterRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
-			data, err = a.executeSSHClusterTool(ctx, sessionID, cfg.Workspace, req)
+			data, err = a.executeSSHClusterTool(cfg.Workspace, req)
 		}
 	case "remote_read":
 		var req RemoteReadFileRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
-			data, err = a.remoteReadFileCached(ctx, req)
+			res, rerr := a.remoteReadFileCached(ctx, req)
+			res.RemoteAlias = strings.TrimSpace(req.Alias)
+			data, err = res, rerr
 		}
 	case "remote_edit":
 		// Flat single-file request: target + the same path/version/changes as
@@ -3047,25 +3109,33 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 			err = validateModelEditToolRequest([]FileTextEdits{req.file()})
 		}
 		if err == nil {
-			data, err = a.remoteEdit(ctx, req)
+			res, rerr := a.remoteEdit(ctx, req)
+			res.RemoteAlias = strings.TrimSpace(req.Alias)
+			data, err = res, rerr
 		}
 	case "remote_create_file":
 		var req RemoteCreateFileRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
-			data, err = a.remoteCreateFile(ctx, req)
+			res, rerr := a.remoteCreateFile(ctx, req)
+			res.RemoteAlias = strings.TrimSpace(req.Alias)
+			data, err = res, rerr
 		}
 	case "remote_delete_path":
 		var req RemoteDeletePathRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
-			data, err = a.remoteDeletePath(ctx, req)
+			res, rerr := a.remoteDeletePath(ctx, req)
+			res.RemoteAlias = strings.TrimSpace(req.Alias)
+			data, err = res, rerr
 		}
 	case "remote_run_command":
 		var req RemoteRunCommandRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
-			data, err = a.remoteRunCommand(ctx, req)
+			res, rerr := a.remoteRunCommand(ctx, req)
+			res.RemoteAlias = strings.TrimSpace(req.Alias)
+			data, err = res, rerr
 		}
 	case "remote_transfer":
 		var req RemoteTransferRequest
@@ -3090,9 +3160,6 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 			}
 		}
 
-	case "document_read": // legacy name; documents now require the anydoc skill
-		err = codedToolError("E_DOCUMENT_UNSUPPORTED",
-			errors.New("document_read was removed; office/PDF documents are no longer read directly. Convert to Markdown with the anydoc skill first, then use read on the converted .md file"))
 	case "calculate":
 		var reqCalc CalculateRequest
 		err, argWarnings = decodeJSON(&reqCalc)
@@ -3122,7 +3189,7 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 				}
 			}
 		}
-	case "subagent", "agent_delegate":
+	case "subagent":
 		var adReq AgentDelegateRequest
 		err, argWarnings = decodeJSON(&adReq)
 		if err == nil {
