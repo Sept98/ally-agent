@@ -393,6 +393,19 @@ func TestWireSchemasDeclareObjectShape(t *testing.T) {
 // honors but the schema long left undeclared. Without a declaration the gate
 // rejects the key outright, so a model cannot send auth headers, raise a body
 // cap, or pick a remote shell at all.
+func TestGoalUpdateAcceptanceIsOptionalAfterInitialSetup(t *testing.T) {
+	params, _ := builtinSchemaForTest(t, "goal_update")
+	properties := schemaObjectForTest(t, params["properties"])
+	acceptance := schemaObjectForTest(t, properties["acceptance"])
+	if acceptance["type"] != "array" {
+		t.Fatalf("acceptance schema = %#v", acceptance)
+	}
+	required, _ := params["required"].([]string)
+	if slices.Contains(required, "acceptance") {
+		t.Fatal("acceptance must be omittable after the initial goal update")
+	}
+}
+
 func TestBuiltinSchemasExposeTheRuntimeParameters(t *testing.T) {
 	for _, tc := range []struct{ tool, param string }{
 		{"web_fetch", "headers"},

@@ -218,7 +218,7 @@ func goalStartMessage(g Goal) string {
 	} else {
 		b.WriteString("\n\n在产生任何副作用前，先整理可观察、可验证的验收条件和有序阶段，并用 goal_update 的 acceptance、stages 字段持久化；阶段包含 title、status（pending/active/completed）、evidence。每次更新都携带完整 stages；每次只推进一个阶段，完成阶段时记录具体证据。若目标有关键歧义，先用 ask 取得用户确认，不要擅自假设。")
 	}
-	b.WriteString("\ngoal_update 每次携带完整 acceptance 与 stages；stage 必须含 title、objective、status、evidence、verifications。完成某阶段前提供该阶段 named verification commands；Ally 实际运行后仅在所有命令退出码为0时才把阶段检查点记为完成。失败计数按阶段持久化，连续失败3次会要求先提交 stage_review，选择 revise（需给新 title/objective）、continue（说明复核理由）或 needs_user；复核前后端阻止所有副作用工具。每阶段 attempt、检查记录和方案修订历史会持久保存。最终 completed 必须再次提供集成验收命令、简短 delivery_summary；若有文件产物，列出 workspace-relative deliverable_paths，Ally 会确认它们存在、是文件并记录 SHA-256。命令在目标工作区沙箱内运行，每条最多120秒；文件路径不允许逃出工作区。只有阶段检查、最终命令及交付物路径检查全部成功后，Ally 才会调用使用同一模型、但拥有独立上下文和专用判定提示词的验收子 agent 审核证据；模型自述完成、命令退出码为0都不能单独证明语义达标。复核不通过会重新打开其指出的阶段，你必须补齐证据或修复后再提交，不能继续宣称完成；复核调用失败或结果无效时目标保持未完成。无法继续时报告 needs_user。普通回答不代表完成。涉及代码时将互不冲突的只读调查、测试设计或 diff review 委派给子 agent；主 agent 核实报告并亲自运行验收命令，不把子 agent 的完成声明当证据。")
+	b.WriteString("\ngoal_update 首次更新时设定 acceptance；此后不要重写或改述验收条件，后续调用省略 acceptance 字段，已保存条件始终生效。若确需改变目标范围，先用 needs_user 向用户询问。每次携带完整 stages；stage 必须含 title、objective、status、evidence、verifications。完成某阶段前提供该阶段 named verification commands；Ally 实际运行后仅在所有命令退出码为0时才把阶段检查点记为完成。失败计数按阶段持久化，连续失败3次会要求先提交 stage_review，选择 revise（需给新 title/objective）、continue（说明复核理由）或 needs_user；复核前后端阻止所有副作用工具。每阶段 attempt、检查记录和方案修订历史会持久保存。最终 completed 必须再次提供集成验收命令、简短 delivery_summary；若有文件产物，列出 workspace-relative deliverable_paths；每项必须是普通文件路径，目录请拆成实际文件分别列出，Ally 会确认文件存在并记录 SHA-256。命令在目标工作区沙箱内运行，每条最多120秒；文件路径不允许逃出工作区。只有阶段检查、最终命令及交付物路径检查全部成功后，Ally 才会调用使用同一模型、但拥有独立上下文和专用判定提示词的验收子 agent 审核证据；模型自述完成、命令退出码为0都不能单独证明语义达标。复核不通过会重新打开其指出的阶段，你必须补齐证据或修复后再提交，不能继续宣称完成；复核调用失败或结果无效时目标保持未完成。无法继续时报告 needs_user。普通回答不代表完成。每个阶段开始时，主 agent 都要先判断是否有边界清晰、互不冲突的只读调查、测试设计或 diff review 值得委派给 subagent；有明显并行收益时才委派，否则由主 agent 执行并简述原因，避免为形式调用子代理。把是否委派及子代理任务简短写入阶段 progress/evidence，主 agent 必须核实子代理报告并亲自运行验收命令，不能把子代理的完成声明当证据。代码修改及其他副作用仍由主 agent 控制。")
 	return b.String()
 }
 
@@ -314,7 +314,8 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 		return Goal{}, err
 	}
 	if len(active.Acceptance) > 0 && len(acceptance) > 0 && !stringSlicesEqual(active.Acceptance, acceptance) {
-		return Goal{}, errors.New("acceptance criteria are fixed for this goal; ask the user before changing scope")
+		frozen, _ := json.Marshal(active.Acceptance)
+		return Goal{}, fmt.Errorf("acceptance criteria are fixed for this goal; do not resend or change them. Omit acceptance to keep the saved criteria %s. Use needs_user to ask the user before changing scope", frozen)
 	}
 	if strings.TrimSpace(req.StageReview.Decision) != "" {
 		return a.reviewGoalStage(ctx, store, active, status, progress, req.StageReview)
@@ -713,7 +714,7 @@ func (a *App) reviewGoalCompletion(ctx context.Context, cfg ConfigState, session
 	}
 	task := "You are a separate acceptance judge using a fresh context and the same configured model as the executing agent. Judge only the supplied evidence. Do not trust the executor's completion claim by itself. A zero exit code is not sufficient unless the command meaningfully checks the stated acceptance criteria; commands such as `true` or `echo` are not substantive verification. Every acceptance criterion needs specific supporting evidence, completed ordered stages, passing checks, and coherent deliverables. If evidence is missing, weak, or ambiguous, choose needs_work and identify the one-based stage that should be reopened. Do not propose broad new scope. Return exactly one JSON object, no markdown: {\"verdict\":\"approved\"|\"needs_work\",\"reason\":\"concise evidence-based reason\",\"stage\":1}. Use stage 0 only when approved.\n\nEvidence JSON:\n" + string(data)
 	reqDelegate := AgentDelegateRequest{
-		Task: task, Role: "independent goal acceptance reviewer", Name: "goal-acceptance-review",
+		Task: task, Role: "independent goal acceptance reviewer",
 		Description: "独立复核目标验收证据", CleanContext: true, Model: cfg.Model, MaxSteps: 2, toolsProvided: true,
 	}
 	var result *AgentDelegateResult
@@ -882,7 +883,7 @@ func (a *App) verifyGoalDeliverables(ctx context.Context, workspace string, path
 			return nil, fmt.Errorf("deliverable %q could not be inspected", clean)
 		}
 		if info.IsDir || info.SHA256 == "" {
-			return nil, fmt.Errorf("deliverable %q is not a regular file", clean)
+			return nil, fmt.Errorf("deliverable %q is not a regular file; list files inside the directory instead", clean)
 		}
 		results = append(results, GoalDeliverable{Path: clean, Size: info.Size, SHA256: info.SHA256, VerifiedAt: time.Now().UTC()})
 	}
@@ -940,7 +941,7 @@ func (a *App) goalContinuation(sessionID, goalID string, count int) (*openai.Cha
 	stages, _ := json.Marshal(g.Stages)
 	return &openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: fmt.Sprintf("<ally-goal-continuation>\n本轮回答结束，但目标状态仍为 %q。请从检查点继续，不重复已完成工作。阶段失败达到阈值时必须先用 goal_update 的 stage_review 选择 revise/continue/needs_user；复核前不能做副作用操作。最终完成必须通过每阶段命令、最终集成命令，并提交 delivery_summary 与实际 deliverable_paths（若产物为文件）。\n当前进度：%s\n验收条件：%s\n阶段检查点（JSON）：%s\n</ally-goal-continuation>", g.Status, g.Progress, criteria, stages),
+		Content: fmt.Sprintf("<ally-goal-continuation>\n本轮回答结束，但目标状态仍为 %q。请从检查点继续，不重复已完成工作。验收条件已经固定：后续 goal_update 必须省略 acceptance 字段，不要重新生成、改写或增加标准；如果确需改变范围，先用 needs_user 询问用户。每进入一个新阶段，先由主 agent 判断是否值得把独立只读调查、测试设计或 diff review 委派给 subagent；只在有实际并行收益时调用，否则说明由主 agent 执行的原因。主 agent 核实所有子代理报告，修改和验收仍由主 agent 负责。阶段失败达到阈值时必须先用 goal_update 的 stage_review 选择 revise/continue/needs_user；复核前不能做副作用操作。最终完成必须通过每阶段命令、最终集成命令，并提交 delivery_summary 与实际 deliverable_paths（若产物为文件）。\n当前进度：%s\n已固定验收条件（仅供核对，不要复制到请求中）：%s\n阶段检查点（JSON）：%s\n</ally-goal-continuation>", g.Status, g.Progress, criteria, stages),
 	}, true
 }
 

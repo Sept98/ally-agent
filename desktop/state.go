@@ -252,6 +252,9 @@ type chatUI struct {
 	AskCustomTxt         map[string]string
 	AskSubmitted         bool
 	PlanCollapsed        bool
+	GoalDetailsOpen      bool
+	GoalPanelVisible     bool
+	GoalActivity         string
 	CmdOpen              bool
 	CmdIndex             int
 	Mention              mentionState

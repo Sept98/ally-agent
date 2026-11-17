@@ -138,6 +138,7 @@ func (a *desktop) applyEvent(name string, p map[string]any) {
 
 	switch name {
 	case "run:start":
+		ui.GoalActivity = ""
 		wasStarting := t.Busy
 		t.RunID = str(p, "runId")
 		t.Busy = true
@@ -291,6 +292,7 @@ func (a *desktop) applyEvent(name string, p map[string]any) {
 		ui.ThinkingBytes = 0
 		t.Status = locales.Text("已注入新消息，继续执行…")
 	case "run:done", "run:error":
+		ui.GoalActivity = ""
 		t.toolRev++
 		ui.ThinkingBytes = 0
 		ui.PlanCollapsed = true
@@ -463,6 +465,19 @@ func (a *desktop) applyToolEvent(t *conversation, name string, p map[string]any)
 	toolName := str(p, "name")
 	if toolName != "" {
 		t.Status = locales.Text("正在使用 ") + toolName
+	}
+	if goal, ok := a.goals[t.ID]; ok && (goal.Status == backend.GoalStatusActive || goal.Status == backend.GoalStatusPending) {
+		if name == "tool:result" || name == "tool:error" {
+			t.uiState().GoalActivity = ""
+		} else {
+			activity := "正在执行：" + toolName
+			if args, ok := p["args"].(map[string]any); ok {
+				if purpose := str(args, "purpose"); purpose != "" {
+					activity += " · " + strings.Join(strings.Fields(purpose), " ")
+				}
+			}
+			t.uiState().GoalActivity = activity
+		}
 	}
 	if name == "tool:result" || name == "tool:error" {
 		// A tool result is the biggest single jump in what the next request will

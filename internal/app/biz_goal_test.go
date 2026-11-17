@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -127,7 +128,14 @@ func TestGoalProgressNeedsUserAndCompletionTransitions(t *testing.T) {
 	if err != nil || updated.Progress != "tests are running" || updated.Status != GoalStatusActive || !stringSlicesEqual(updated.Acceptance, criteria) {
 		t.Fatalf("progress update = %+v, %v", updated, err)
 	}
-	updated, err = app.updateGoalForSession("s1", GoalUpdateRequest{Status: "needs_user", Progress: "need deployment approval", Acceptance: criteria})
+	updated, err = app.updateGoalForSession("s1", GoalUpdateRequest{Status: "progress", Progress: "continuing with saved criteria", Stages: []GoalStageUpdate{{Title: "Run tests", Objective: "Run the relevant acceptance tests", Status: "active"}}})
+	if err != nil || !stringSlicesEqual(updated.Acceptance, criteria) {
+		t.Fatalf("omitting unchanged acceptance did not preserve the saved criteria: %+v, %v", updated, err)
+	}
+	if _, err := app.updateGoalForSession("s1", GoalUpdateRequest{Status: "progress", Progress: "attempting a scope change", Acceptance: []string{"different criteria"}, Stages: []GoalStageUpdate{{Title: "Run tests", Objective: "Run the relevant acceptance tests", Status: "active"}}}); err == nil || !strings.Contains(err.Error(), `"relevant tests pass"`) {
+		t.Fatalf("scope change did not return actionable frozen criteria: %v", err)
+	}
+	updated, err = app.updateGoalForSession("s1", GoalUpdateRequest{Status: "needs_user", Progress: "need deployment approval"})
 	if err != nil || updated.Status != GoalStatusNeedsUser {
 		t.Fatalf("needs_user update = %+v, %v", updated, err)
 	}
@@ -194,6 +202,27 @@ func TestGoalStageVerificationRetryUsesLatestAttemptAndKeepsHistory(t *testing.T
 	stage := updated.Stages[0]
 	if stage.Status != "completed" || stage.Attempts != 2 || len(stage.VerificationAttempts) != 2 || stage.VerificationAttempts[0].Passed || !stage.VerificationAttempts[1].Passed || !allGoalVerificationsPassed(stage.Verifications) {
 		t.Fatalf("verification retry history/latest result incorrect: %+v", stage)
+	}
+}
+
+func TestGoalCompletionReviewerCanRunRepeatedly(t *testing.T) {
+	app := newAppState(t.TempDir())
+	calls := 0
+	app.goalCompletionReviewRunner = func(_ context.Context, _ ConfigState, _ string, req AgentDelegateRequest) (*AgentDelegateResult, error) {
+		calls++
+		if req.Name != "" {
+			t.Fatalf("reviewer name must be auto-assigned for retries, got %q", req.Name)
+		}
+		return &AgentDelegateResult{Status: "completed", Summary: `{"verdict":"approved","reason":"Evidence supports acceptance.","stage":0}`}, nil
+	}
+	goal := Goal{Details: "deliver result", Acceptance: []string{"result exists"}}
+	for i := 0; i < 2; i++ {
+		if _, err := app.reviewGoalCompletion(context.Background(), ConfigState{}, "session", goal, nil, GoalUpdateRequest{Progress: "checked"}, nil, nil); err != nil {
+			t.Fatalf("review attempt %d failed: %v", i+1, err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("reviewer called %d times", calls)
 	}
 }
 

@@ -465,12 +465,12 @@ func chatToolsUncached() []openai.Tool {
 				},
 			},
 		}),
-		functionTool("goal_update", "Persist a complete ordered stage plan and progress. Each completed stage requires named verification commands run by Ally in the workspace sandbox (120-second timeout, no background service). Failures are tracked per stage; after 3 failed attempts, side effects are blocked until stage_review explicitly chooses revise, continue, or needs_user. Final completion also requires passing integration commands, a delivery_summary and workspace-relative deliverable_paths for any file outputs; Ally checks each listed file exists and stores its size and SHA-256, then asks a same-model acceptance sub-agent with an isolated context and a distinct judging prompt to review the evidence. A completion claim or zero exit code alone is not semantic acceptance; rejection reopens the cited stage, while reviewer failure or invalid output leaves the goal incomplete.", map[string]any{
+		functionTool("goal_update", "Persist progress for the current goal. On the first update, establish observable acceptance criteria; after they are saved, omit acceptance from all later calls because the criteria are immutable. Do not rephrase, add, or remove criteria; use needs_user to ask the user before any scope change. The saved criteria remain in force when omitted. Always send the complete ordered stage plan. Each completed stage requires named verification commands run by Ally in the workspace sandbox (120-second timeout, no background service). Failures are tracked per stage; after 3 failed attempts, side effects are blocked until stage_review explicitly chooses revise, continue, or needs_user. Final completion also requires passing integration commands, a delivery_summary and workspace-relative deliverable_paths for any file outputs; Ally checks each listed file exists and stores its size and SHA-256, then asks a same-model acceptance sub-agent with an isolated context and a distinct judging prompt to review the evidence. A completion claim or zero exit code alone is not semantic acceptance; rejection reopens the cited stage, while reviewer failure or invalid output leaves the goal incomplete.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"status":     map[string]any{"type": "string", "enum": []string{"progress", "needs_user", "completed"}},
 				"progress":   map[string]any{"type": "string", "minLength": 1},
-				"acceptance": map[string]any{"type": "array", "maxItems": MaxGoalAcceptanceCriteria, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": MaxGoalAcceptanceCriterionChars}},
+				"acceptance": map[string]any{"type": "array", "maxItems": MaxGoalAcceptanceCriteria, "description": "Set only on the first goal update. Once criteria are saved, omit this field from later updates; changing scope requires asking the user.", "items": map[string]any{"type": "string", "minLength": 1, "maxLength": MaxGoalAcceptanceCriterionChars}},
 				"stages": map[string]any{"type": "array", "maxItems": MaxPlanSteps, "items": map[string]any{"type": "object", "properties": map[string]any{
 					"title":         map[string]any{"type": "string", "minLength": 1, "maxLength": MaxPlanStepTitleChars},
 					"objective":     map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
@@ -489,7 +489,7 @@ func chatToolsUncached() []openai.Tool {
 				"delivery_summary":  map[string]any{"type": "string", "maxLength": 4000},
 				"verifications":     map[string]any{"type": "array", "maxItems": 10, "items": map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string", "minLength": 1, "maxLength": 120}, "command": map[string]any{"type": "string", "minLength": 1, "maxLength": 2000}}, "required": []string{"name", "command"}}},
 			},
-			"required": []string{"status", "progress", "acceptance", "stages", "verifications", "stage_review", "deliverable_paths", "delivery_summary"},
+			"required": []string{"status", "progress", "stages", "verifications", "stage_review", "deliverable_paths", "delivery_summary"},
 		}),
 		functionTool("subagent", "Run an isolated child task. The parent waits for the tool batch; same-stage calls can run concurrently. Children in the same chat run share a temporary Blackboard, not conversation history; give collaborating children unique names and mention peer names in their tasks. The child uses built-in and MCP tools, but cannot use ask, suggest, subagent, plan, skill, scheduled_task, render_html or screenshot. Verify its report and stopReason.", map[string]any{
 			"type": "object",

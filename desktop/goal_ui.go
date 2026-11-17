@@ -101,6 +101,15 @@ func (a *desktop) applyGoalUpdate(p map[string]any) {
 	}
 	a.goals[goal.SessionID] = goal
 	a.goalRev[goal.SessionID] = rev
+	if goal.Status == backend.GoalStatusCompleted {
+		for _, tab := range a.tabs {
+			if tab.ID == goal.SessionID && tab.UI != nil {
+				tab.UI.GoalPanelVisible = false
+				tab.UI.GoalDetailsOpen = false
+				break
+			}
+		}
+	}
 }
 
 func (a *desktop) deleteGoalRecord(goal backend.Goal) {
@@ -174,103 +183,199 @@ func goalStatusLabel(status backend.GoalStatus) string {
 	}
 }
 
+func goalProgressSummary(goal backend.Goal) string {
+	done, current := 0, ""
+	for i, stage := range goal.Stages {
+		if stage.Status == "completed" {
+			done++
+		} else if current == "" && stage.Status == "active" {
+			current = fmt.Sprintf("第%d步：%s", i+1, stage.Title)
+		}
+	}
+	parts := []string{}
+	if len(goal.Stages) > 0 {
+		parts = append(parts, fmt.Sprintf("阶段 %d/%d 完成", done, len(goal.Stages)))
+	}
+	if current != "" {
+		parts = append(parts, "当前 "+current)
+	}
+	if goal.Progress != "" {
+		progress := strings.Join(strings.Fields(goal.Progress), " ")
+		if len([]rune(progress)) > 120 {
+			progress = string([]rune(progress)[:120]) + "…"
+		}
+		parts = append(parts, progress)
+	}
+	if goal.Status == backend.GoalStatusPaused && goal.StopReason != "" {
+		reason := strings.Join(strings.Fields(goal.StopReason), " ")
+		if len([]rune(reason)) > 100 {
+			reason = string([]rune(reason)[:100]) + "…"
+		}
+		parts = append(parts, "暂停原因："+reason)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func goalPanelVisible(goal backend.Goal, st *chatUI) bool {
+	return goal.ID != "" && (goal.Status != backend.GoalStatusCompleted || st.GoalPanelVisible)
+}
+
+func goalSubagentCallCount(t *conversation) int {
+	count := 0
+	if t == nil {
+		return count
+	}
+	for _, message := range t.Messages {
+		if str(message, "role") == "tool_call" && toolKind(str(message, "name")) == "subagent" {
+			count++
+		}
+	}
+	return count
+}
+
+func (a *desktop) jumpToGoalProcess(t *conversation) {
+	if t == nil {
+		return
+	}
+	st := t.uiState()
+	row := t.rowOfMessage(0)
+	if row < 0 {
+		return
+	}
+	st.Follow, st.FollowPending, st.FollowBottom = false, false, 0
+	st.List.ScrollTo(row, ui.Start)
+}
+
 func (a *desktop) goalPanel(c *ui.Context, t *conversation) {
 	goal, ok := a.goals[t.ID]
 	if !ok {
 		return
 	}
+	st := t.uiState()
+	if !goalPanelVisible(goal, st) {
+		return
+	}
+	open := st.GoalDetailsOpen
 	ui.Column(c).Key("goal-"+t.ID).FillWidth().Padding(10, 12).Gap(gapInline).Border(1, c.Theme().Border).Radius(radiusCard).Background(c.Theme().Surface).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Gap(gapField).Children(func() {
 			ui.Text(c, "目标 · "+goal.Title).FontSize(fsSmall).Bold()
 			ui.Spacer(c)
 			ui.Text(c, goalStatusLabel(goal.Status)).FontSize(fsTiny).TextColor(a.secondaryInk())
 		})
-		if goal.Progress != "" {
-			ui.Text(c, goal.Progress).FontSize(fsSmall).TextColor(a.secondaryInk())
+		if summary := goalProgressSummary(goal); summary != "" {
+			ui.Text(c, summary).FontSize(fsSmall).TextColor(a.secondaryInk())
 		}
-		if goal.CompletionReview != nil {
-			label := "未通过"
-			if goal.CompletionReview.Verdict == "approved" {
-				label = "通过"
+		if st.GoalActivity != "" && goal.Status == backend.GoalStatusActive {
+			activity := st.GoalActivity
+			if len([]rune(activity)) > 140 {
+				activity = string([]rune(activity)[:140]) + "…"
 			}
-			ui.Text(c, "独立验收复核（同模型·独立上下文）："+label+" · "+goal.CompletionReview.Reason).FontSize(fsTiny).TextColor(a.secondaryInk())
+			ui.Text(c, activity).FontSize(fsTiny).TextColor(a.secondaryInk())
 		}
-		if len(goal.Stages) > 0 {
-			ui.Text(c, "阶段检查点").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
-			for i, stage := range goal.Stages {
-				label := map[string]string{"pending": "待开始", "active": "进行中", "completed": "阶段检查通过"}[stage.Status]
-				if stage.ReviewRequired {
-					label = "需要复核（副作用已阻止）"
+		parts := ui.CollapsibleBase(c, &open)
+		parts.Trigger.FillWidth().Height(28).Padding(0, 4).Cursor(ui.CursorPointer).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(gapField).Children(func() {
+				ui.Text(c, "目标详情").FontSize(fsTiny).TextColor(a.secondaryInk())
+				ui.Spacer(c)
+				iconGlyph(c, "chevrondown", sizeCaretBlock).Rotate(-90 * (1 - parts.Progress()))
+			})
+		})
+		parts.Panel(func() {
+			ui.Scroll(c.Key("goal-details-scroll-" + t.ID)).MaxHeight(220).Gap(gapInline).Children(func() {
+				flat(c, "查看完整聊天执行过程（含工具调用与结果）").OnClick(func() { a.jumpToGoalProcess(t) })
+				if calls := goalSubagentCallCount(t); calls == 0 {
+					ui.Text(c, "任务子代理：本次未调用，代码实现由主 Agent 完成").FontSize(fsTiny).TextColor(a.secondaryInk())
+				} else {
+					ui.Text(c, fmt.Sprintf("任务子代理调用：%d 次，详见聊天记录中的委派卡片", calls)).FontSize(fsTiny).TextColor(a.secondaryInk())
 				}
-				ui.Text(c, fmt.Sprintf("%d. [%s] %s", i+1, label, stage.Title)).FontSize(fsTiny).TextColor(a.secondaryInk())
-				if stage.Objective != "" {
-					ui.Text(c, "   阶段目标："+stage.Objective).FontSize(fsTiny).TextColor(a.secondaryInk())
-				}
-				if stage.Attempts > 0 {
-					ui.Text(c, fmt.Sprintf("   验收尝试：%d · 连续失败：%d/%d", stage.Attempts, stage.FailuresSinceReview, backend.GoalStageReviewFailureThreshold)).FontSize(fsTiny).TextColor(a.secondaryInk())
-				}
-				if stage.Evidence != "" {
-					ui.Text(c, "   Agent 阶段说明（待核验）："+stage.Evidence).FontSize(fsTiny).TextColor(a.secondaryInk())
-				}
-				for _, check := range stage.Verifications {
-					checkLabel := "失败"
-					if check.Passed {
-						checkLabel = "通过"
+				if goal.CompletionReview != nil {
+					label := "未通过"
+					if goal.CompletionReview.Verdict == "approved" {
+						label = "通过"
 					}
-					ui.Text(c, fmt.Sprintf("   检查 %s：%s（退出码 %d）", check.Name, checkLabel, check.ExitCode)).FontSize(fsTiny).TextColor(a.secondaryInk())
+					ui.Text(c, "独立验收子代理复核（同模型·独立上下文）："+label+" · "+goal.CompletionReview.Reason).FontSize(fsTiny).TextColor(a.secondaryInk())
 				}
-				for _, revision := range stage.ReviewHistory {
-					ui.Text(c, fmt.Sprintf("   方案复核：%s · %s", revision.Decision, revision.Rationale)).FontSize(fsTiny).TextColor(a.secondaryInk())
+				if len(goal.Stages) > 0 {
+					ui.Text(c, "阶段检查点").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+					for i, stage := range goal.Stages {
+						label := map[string]string{"pending": "待开始", "active": "进行中", "completed": "阶段检查通过"}[stage.Status]
+						if stage.ReviewRequired {
+							label = "需要复核（副作用已阻止）"
+						}
+						ui.Text(c, fmt.Sprintf("%d. [%s] %s", i+1, label, stage.Title)).FontSize(fsTiny).TextColor(a.secondaryInk())
+						if stage.Objective != "" {
+							ui.Text(c, "   阶段目标："+stage.Objective).FontSize(fsTiny).TextColor(a.secondaryInk())
+						}
+						if stage.Attempts > 0 {
+							ui.Text(c, fmt.Sprintf("   验收尝试：%d · 连续失败：%d/%d", stage.Attempts, stage.FailuresSinceReview, backend.GoalStageReviewFailureThreshold)).FontSize(fsTiny).TextColor(a.secondaryInk())
+						}
+						if stage.Evidence != "" {
+							ui.Text(c, "   Agent 阶段说明（待核验）："+stage.Evidence).FontSize(fsTiny).TextColor(a.secondaryInk())
+						}
+						for _, check := range stage.Verifications {
+							checkLabel := "失败"
+							if check.Passed {
+								checkLabel = "通过"
+							}
+							ui.Text(c, fmt.Sprintf("   检查 %s：%s（退出码 %d）", check.Name, checkLabel, check.ExitCode)).FontSize(fsTiny).TextColor(a.secondaryInk())
+						}
+						for _, revision := range stage.ReviewHistory {
+							ui.Text(c, fmt.Sprintf("   方案复核：%s · %s", revision.Decision, revision.Rationale)).FontSize(fsTiny).TextColor(a.secondaryInk())
+						}
+					}
 				}
-			}
-		}
-		if goal.Model != nil {
-			ui.Text(c, "目标固定模型："+modelLabel(goal.Model.ProviderName, goal.Model.Model)).FontSize(fsTiny).TextColor(a.secondaryInk())
-		}
-		if goal.DeliverySummary != "" {
-			ui.Text(c, "交付摘要").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
-			ui.Text(c, goal.DeliverySummary).FontSize(fsTiny).TextColor(a.secondaryInk())
-		}
-		if len(goal.Deliverables) > 0 {
-			ui.Text(c, "已检查的交付文件").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
-			for _, deliverable := range goal.Deliverables {
-				hash := deliverable.SHA256
-				if len(hash) > 12 {
-					hash = hash[:12]
+				if goal.Model != nil {
+					ui.Text(c, "目标固定模型："+modelLabel(goal.Model.ProviderName, goal.Model.Model)).FontSize(fsTiny).TextColor(a.secondaryInk())
 				}
-				ui.Text(c, fmt.Sprintf("%s · %d B · SHA-256 %s…", deliverable.Path, deliverable.Size, hash)).FontSize(fsTiny).TextColor(a.secondaryInk())
-			}
-		}
-		if len(goal.Verifications) > 0 {
-			ui.Text(c, "自动验收命令结果").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
-			for _, result := range goal.Verifications {
-				label := "失败"
-				if result.Passed {
-					label = "通过（退出码 0）"
+				if goal.DeliverySummary != "" {
+					ui.Text(c, "交付摘要").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+					ui.Text(c, goal.DeliverySummary).FontSize(fsTiny).TextColor(a.secondaryInk())
 				}
-				ui.Text(c, fmt.Sprintf("%s：%s", result.Name, label)).FontSize(fsTiny).TextColor(a.secondaryInk())
-			}
-		}
-		if len(goal.Acceptance) > 0 {
-			ui.Text(c, "验收条件").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
-			for i, criterion := range goal.Acceptance {
-				ui.Text(c, fmt.Sprintf("%d. %s", i+1, criterion)).FontSize(fsTiny).TextColor(a.secondaryInk())
-			}
-		}
-		if goal.StopReason != "" {
-			ui.Text(c, "停止原因："+goal.StopReason).FontSize(fsTiny).TextColor(a.secondaryInk())
-		}
-		if goal.Status == backend.GoalStatusNeedsUser {
-			ui.Text(c, "在聊天输入框补充信息并发送，即可继续目标。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
-		}
-		if goal.Status == backend.GoalStatusCompleted {
-			ui.Text(c, "阶段证据仍由 Agent 报告；自动命令通过只代表退出码为 0，请核验测试覆盖和实际产物。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
-		}
-		if goal.Status == backend.GoalStatusPaused {
-			primary(c, "继续目标").OnClick(func() { a.continueGoal(goal) })
-		}
-		if goal.Status != backend.GoalStatusActive && goal.Status != backend.GoalStatusPending {
-			flat(c, "移除记录").OnClick(func() { a.deleteGoalRecord(goal) })
+				if len(goal.Deliverables) > 0 {
+					ui.Text(c, "已检查的交付文件").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+					for _, deliverable := range goal.Deliverables {
+						hash := deliverable.SHA256
+						if len(hash) > 12 {
+							hash = hash[:12]
+						}
+						ui.Text(c, fmt.Sprintf("%s · %d B · SHA-256 %s…", deliverable.Path, deliverable.Size, hash)).FontSize(fsTiny).TextColor(a.secondaryInk())
+					}
+				}
+				if len(goal.Verifications) > 0 {
+					ui.Text(c, "自动验收命令结果").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+					for _, result := range goal.Verifications {
+						label := "失败"
+						if result.Passed {
+							label = "通过（退出码 0）"
+						}
+						ui.Text(c, fmt.Sprintf("%s：%s", result.Name, label)).FontSize(fsTiny).TextColor(a.secondaryInk())
+					}
+				}
+				if len(goal.Acceptance) > 0 {
+					ui.Text(c, "验收条件").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
+					for i, criterion := range goal.Acceptance {
+						ui.Text(c, fmt.Sprintf("%d. %s", i+1, criterion)).FontSize(fsTiny).TextColor(a.secondaryInk())
+					}
+				}
+				if goal.StopReason != "" {
+					ui.Text(c, "停止原因："+goal.StopReason).FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				if goal.Status == backend.GoalStatusNeedsUser {
+					ui.Text(c, "在聊天输入框补充信息并发送，即可继续目标。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				if goal.Status == backend.GoalStatusCompleted {
+					ui.Text(c, "阶段证据仍由 Agent 报告；自动命令通过只代表退出码为 0，请核验测试覆盖和实际产物。 ").FontSize(fsTiny).TextColor(a.secondaryInk())
+				}
+				if goal.Status == backend.GoalStatusPaused {
+					primary(c, "继续目标").OnClick(func() { a.continueGoal(goal) })
+				}
+				if goal.Status != backend.GoalStatusActive && goal.Status != backend.GoalStatusPending {
+					flat(c, "删除目标记录").OnClick(func() { a.deleteGoalRecord(goal) })
+				}
+			})
+		})
+		if open != st.GoalDetailsOpen {
+			st.GoalDetailsOpen = open
 		}
 	})
 }

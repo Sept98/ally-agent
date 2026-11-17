@@ -415,6 +415,20 @@ func (a *desktop) headerActions(c *ui.Context) {
 	})
 
 	pageOK := a.page == "chat" || strings.HasPrefix(a.page, "plugin:")
+	if tab := a.current(); tab != nil {
+		goal := a.goals[tab.ID]
+		if goal.Status == backend.GoalStatusCompleted {
+			label, glyph := "查看目标结果", "check"
+			if tab.uiState().GoalPanelVisible {
+				label, glyph = "收起目标结果", "close"
+			}
+			iconButton(c, "goal-result", locales.Text(label), glyph, func() {
+				visible := !tab.uiState().GoalPanelVisible
+				tab.uiState().GoalPanelVisible = visible
+				tab.uiState().GoalDetailsOpen = visible
+			})
+		}
+	}
 	// The explorer toggle carries the theme colour even while it is off: a muted
 	// glyph made the header's folder read as decoration. Off is half accent, on is
 	// the full accent, so the state reads from the stroke alone — no fill behind it.
