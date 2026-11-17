@@ -235,11 +235,12 @@ type App struct {
 	// Shutdown 掉——commit 核对虽能自愈，整轮拨号却白跑。重启耗时可达分钟级，
 	// 与 a.mu 分开（绝不能拿 a.mu 当闸）。mcpManager 指针本身的读写由 a.mu
 	// 守护，统一走 activeMcpManager。
-	mcpRestartMu  sync.Mutex
-	plans         map[string][]PlanStep // sessionID → the plan's steps
-	planRevisions map[string]int64
-	goalStoreMu   sync.Mutex
-	goalStore     *GoalStore
+	mcpRestartMu               sync.Mutex
+	plans                      map[string][]PlanStep // sessionID → the plan's steps
+	planRevisions              map[string]int64
+	goalStoreMu                sync.Mutex
+	goalStore                  *GoalStore
+	goalCompletionReviewRunner func(context.Context, ConfigState, string, AgentDelegateRequest) (*AgentDelegateResult, error)
 	// sessionWorkspaceMaps freezes the workspace map bytes per session
 	// (sessionID → map text) so the request prefix stays byte-stable across
 	// runs and provider prompt cache survive; guarded by mu (declared in
@@ -1577,14 +1578,15 @@ func (f *PlanFinish) UnmarshalJSON(data []byte) error {
 }
 
 type AgentDelegateRequest struct {
-	Task         string `json:"task"`
-	Role         string `json:"role"`
-	Name         string `json:"name,omitempty"`
-	Description  string `json:"description,omitempty"`
-	CleanContext bool   `json:"cleanContext,omitempty"`
-	Model        string `json:"model,omitempty"`
-	MaxSteps     int    `json:"maxSteps,omitempty"`
-	tools        []openai.Tool
+	Task          string `json:"task"`
+	Role          string `json:"role"`
+	Name          string `json:"name,omitempty"`
+	Description   string `json:"description,omitempty"`
+	CleanContext  bool   `json:"cleanContext,omitempty"`
+	Model         string `json:"model,omitempty"`
+	MaxSteps      int    `json:"maxSteps,omitempty"`
+	tools         []openai.Tool
+	toolsProvided bool
 }
 
 type AgentDelegateResult struct {

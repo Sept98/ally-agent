@@ -38,16 +38,17 @@ func (s GoalStatus) Valid() bool {
 
 // GoalStage is a persisted checkpoint; completion requires the recorded Ally-run checks.
 type GoalStage struct {
-	Title               string              `json:"title"`
-	Objective           string              `json:"objective,omitempty"`
-	Status              string              `json:"status"`
-	Evidence            string              `json:"evidence,omitempty"`
-	Attempts            int                 `json:"attempts,omitempty"`
-	FailuresSinceReview int                 `json:"failures_since_review,omitempty"`
-	ReviewRequired      bool                `json:"review_required,omitempty"`
-	Revision            int                 `json:"revision,omitempty"`
-	ReviewHistory       []GoalStageRevision `json:"review_history,omitempty"`
-	Verifications       []GoalVerification  `json:"verifications,omitempty"`
+	Title                string                    `json:"title"`
+	Objective            string                    `json:"objective,omitempty"`
+	Status               string                    `json:"status"`
+	Evidence             string                    `json:"evidence,omitempty"`
+	Attempts             int                       `json:"attempts,omitempty"`
+	FailuresSinceReview  int                       `json:"failures_since_review,omitempty"`
+	ReviewRequired       bool                      `json:"review_required,omitempty"`
+	Revision             int                       `json:"revision,omitempty"`
+	ReviewHistory        []GoalStageRevision       `json:"review_history,omitempty"`
+	Verifications        []GoalVerification        `json:"verifications,omitempty"`
+	VerificationAttempts []GoalVerificationAttempt `json:"verification_attempts,omitempty"`
 }
 
 type GoalStageRevision struct {
@@ -81,28 +82,47 @@ type GoalVerification struct {
 	VerifiedAt time.Time `json:"verified_at"`
 }
 
+// GoalVerificationAttempt preserves attempt history while Verifications holds
+// only the latest attempt used to decide whether a checkpoint may pass.
+type GoalVerificationAttempt struct {
+	Number int                `json:"number"`
+	Checks []GoalVerification `json:"checks"`
+	Passed bool               `json:"passed"`
+	At     time.Time          `json:"at"`
+}
+
+type GoalCompletionReview struct {
+	Verdict    string    `json:"verdict"`
+	Reason     string    `json:"reason"`
+	Stage      int       `json:"stage,omitempty"`
+	Model      string    `json:"model,omitempty"`
+	ReviewedAt time.Time `json:"reviewed_at"`
+}
+
 // Goal contains user-authored goal text and lifecycle metadata. Credentials must not be stored here.
 type Goal struct {
-	ID              string             `json:"id"`
-	SessionID       string             `json:"session_id"`
-	Workspace       string             `json:"workspace"`
-	Title           string             `json:"title"`
-	Details         string             `json:"details,omitempty"`
-	Acceptance      []string           `json:"acceptance,omitempty"`
-	Stages          []GoalStage        `json:"stages,omitempty"`
-	Verifications   []GoalVerification `json:"verifications,omitempty"`
-	Deliverables    []GoalDeliverable  `json:"deliverables,omitempty"`
-	DeliverySummary string             `json:"delivery_summary,omitempty"`
-	Model           *ModelIdentity     `json:"model,omitempty"`
-	Progress        string             `json:"progress,omitempty"`
-	Status          GoalStatus         `json:"status"`
-	RunCount        int                `json:"run_count"`
-	MaxRuns         int                `json:"max_runs"`
-	Revision        uint64             `json:"revision"`
-	ActiveRunID     string             `json:"active_run_id,omitempty"`
-	StopReason      string             `json:"stop_reason,omitempty"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
+	ID                        string                    `json:"id"`
+	SessionID                 string                    `json:"session_id"`
+	Workspace                 string                    `json:"workspace"`
+	Title                     string                    `json:"title"`
+	Details                   string                    `json:"details,omitempty"`
+	Acceptance                []string                  `json:"acceptance,omitempty"`
+	Stages                    []GoalStage               `json:"stages,omitempty"`
+	Verifications             []GoalVerification        `json:"verifications,omitempty"`
+	FinalVerificationAttempts []GoalVerificationAttempt `json:"final_verification_attempts,omitempty"`
+	CompletionReview          *GoalCompletionReview     `json:"completion_review,omitempty"`
+	Deliverables              []GoalDeliverable         `json:"deliverables,omitempty"`
+	DeliverySummary           string                    `json:"delivery_summary,omitempty"`
+	Model                     *ModelIdentity            `json:"model,omitempty"`
+	Progress                  string                    `json:"progress,omitempty"`
+	Status                    GoalStatus                `json:"status"`
+	RunCount                  int                       `json:"run_count"`
+	MaxRuns                   int                       `json:"max_runs"`
+	Revision                  uint64                    `json:"revision"`
+	ActiveRunID               string                    `json:"active_run_id,omitempty"`
+	StopReason                string                    `json:"stop_reason,omitempty"`
+	CreatedAt                 time.Time                 `json:"created_at"`
+	UpdatedAt                 time.Time                 `json:"updated_at"`
 }
 
 const (
@@ -242,8 +262,18 @@ func validateGoal(g Goal) error {
 		if stage.ReviewRequired != (stage.FailuresSinceReview >= goalStageReviewFailureThreshold) {
 			return errors.New("goal stage review flag does not match its failure count")
 		}
-		if len(stage.ReviewHistory) > maxGoalStageRevisionHistory || len(stage.Verifications) > maxGoalStageVerificationResults {
+		if len(stage.ReviewHistory) > maxGoalStageRevisionHistory || len(stage.Verifications) > maxGoalVerificationItems || len(stage.VerificationAttempts) > maxGoalStageVerificationResults {
 			return errors.New("goal stage review history or verification results exceed limits")
+		}
+		for _, attempt := range stage.VerificationAttempts {
+			if attempt.Number < 1 || attempt.Number > maxGoalStageAttempts || len(attempt.Checks) == 0 || len(attempt.Checks) > maxGoalVerificationItems {
+				return errors.New("goal stage verification attempt is invalid")
+			}
+			for _, check := range attempt.Checks {
+				if strings.TrimSpace(check.Name) == "" || len([]rune(check.Name)) > maxGoalVerificationNameRunes {
+					return errors.New("goal stage verification attempt contains an invalid result")
+				}
+			}
 		}
 		for _, review := range stage.ReviewHistory {
 			if review.Decision != "revise" && review.Decision != "continue" && review.Decision != "needs_user" || strings.TrimSpace(review.Rationale) == "" || len([]rune(review.Rationale)) > maxGoalStageEvidenceRunes || len([]rune(review.OldTitle)) > maxGoalStageTitleRunes || len([]rune(review.NewTitle)) > maxGoalStageTitleRunes || len([]rune(review.OldObjective)) > maxGoalStageEvidenceRunes || len([]rune(review.NewObjective)) > maxGoalStageEvidenceRunes {
@@ -275,8 +305,23 @@ func validateGoal(g Goal) error {
 	if activeStages > 1 {
 		return errors.New("only one goal stage may be active")
 	}
-	if len(g.Verifications) > maxGoalVerificationItems {
+	if len(g.Verifications) > maxGoalVerificationItems || len(g.FinalVerificationAttempts) > maxGoalStageVerificationResults {
 		return errors.New("too many goal verification results")
+	}
+	for _, attempt := range g.FinalVerificationAttempts {
+		if attempt.Number < 1 || attempt.Number > maxGoalStageAttempts || len(attempt.Checks) == 0 || len(attempt.Checks) > maxGoalVerificationItems {
+			return errors.New("goal final verification attempt is invalid")
+		}
+		for _, check := range attempt.Checks {
+			if strings.TrimSpace(check.Name) == "" || len([]rune(check.Name)) > maxGoalVerificationNameRunes {
+				return errors.New("goal final verification attempt contains an invalid result")
+			}
+		}
+	}
+	if g.CompletionReview != nil {
+		if g.CompletionReview.Verdict != "approved" && g.CompletionReview.Verdict != "needs_work" && g.CompletionReview.Verdict != "unavailable" || strings.TrimSpace(g.CompletionReview.Reason) == "" || len([]rune(g.CompletionReview.Reason)) > maxGoalStageEvidenceRunes {
+			return errors.New("goal completion review is invalid")
+		}
 	}
 	for _, verification := range g.Verifications {
 		if strings.TrimSpace(verification.Name) == "" || len([]rune(verification.Name)) > maxGoalVerificationNameRunes {
@@ -303,14 +348,28 @@ func validateGoal(g Goal) error {
 	return nil
 }
 
+func cloneGoalVerificationAttempts(in []GoalVerificationAttempt) []GoalVerificationAttempt {
+	out := append([]GoalVerificationAttempt(nil), in...)
+	for i := range out {
+		out[i].Checks = append([]GoalVerification(nil), out[i].Checks...)
+	}
+	return out
+}
+
 func cloneGoal(g Goal) Goal {
 	g.Acceptance = append([]string(nil), g.Acceptance...)
 	g.Stages = append([]GoalStage(nil), g.Stages...)
 	for i := range g.Stages {
 		g.Stages[i].ReviewHistory = append([]GoalStageRevision(nil), g.Stages[i].ReviewHistory...)
 		g.Stages[i].Verifications = append([]GoalVerification(nil), g.Stages[i].Verifications...)
+		g.Stages[i].VerificationAttempts = cloneGoalVerificationAttempts(g.Stages[i].VerificationAttempts)
 	}
 	g.Verifications = append([]GoalVerification(nil), g.Verifications...)
+	g.FinalVerificationAttempts = cloneGoalVerificationAttempts(g.FinalVerificationAttempts)
+	if g.CompletionReview != nil {
+		review := *g.CompletionReview
+		g.CompletionReview = &review
+	}
 	g.Deliverables = append([]GoalDeliverable(nil), g.Deliverables...)
 	if g.Model != nil {
 		model := *g.Model

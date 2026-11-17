@@ -10,6 +10,12 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+func stubGoalCompletionReviewer(app *App, summary string) {
+	app.goalCompletionReviewRunner = func(_ context.Context, _ ConfigState, _ string, _ AgentDelegateRequest) (*AgentDelegateResult, error) {
+		return &AgentDelegateResult{Status: "completed", Summary: summary}, nil
+	}
+}
+
 func TestGoalUpdatesCannotShareBatchWithOtherTools(t *testing.T) {
 	call := func(name, args string) openai.ToolCall {
 		return openai.ToolCall{Function: openai.FunctionCall{Name: name, Arguments: args}}
@@ -132,6 +138,7 @@ func TestGoalProgressNeedsUserAndCompletionTransitions(t *testing.T) {
 
 func TestGoalCompletionRequiresOrderedStagesAndEvidence(t *testing.T) {
 	app := newAppState(t.TempDir())
+	stubGoalCompletionReviewer(app, `{"verdict":"approved","reason":"Acceptance evidence is supported.","stage":0}`)
 	store, err := app.goalStoreInstance()
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +163,62 @@ func TestGoalCompletionRequiresOrderedStagesAndEvidence(t *testing.T) {
 	updated, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "completed", Progress: "done", Acceptance: criteria, Stages: stages, Verifications: []GoalVerificationSpec{{Name: "smoke", Command: "echo verified"}}, DeliverySummary: "Implemented and checked.", StageReview: GoalStageReviewRequest{Stage: 0, Decision: "", Rationale: "", RevisedTitle: "", RevisedObjective: ""}})
 	if err != nil || updated.Status != GoalStatusCompleted || len(updated.Verifications) != 1 || !updated.Verifications[0].Passed || len(updated.Deliverables) != 0 || updated.DeliverySummary == "" || !allGoalVerificationsPassed(updated.Stages[0].Verifications) || !allGoalVerificationsPassed(updated.Stages[1].Verifications) {
 		t.Fatalf("completion with executed verification failed: %+v, %v", updated, err)
+	}
+}
+
+func TestGoalStageVerificationRetryUsesLatestAttemptAndKeepsHistory(t *testing.T) {
+	app := newAppState(t.TempDir())
+	store, err := app.goalStoreInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{ID: "retry-stage", SessionID: "s-retry-stage", Workspace: t.TempDir(), Title: "retry stage", Acceptance: []string{"stage passes"}, Status: GoalStatusActive, MaxRuns: 5}
+	if err := store.Create(goal); err != nil {
+		t.Fatal(err)
+	}
+	stages := []GoalStageUpdate{{Title: "Check", Objective: "Run the stage check", Status: "active"}}
+	if _, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "progress", Progress: "started", Acceptance: goal.Acceptance, Stages: stages}); err != nil {
+		t.Fatal(err)
+	}
+	stages[0].Status = "completed"
+	stages[0].Evidence = "first attempt failed; corrected the check"
+	stages[0].Verifications = []GoalVerificationSpec{{Name: "first attempt", Command: "exit 1"}}
+	if _, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "progress", Progress: "first check failed", Acceptance: goal.Acceptance, Stages: stages}); err == nil {
+		t.Fatal("expected first verification attempt to fail")
+	}
+	stages[0].Verifications = []GoalVerificationSpec{{Name: "corrected attempt", Command: "echo stage-passed"}}
+	updated, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "progress", Progress: "corrected check passed", Acceptance: goal.Acceptance, Stages: stages})
+	if err != nil {
+		t.Fatalf("successful retry was blocked by prior failure: %v", err)
+	}
+	stage := updated.Stages[0]
+	if stage.Status != "completed" || stage.Attempts != 2 || len(stage.VerificationAttempts) != 2 || stage.VerificationAttempts[0].Passed || !stage.VerificationAttempts[1].Passed || !allGoalVerificationsPassed(stage.Verifications) {
+		t.Fatalf("verification retry history/latest result incorrect: %+v", stage)
+	}
+}
+
+func TestGoalCompletionReviewReopensRequestedStage(t *testing.T) {
+	app := newAppState(t.TempDir())
+	stubGoalCompletionReviewer(app, `{"verdict":"needs_work","reason":"The acceptance evidence does not show the required output.","stage":1}`)
+	store, err := app.goalStoreInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{ID: "review-reopen", SessionID: "s-review-reopen", Workspace: t.TempDir(), Title: "review me", Acceptance: []string{"expected output exists"}, Stages: []GoalStage{{Title: "Produce output", Objective: "Create the expected output", Status: "completed", Evidence: "done", Verifications: []GoalVerification{{Name: "stage check", Passed: true, ExitCode: 0}}}}, Status: GoalStatusActive, MaxRuns: 5}
+	if err := store.Create(goal); err != nil {
+		t.Fatal(err)
+	}
+	_, err = app.updateGoalForSessionWithConfig(context.Background(), goal.SessionID, ConfigState{Workspace: goal.Workspace}, GoalUpdateRequest{Status: "completed", Progress: "ready", Acceptance: goal.Acceptance, Stages: []GoalStageUpdate{{Title: "Produce output", Objective: "Create the expected output", Status: "completed", Evidence: "done"}}, Verifications: []GoalVerificationSpec{{Name: "integration", Command: "echo verified"}}, DeliverySummary: "done"})
+	if err == nil {
+		t.Fatal("weak acceptance evidence was approved")
+	}
+	updated, _ := store.Get(goal.ID)
+	if updated.Status != GoalStatusActive || updated.Stages[0].Status != "active" || updated.CompletionReview == nil || updated.CompletionReview.Verdict != "needs_work" || updated.FinalVerificationAttempts[len(updated.FinalVerificationAttempts)-1].Passed != true {
+		t.Fatalf("review rejection did not preserve evidence and reopen stage: %+v", updated)
+	}
+	ctx := context.WithValue(context.Background(), goalRunContextKey{}, goal.ID)
+	if err := app.checkGoalToolExecution(ctx, goal.SessionID, "create"); err != nil {
+		t.Fatalf("side effects remain blocked after review reopened a stage: %v", err)
 	}
 }
 
@@ -210,6 +273,7 @@ func TestGoalRepeatedStageFailuresRequireReviewAndAllowRevision(t *testing.T) {
 
 func TestGoalCompletionVerifiesAndRecordsDeliverablePaths(t *testing.T) {
 	app := newAppState(t.TempDir())
+	stubGoalCompletionReviewer(app, `{"verdict":"approved","reason":"Deliverable and checks are present.","stage":0}`)
 	store, err := app.goalStoreInstance()
 	if err != nil {
 		t.Fatal(err)
@@ -225,8 +289,8 @@ func TestGoalCompletionVerifiesAndRecordsDeliverablePaths(t *testing.T) {
 		t.Fatal("missing deliverable was accepted")
 	}
 	failed, _ := store.Get(goal.ID)
-	if failed.Status != GoalStatusActive || failed.Stages[0].FailuresSinceReview != 1 {
-		t.Fatalf("missing deliverable failure was not tracked: %+v", failed)
+	if failed.Status != GoalStatusActive || failed.Stages[0].FailuresSinceReview != 0 || len(failed.FinalVerificationAttempts) != 1 || !failed.FinalVerificationAttempts[0].Passed {
+		t.Fatalf("deliverable failure was incorrectly attributed to a stage: %+v", failed)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "artifact.txt"), []byte("final artifact\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -249,7 +313,7 @@ func TestGoalCompletionRequiresSuccessfulVerificationCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	updated, err := app.updateGoalForSessionWithConfig(context.Background(), goal.SessionID, ConfigState{Workspace: goal.Workspace}, GoalUpdateRequest{Status: "completed", Progress: "done", Acceptance: goal.Acceptance, Stages: []GoalStageUpdate{{Title: "Checks", Objective: "Verify all checks", Status: "completed", Evidence: "agent ran checks"}}, Verifications: []GoalVerificationSpec{{Name: "must fail", Command: "exit 7"}}, DeliverySummary: "checked"})
-	if err == nil || updated.Status != GoalStatusActive || len(updated.Stages) != 1 || updated.Stages[0].ReviewRequired || updated.Stages[0].FailuresSinceReview != 1 || updated.Stages[0].Verifications[len(updated.Stages[0].Verifications)-1].Passed {
+	if err == nil || updated.Status != GoalStatusActive || len(updated.Stages) != 1 || updated.Stages[0].Status != "completed" || updated.Stages[0].ReviewRequired || updated.Stages[0].FailuresSinceReview != 0 || len(updated.FinalVerificationAttempts) != 1 || updated.FinalVerificationAttempts[0].Passed {
 		t.Fatalf("failed verification incorrectly completed goal: %+v, %v", updated, err)
 	}
 }

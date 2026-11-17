@@ -465,7 +465,7 @@ func chatToolsUncached() []openai.Tool {
 				},
 			},
 		}),
-		functionTool("goal_update", "Persist a complete ordered stage plan and progress. Each completed stage requires named verification commands run by Ally in the workspace sandbox (120-second timeout, no background service). Failures are tracked per stage; after 3 failed attempts, side effects are blocked until stage_review explicitly chooses revise, continue, or needs_user. Final completion also requires passing integration commands, a delivery_summary and workspace-relative deliverable_paths for any file outputs; Ally checks each listed file exists and stores its size and SHA-256.", map[string]any{
+		functionTool("goal_update", "Persist a complete ordered stage plan and progress. Each completed stage requires named verification commands run by Ally in the workspace sandbox (120-second timeout, no background service). Failures are tracked per stage; after 3 failed attempts, side effects are blocked until stage_review explicitly chooses revise, continue, or needs_user. Final completion also requires passing integration commands, a delivery_summary and workspace-relative deliverable_paths for any file outputs; Ally checks each listed file exists and stores its size and SHA-256, then asks a same-model acceptance sub-agent with an isolated context and a distinct judging prompt to review the evidence. A completion claim or zero exit code alone is not semantic acceptance; rejection reopens the cited stage, while reviewer failure or invalid output leaves the goal incomplete.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"status":     map[string]any{"type": "string", "enum": []string{"progress", "needs_user", "completed"}},

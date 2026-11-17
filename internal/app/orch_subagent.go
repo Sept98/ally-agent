@@ -184,7 +184,7 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 
 	// Run sub-agent loop synchronously (the caller is already in a goroutine for parallel)
 	tools := req.tools
-	if len(tools) == 0 {
+	if len(tools) == 0 && !req.toolsProvided {
 		tools = a.subagentTools(cfg)
 	}
 	ctx = withBuiltinToolAvailability(ctx, tools)

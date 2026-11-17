@@ -188,6 +188,13 @@ func (a *desktop) goalPanel(c *ui.Context, t *conversation) {
 		if goal.Progress != "" {
 			ui.Text(c, goal.Progress).FontSize(fsSmall).TextColor(a.secondaryInk())
 		}
+		if goal.CompletionReview != nil {
+			label := "未通过"
+			if goal.CompletionReview.Verdict == "approved" {
+				label = "通过"
+			}
+			ui.Text(c, "独立验收复核（同模型·独立上下文）："+label+" · "+goal.CompletionReview.Reason).FontSize(fsTiny).TextColor(a.secondaryInk())
+		}
 		if len(goal.Stages) > 0 {
 			ui.Text(c, "阶段检查点").FontSize(fsTiny).Bold().TextColor(a.secondaryInk())
 			for i, stage := range goal.Stages {

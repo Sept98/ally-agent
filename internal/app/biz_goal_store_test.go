@@ -97,10 +97,13 @@ func TestGoalStorePersistsReviewVerificationAndDeliverableMetadata(t *testing.T)
 	verifiedAt := time.Now().UTC().Truncate(time.Second)
 	goal := Goal{ID: "metadata", SessionID: "session", Workspace: t.TempDir(), Title: "delivery", Acceptance: []string{"checks pass"}, Status: GoalStatusPaused, MaxRuns: 5,
 		Stages: []GoalStage{{Title: "Revised check", Objective: "Check observable output", Status: "active", Attempts: 3, Revision: 1,
-			ReviewHistory: []GoalStageRevision{{Decision: "revise", OldTitle: "Old check", OldObjective: "Old objective", NewTitle: "Revised check", NewObjective: "Check observable output", Rationale: "Clarified expected output", At: verifiedAt}},
-			Verifications: []GoalVerification{{Name: "stage tests", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}}}},
-		Verifications: []GoalVerification{{Name: "integration", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}},
-		Deliverables:  []GoalDeliverable{{Path: "artifact.txt", Size: 12, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt}}, DeliverySummary: "Artifact verified."}
+			ReviewHistory:        []GoalStageRevision{{Decision: "revise", OldTitle: "Old check", OldObjective: "Old objective", NewTitle: "Revised check", NewObjective: "Check observable output", Rationale: "Clarified expected output", At: verifiedAt}},
+			Verifications:        []GoalVerification{{Name: "stage tests", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}},
+			VerificationAttempts: []GoalVerificationAttempt{{Number: 1, Checks: []GoalVerification{{Name: "first attempt", ExitCode: 1, Passed: false, VerifiedAt: verifiedAt}}, At: verifiedAt}}}},
+		Verifications:             []GoalVerification{{Name: "integration", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}},
+		FinalVerificationAttempts: []GoalVerificationAttempt{{Number: 1, Checks: []GoalVerification{{Name: "integration", ExitCode: 0, Passed: true, VerifiedAt: verifiedAt}}, Passed: true, At: verifiedAt}},
+		CompletionReview:          &GoalCompletionReview{Verdict: "needs_work", Reason: "Need clearer evidence.", Stage: 1, Model: "test-model", ReviewedAt: verifiedAt},
+		Deliverables:              []GoalDeliverable{{Path: "artifact.txt", Size: 12, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt}}, DeliverySummary: "Artifact verified."}
 	if err := store.Create(goal); err != nil {
 		t.Fatal(err)
 	}
@@ -110,12 +113,15 @@ func TestGoalStorePersistsReviewVerificationAndDeliverableMetadata(t *testing.T)
 	}
 	got.Stages[0].ReviewHistory[0].Rationale = "mutated"
 	got.Stages[0].Verifications[0].Name = "mutated"
+	got.Stages[0].VerificationAttempts[0].Checks[0].Name = "mutated"
 	got.Verifications[0].Name = "mutated"
+	got.FinalVerificationAttempts[0].Checks[0].Name = "mutated"
+	got.CompletionReview.Reason = "mutated"
 	got.Deliverables[0].Path = "mutated"
 	listed := store.List()
 	listed[0].Stages[0].ReviewHistory[0].Decision = "mutated"
 	persisted, ok := store.Get(goal.ID)
-	if !ok || persisted.Stages[0].ReviewHistory[0].Rationale != "Clarified expected output" || persisted.Stages[0].Verifications[0].Name != "stage tests" || persisted.Verifications[0].Name != "integration" || persisted.Deliverables[0].Path != "artifact.txt" {
+	if !ok || persisted.Stages[0].ReviewHistory[0].Rationale != "Clarified expected output" || persisted.Stages[0].Verifications[0].Name != "stage tests" || persisted.Stages[0].VerificationAttempts[0].Checks[0].Name != "first attempt" || persisted.Verifications[0].Name != "integration" || persisted.FinalVerificationAttempts[0].Checks[0].Name != "integration" || persisted.CompletionReview.Reason != "Need clearer evidence." || persisted.Deliverables[0].Path != "artifact.txt" {
 		t.Fatalf("returned metadata aliases stored state: %+v", persisted)
 	}
 	reloaded, err := NewGoalStore(path)
@@ -123,7 +129,7 @@ func TestGoalStorePersistsReviewVerificationAndDeliverableMetadata(t *testing.T)
 		t.Fatal(err)
 	}
 	disk, ok := reloaded.Get(goal.ID)
-	if !ok || disk.Stages[0].ReviewHistory[0].NewObjective != "Check observable output" || !disk.Stages[0].Verifications[0].Passed || !disk.Verifications[0].Passed || disk.Deliverables[0].Size != 12 || disk.Deliverables[0].SHA256 != strings.Repeat("a", 64) || disk.DeliverySummary != "Artifact verified." {
+	if !ok || disk.Stages[0].ReviewHistory[0].NewObjective != "Check observable output" || !disk.Stages[0].Verifications[0].Passed || disk.Stages[0].VerificationAttempts[0].Checks[0].Passed || !disk.Verifications[0].Passed || !disk.FinalVerificationAttempts[0].Passed || disk.CompletionReview.Verdict != "needs_work" || disk.Deliverables[0].Size != 12 || disk.Deliverables[0].SHA256 != strings.Repeat("a", 64) || disk.DeliverySummary != "Artifact verified." {
 		t.Fatalf("metadata did not survive JSON reload: %+v, %v", disk, ok)
 	}
 }

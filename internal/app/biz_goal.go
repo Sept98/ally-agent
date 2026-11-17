@@ -218,7 +218,7 @@ func goalStartMessage(g Goal) string {
 	} else {
 		b.WriteString("\n\n在产生任何副作用前，先整理可观察、可验证的验收条件和有序阶段，并用 goal_update 的 acceptance、stages 字段持久化；阶段包含 title、status（pending/active/completed）、evidence。每次更新都携带完整 stages；每次只推进一个阶段，完成阶段时记录具体证据。若目标有关键歧义，先用 ask 取得用户确认，不要擅自假设。")
 	}
-	b.WriteString("\ngoal_update 每次携带完整 acceptance 与 stages；stage 必须含 title、objective、status、evidence、verifications。完成某阶段前提供该阶段 named verification commands；Ally 实际运行后仅在所有命令退出码为0时才把阶段检查点记为完成。失败计数按阶段持久化，连续失败3次会要求先提交 stage_review，选择 revise（需给新 title/objective）、continue（说明复核理由）或 needs_user；复核前后端阻止所有副作用工具。每阶段 attempt、检查记录和方案修订历史会持久保存。最终 completed 必须再次提供集成验收命令、简短 delivery_summary；若有文件产物，列出 workspace-relative deliverable_paths，Ally 会确认它们存在、是文件并记录 SHA-256。命令在目标工作区沙箱内运行，每条最多120秒；文件路径不允许逃出工作区。只有阶段检查、最终命令及交付物路径检查全部成功后才报告完成。阶段证据与验收语义仍需用户判断。无法继续时报告 needs_user。普通回答不代表完成。涉及代码时将互不冲突的只读调查、测试设计或 diff review 委派给子 agent；主 agent 核实报告并亲自运行验收命令，不把子 agent 的完成声明当证据。")
+	b.WriteString("\ngoal_update 每次携带完整 acceptance 与 stages；stage 必须含 title、objective、status、evidence、verifications。完成某阶段前提供该阶段 named verification commands；Ally 实际运行后仅在所有命令退出码为0时才把阶段检查点记为完成。失败计数按阶段持久化，连续失败3次会要求先提交 stage_review，选择 revise（需给新 title/objective）、continue（说明复核理由）或 needs_user；复核前后端阻止所有副作用工具。每阶段 attempt、检查记录和方案修订历史会持久保存。最终 completed 必须再次提供集成验收命令、简短 delivery_summary；若有文件产物，列出 workspace-relative deliverable_paths，Ally 会确认它们存在、是文件并记录 SHA-256。命令在目标工作区沙箱内运行，每条最多120秒；文件路径不允许逃出工作区。只有阶段检查、最终命令及交付物路径检查全部成功后，Ally 才会调用使用同一模型、但拥有独立上下文和专用判定提示词的验收子 agent 审核证据；模型自述完成、命令退出码为0都不能单独证明语义达标。复核不通过会重新打开其指出的阶段，你必须补齐证据或修复后再提交，不能继续宣称完成；复核调用失败或结果无效时目标保持未完成。无法继续时报告 needs_user。普通回答不代表完成。涉及代码时将互不冲突的只读调查、测试设计或 diff review 委派给子 agent；主 agent 核实报告并亲自运行验收命令，不把子 agent 的完成声明当证据。")
 	return b.String()
 }
 
@@ -378,6 +378,7 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 				stage.Revision = previous.Revision
 				stage.ReviewHistory = append([]GoalStageRevision(nil), previous.ReviewHistory...)
 				stage.Verifications = append([]GoalVerification(nil), previous.Verifications...)
+				stage.VerificationAttempts = cloneGoalVerificationAttempts(previous.VerificationAttempts)
 			}
 			if stage.Status != "pending" && stage.Status != "active" && stage.Status != "completed" {
 				return Goal{}, fmt.Errorf("stage %d status must be pending, active, or completed", i+1)
@@ -433,7 +434,11 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 			return Goal{}, runErr
 		}
 		nextStages[i].Attempts++
-		nextStages[i].Verifications = append(nextStages[i].Verifications, results...)
+		nextStages[i].Verifications = append([]GoalVerification(nil), results...)
+		if len(nextStages[i].VerificationAttempts) >= maxGoalStageVerificationResults {
+			return Goal{}, fmt.Errorf("stage %d verification history limit reached", i+1)
+		}
+		nextStages[i].VerificationAttempts = append(nextStages[i].VerificationAttempts, newGoalVerificationAttempt(nextStages[i].Attempts, results, failed == nil))
 		if failed != nil {
 			nextStages[i].Status = "active"
 			nextStages[i].Evidence = ""
@@ -468,28 +473,93 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 		if runErr != nil {
 			return Goal{}, runErr
 		}
-		if failed != nil {
-			nextStages = recordGoalStageFailure(nextStages, len(nextStages)-1, finalResults)
-			reason := stageVerificationFailureMessage(len(nextStages)-1, nextStages[len(nextStages)-1])
-			updated, persistErr := a.persistGoalProgress(store, active.ID, acceptance, nextStages, reason)
-			if persistErr != nil {
-				return Goal{}, fmt.Errorf("final verification failed and checkpoint could not be persisted: %w", persistErr)
-			}
-			a.emitGoalUpdate(updated)
-			return updated, fmt.Errorf("final verification %q failed (exit %d); %s", failed.Name, failed.ExitCode, reason)
+		if len(active.FinalVerificationAttempts) >= maxGoalStageVerificationResults {
+			return Goal{}, errors.New("final verification history limit reached")
 		}
-		deliverables, deliveryErr := a.verifyGoalDeliverables(ctx, active.Workspace, req.DeliverablePaths)
-		if deliveryErr != nil {
-			nextStages = recordGoalStageFailure(nextStages, len(nextStages)-1, nil)
-			reason := "最终交付物检查失败：" + deliveryErr.Error()
-			updated, persistErr := a.persistGoalProgress(store, active.ID, acceptance, nextStages, reason)
-			if persistErr != nil {
-				return Goal{}, fmt.Errorf("deliverable check failed and checkpoint could not be persisted: %w", persistErr)
+		finalAttempt := newGoalVerificationAttempt(len(active.FinalVerificationAttempts)+1, finalResults, failed == nil)
+		if failed != nil {
+			reason := fmt.Sprintf("final verification %q failed (exit %d); review the integration check and retry", failed.Name, failed.ExitCode)
+			if err := store.Update(active.ID, func(g *Goal) error {
+				if g.Status != GoalStatusActive {
+					return errors.New("goal is no longer active")
+				}
+				g.FinalVerificationAttempts = append(g.FinalVerificationAttempts, finalAttempt)
+				g.Verifications = append([]GoalVerification(nil), finalResults...)
+				g.Progress = reason
+				g.DeliverySummary = ""
+				g.Deliverables = nil
+				g.CompletionReview = nil
+				return nil
+			}); err != nil {
+				return Goal{}, fmt.Errorf("final verification failed and checkpoint could not be persisted: %w", err)
 			}
+			updated, _ := store.Get(active.ID)
 			a.emitGoalUpdate(updated)
 			return updated, errors.New(reason)
 		}
-		// Persist final state only after all phase checks, integration checks and deliverable checks pass.
+		deliverables, deliveryErr := a.verifyGoalDeliverables(ctx, active.Workspace, req.DeliverablePaths)
+		if deliveryErr != nil {
+			reason := "最终交付物检查失败：" + deliveryErr.Error()
+			if err := store.Update(active.ID, func(g *Goal) error {
+				if g.Status != GoalStatusActive {
+					return errors.New("goal is no longer active")
+				}
+				g.FinalVerificationAttempts = append(g.FinalVerificationAttempts, finalAttempt)
+				g.Verifications = append([]GoalVerification(nil), finalResults...)
+				g.Progress = reason
+				g.DeliverySummary = ""
+				g.Deliverables = nil
+				g.CompletionReview = nil
+				return nil
+			}); err != nil {
+				return Goal{}, fmt.Errorf("deliverable check failed and checkpoint could not be persisted: %w", err)
+			}
+			updated, _ := store.Get(active.ID)
+			a.emitGoalUpdate(updated)
+			return updated, errors.New(reason)
+		}
+		// Persist final state only after phase/integration checks, deliverables,
+		// and an isolated completion review all pass.
+		review, reviewErr := a.reviewGoalCompletion(ctx, verifyCfg, active.ID, *active, nextStages, req, finalResults, deliverables)
+		if reviewErr != nil {
+			return Goal{}, reviewErr
+		}
+		if review.Verdict != "approved" {
+			stageIndex := review.Stage - 1
+			if stageIndex < 0 || stageIndex >= len(nextStages) {
+				stageIndex = len(nextStages) - 1
+			}
+			for i := stageIndex; i < len(nextStages); i++ {
+				if i == stageIndex {
+					nextStages[i].Status = "active"
+				} else {
+					nextStages[i].Status = "pending"
+				}
+				nextStages[i].Evidence = ""
+			}
+			reason := review.Reason
+			if reason == "" {
+				reason = "独立验收复核认为仍需补充证据。"
+			}
+			if err := store.Update(active.ID, func(g *Goal) error {
+				if g.Status != GoalStatusActive {
+					return errors.New("goal is no longer active")
+				}
+				g.Stages = cloneGoal(Goal{Stages: nextStages}).Stages
+				g.Verifications = append([]GoalVerification(nil), finalResults...)
+				g.FinalVerificationAttempts = append(g.FinalVerificationAttempts, finalAttempt)
+				g.Deliverables = append([]GoalDeliverable(nil), deliverables...)
+				g.DeliverySummary = ""
+				g.Progress = reason
+				g.CompletionReview = &review
+				return nil
+			}); err != nil {
+				return Goal{}, err
+			}
+			updated, _ := store.Get(active.ID)
+			a.emitGoalUpdate(updated)
+			return updated, fmt.Errorf("独立验收复核未通过，已重新打开阶段 %d：%s", stageIndex+1, reason)
+		}
 		if err := store.Update(active.ID, func(g *Goal) error {
 			if g.Status != GoalStatusActive {
 				return errors.New("goal is no longer active")
@@ -497,6 +567,8 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 			g.Acceptance = append([]string(nil), chooseAcceptance(acceptance, g.Acceptance)...)
 			g.Stages = cloneGoal(Goal{Stages: nextStages}).Stages
 			g.Verifications = append([]GoalVerification(nil), finalResults...)
+			g.FinalVerificationAttempts = append(g.FinalVerificationAttempts, finalAttempt)
+			g.CompletionReview = &review
 			g.Deliverables = append([]GoalDeliverable(nil), deliverables...)
 			g.DeliverySummary = strings.TrimSpace(req.DeliverySummary)
 			g.Progress = progress
@@ -576,6 +648,10 @@ func hasNewStageChecks(previous []GoalStage, next []GoalStageUpdate) bool {
 	return false
 }
 
+func newGoalVerificationAttempt(number int, results []GoalVerification, passed bool) GoalVerificationAttempt {
+	return GoalVerificationAttempt{Number: number, Checks: append([]GoalVerification(nil), results...), Passed: passed, At: time.Now().UTC()}
+}
+
 func allGoalVerificationsPassed(results []GoalVerification) bool {
 	if len(results) == 0 {
 		return false
@@ -586,6 +662,84 @@ func allGoalVerificationsPassed(results []GoalVerification) bool {
 		}
 	}
 	return true
+}
+
+type goalCompletionReviewInput struct {
+	Objective       string                        `json:"objective"`
+	Acceptance      []string                      `json:"acceptance"`
+	Progress        string                        `json:"progress"`
+	Stages          []goalCompletionStageEvidence `json:"stages"`
+	FinalChecks     []goalCompletionCheckEvidence `json:"final_checks"`
+	Deliverables    []GoalDeliverable             `json:"deliverables"`
+	DeliverySummary string                        `json:"delivery_summary"`
+}
+
+type goalCompletionStageEvidence struct {
+	Title     string             `json:"title"`
+	Objective string             `json:"objective"`
+	Evidence  string             `json:"evidence"`
+	Checks    []GoalVerification `json:"checks"`
+}
+
+type goalCompletionCheckEvidence struct {
+	Name     string `json:"name"`
+	Command  string `json:"command"`
+	ExitCode int    `json:"exit_code"`
+	Passed   bool   `json:"passed"`
+}
+
+func (a *App) reviewGoalCompletion(ctx context.Context, cfg ConfigState, sessionID string, goal Goal, stages []GoalStage, req GoalUpdateRequest, finalResults []GoalVerification, deliverables []GoalDeliverable) (GoalCompletionReview, error) {
+	input := goalCompletionReviewInput{
+		Objective: goal.Details, Acceptance: append([]string(nil), goal.Acceptance...), Progress: req.Progress,
+		Deliverables: append([]GoalDeliverable(nil), deliverables...), DeliverySummary: req.DeliverySummary,
+	}
+	for _, stage := range stages {
+		input.Stages = append(input.Stages, goalCompletionStageEvidence{
+			Title: stage.Title, Objective: stage.Objective, Evidence: stage.Evidence,
+			Checks: append([]GoalVerification(nil), stage.Verifications...),
+		})
+	}
+	for i, spec := range req.Verifications {
+		if i >= len(finalResults) {
+			break
+		}
+		input.FinalChecks = append(input.FinalChecks, goalCompletionCheckEvidence{
+			Name: spec.Name, Command: spec.Command, ExitCode: finalResults[i].ExitCode, Passed: finalResults[i].Passed,
+		})
+	}
+	data, err := json.Marshal(input)
+	if err != nil {
+		return GoalCompletionReview{}, err
+	}
+	task := "You are a separate acceptance judge using a fresh context and the same configured model as the executing agent. Judge only the supplied evidence. Do not trust the executor's completion claim by itself. A zero exit code is not sufficient unless the command meaningfully checks the stated acceptance criteria; commands such as `true` or `echo` are not substantive verification. Every acceptance criterion needs specific supporting evidence, completed ordered stages, passing checks, and coherent deliverables. If evidence is missing, weak, or ambiguous, choose needs_work and identify the one-based stage that should be reopened. Do not propose broad new scope. Return exactly one JSON object, no markdown: {\"verdict\":\"approved\"|\"needs_work\",\"reason\":\"concise evidence-based reason\",\"stage\":1}. Use stage 0 only when approved.\n\nEvidence JSON:\n" + string(data)
+	reqDelegate := AgentDelegateRequest{
+		Task: task, Role: "independent goal acceptance reviewer", Name: "goal-acceptance-review",
+		Description: "独立复核目标验收证据", CleanContext: true, Model: cfg.Model, MaxSteps: 2, toolsProvided: true,
+	}
+	var result *AgentDelegateResult
+	if a.goalCompletionReviewRunner != nil {
+		result, err = a.goalCompletionReviewRunner(ctx, cfg, sessionID, reqDelegate)
+	} else {
+		result, err = a.executeDelegate(ctx, cfg, sessionID, reqDelegate)
+	}
+	if err != nil {
+		return GoalCompletionReview{}, fmt.Errorf("独立验收复核调用失败：%w", err)
+	}
+	if result == nil || result.Status != "completed" {
+		return GoalCompletionReview{}, errors.New("独立验收复核未能完成")
+	}
+	var review GoalCompletionReview
+	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Summary)), &review); err != nil {
+		return GoalCompletionReview{}, errors.New("独立验收复核没有返回有效 JSON；目标保持未完成")
+	}
+	review.Verdict = strings.TrimSpace(review.Verdict)
+	review.Reason = strings.TrimSpace(review.Reason)
+	if (review.Verdict != "approved" && review.Verdict != "needs_work") || review.Reason == "" || len([]rune(review.Reason)) > maxGoalStageEvidenceRunes || review.Verdict == "approved" && review.Stage != 0 || review.Verdict == "needs_work" && (review.Stage < 1 || review.Stage > len(stages)) {
+		return GoalCompletionReview{}, errors.New("独立验收复核返回了无效判定；目标保持未完成")
+	}
+	review.Model = cfg.Model
+	review.ReviewedAt = time.Now().UTC()
+	return review, nil
 }
 
 func (a *App) runGoalVerificationCommands(ctx context.Context, cfg ConfigState, specs []GoalVerificationSpec) ([]GoalVerification, *GoalVerification, error) {
@@ -623,6 +777,7 @@ func (a *App) persistGoalProgress(store *GoalStore, goalID string, acceptance []
 		g.Verifications = nil
 		g.Deliverables = nil
 		g.DeliverySummary = ""
+		g.CompletionReview = nil
 		g.Progress = progress
 		return nil
 	}); err != nil {
@@ -640,24 +795,6 @@ func stageVerificationFailureMessage(index int, stage GoalStage) string {
 		return fmt.Sprintf("阶段 %d 已连续失败 %d 次，系统已暂停副作用操作；必须提交 stage_review 复核是修改阶段目标、按原目标继续，还是请求用户介入。", index+1, stage.FailuresSinceReview)
 	}
 	return fmt.Sprintf("阶段 %d 当前失败计数 %d/%d；检查命令和实现后重试。", index+1, stage.FailuresSinceReview, goalStageReviewFailureThreshold)
-}
-
-func recordGoalStageFailure(stages []GoalStage, index int, results []GoalVerification) []GoalStage {
-	if index < 0 || index >= len(stages) {
-		return stages
-	}
-	stage := &stages[index]
-	stage.Status = "active"
-	stage.Evidence = ""
-	stage.Attempts++
-	stage.FailuresSinceReview++
-	stage.ReviewRequired = stage.FailuresSinceReview >= goalStageReviewFailureThreshold
-	stage.Verifications = append(stage.Verifications, results...)
-	for i := index + 1; i < len(stages); i++ {
-		stages[i].Status = "pending"
-		stages[i].Evidence = ""
-	}
-	return stages
 }
 
 func (a *App) reviewGoalStage(ctx context.Context, store *GoalStore, active *Goal, status, progress string, review GoalStageReviewRequest) (Goal, error) {
@@ -709,6 +846,7 @@ func (a *App) reviewGoalStage(ctx context.Context, store *GoalStore, active *Goa
 		g.Verifications = nil
 		g.Deliverables = nil
 		g.DeliverySummary = ""
+		g.CompletionReview = nil
 		g.Progress = progress
 		if decision == "needs_user" {
 			g.Status = GoalStatusNeedsUser
