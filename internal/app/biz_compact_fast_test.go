@@ -149,21 +149,104 @@ func TestFastCompactTaskProvenanceSurvivesInjectedInputsAndRestart(t *testing.T)
 	}
 }
 
-func TestFastCompactDoesNotCutSingleTaskOrImageInputs(t *testing.T) {
+func TestFastCompactKeepsSingleTaskButReplacesItsImages(t *testing.T) {
 	t.Parallel()
 	a := newIsolatedChatTestApp(t)
-	history := []openai.ChatCompletionMessage{{Role: "user", Content: "one task"}}
+	image := func(data string) openai.ChatMessagePart {
+		return openai.ChatMessagePart{Type: openai.ChatMessagePartTypeImageURL, ImageURL: &openai.ChatMessageImageURL{URL: "data:image/png;base64," + data}}
+	}
+	history := []openai.ChatCompletionMessage{{Role: "user", MultiContent: []openai.ChatMessagePart{{Type: openai.ChatMessagePartTypeText, Text: "one task"}, image("AAAA"), image("BBBB")}}}
 	for i := 0; i < 12; i++ {
 		call := openai.ToolCall{ID: fmt.Sprint(i), Type: "function", Function: openai.FunctionCall{Name: "read", Arguments: `{}`}}
 		history = append(history, openai.ChatCompletionMessage{Role: "assistant", ToolCalls: []openai.ToolCall{call}}, openai.ChatCompletionMessage{Role: "tool", ToolCallID: call.ID, Content: strings.Repeat("data", 1000)})
 	}
-	if image := readImageInjectionMessage([]readImageCandidate{{Path: "test.png", DataURL: "data:image/png;base64,AAAA"}}); image != nil {
+	if image := readImageInjectionMessage([]readImageCandidate{{Path: "test.png", DataURL: "data:image/png;base64,CCCC"}}); image != nil {
 		history = append(history, *image)
 	}
 	a.saveHistory("one", history)
 	result, err := a.FastCompactSession("one")
-	if err != nil || result["changed"] != false || !reflect.DeepEqual(a.loadSessionHistoryCopy("one"), history) {
-		t.Fatal("a single long task was partially compacted")
+	if err != nil || result["changed"] != true {
+		t.Fatalf("fast compaction did not record image changes: result=%v err=%v", result, err)
+	}
+	after := a.loadSessionHistoryCopy("one")
+	if len(after) != len(history)-1 || after[0].Content != "one task\n\n[2 image attachment(s) omitted from saved history]" {
+		t.Fatalf("single task or image placeholder changed unexpectedly: %d messages, first=%q", len(after), after[0].Content)
+	}
+	for i := range after {
+		if isImageInjectionMessage(&after[i]) || len(after[i].MultiContent) != 0 {
+			t.Fatalf("image payload/injection survived fast compaction: %#v", after[i])
+		}
+	}
+	for i := 0; i < 12; i++ {
+		if after[1+i*2].Role != openai.ChatMessageRoleAssistant || after[2+i*2].Role != openai.ChatMessageRoleTool {
+			t.Fatal("single-task tool history was cut while replacing images")
+		}
+	}
+}
+
+func TestFastCompactReplacesImagesInOldAndCurrentTurnsAndSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	a := newIsolatedChatTestApp(t)
+	a.modelHistoryCodec = nil
+	image := func(data string) openai.ChatMessagePart {
+		return openai.ChatMessagePart{Type: openai.ChatMessagePartTypeImageURL, ImageURL: &openai.ChatMessageImageURL{URL: "data:image/png;base64," + data}}
+	}
+	const sid = "all-images"
+	old := []openai.ChatCompletionMessage{
+		{Role: "user", MultiContent: []openai.ChatMessagePart{{Type: openai.ChatMessagePartTypeText, Text: "old question"}, image("OLD1"), image("OLD2")}},
+		{Role: "assistant", Content: "old answer"},
+	}
+	a.saveHistory(sid, old)
+	history := append(cloneChatMessages(old),
+		openai.ChatCompletionMessage{Role: "user", MultiContent: []openai.ChatMessagePart{{Type: openai.ChatMessagePartTypeText, Text: "current question"}, image("CURRENT")}},
+	)
+	injected := readImageInjectionMessage([]readImageCandidate{{Path: "read.png", DataURL: "data:image/png;base64,INJECTED"}})
+	history = append(history, *injected, openai.ChatCompletionMessage{Role: "assistant", Content: "current answer"})
+	a.beginHistoryTask(sid, history)
+	cfg := ConfigState{Model: "m", APIFormat: apiFormatOpenAIResponses, responsesPromptCacheKey: openAIResponsesPromptCacheKey(sid)}
+	key := reasoningReplayKey(cfg, "m")
+	a.reasoningStash.appendResponses(key, responsesMessageKey(1, history[4]), []json.RawMessage{json.RawMessage(`{"type":"message","id":"msg_current_after_image"}`)})
+	a.saveHistory(sid, history)
+	result, err := a.FastCompactSession(sid)
+	if err != nil || result["changed"] != true {
+		t.Fatalf("FastCompactSession() = %v, %v", result, err)
+	}
+	after := a.loadSessionHistoryCopy(sid)
+	if len(after) != 3 {
+		t.Fatalf("fast compacted history has %d messages, want compacted record plus current turn", len(after))
+	}
+	entries, ok := decodeFastCompactHistory(after[0])
+	if !ok || len(entries) != 2 || !strings.Contains(entries[0].Content, "[2 image attachment(s) omitted from saved history]") {
+		t.Fatalf("old attachments did not use the restart placeholder: %#v", entries)
+	}
+	if !strings.Contains(after[1].Content, "current question") || !strings.Contains(after[1].Content, "[1 image attachment(s) omitted from saved history]") || after[2].Content != "current answer" {
+		t.Fatalf("current task or its image placeholder was lost: %#v", after)
+	}
+	if payload := a.reasoningStash.get(key); len(payload.nativeResponses(0, after[2])) != 1 {
+		t.Fatalf("removing an image-injection message lost current native replay state: %#v", payload.responsesNative)
+	}
+	for i := range after {
+		if len(after[i].MultiContent) != 0 || strings.Contains(after[i].Content, "INJECTED") || strings.Contains(after[i].Content, "OLD1") || strings.Contains(after[i].Content, "CURRENT") {
+			t.Fatalf("image payload survived in compacted history: %#v", after[i])
+		}
+	}
+
+	// The standard restart projection must leave the same placeholder text, not
+	// resurrect image data or add a second, conflicting marker.
+	disk := sanitizeHistoryMessagesForDisk(after)
+	persisted, err := json.Marshal(a.modelHistoryForStorage(sid, disk, after))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diskMessages []openai.ChatCompletionMessage
+	if err := json.Unmarshal(persisted, &diskMessages); err != nil {
+		t.Fatal(err)
+	}
+	restoredApp := newIsolatedChatTestApp(t)
+	restoredApp.modelHistoryCodec = nil
+	restored, _ := restoredApp.modelHistoryFromStorage(sid, persisted, diskMessages)
+	if !reflect.DeepEqual(restored, after) {
+		t.Fatalf("restart changed the fast-compaction image placeholders: %#v", restored)
 	}
 }
 

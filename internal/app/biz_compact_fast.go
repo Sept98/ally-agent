@@ -143,6 +143,7 @@ func (a *App) projectFastCompactHistory(ctx context.Context, sessionID string, h
 	toolEntries := map[int]fastCompactEntry{}
 	calls := map[string][]openai.ToolCall{}
 	reasoningCount, assistantCount, argumentCount := 0, 0, 0
+	imageChanged := false
 	latestPlanID := ""
 	for _, m := range history {
 		for _, call := range m.ToolCalls {
@@ -165,6 +166,11 @@ func (a *App) projectFastCompactHistory(ctx context.Context, sessionID string, h
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+		}
+		keep, flattened := flattenHistoryImageMessage(&m)
+		imageChanged = imageChanged || flattened
+		if !keep {
+			continue
 		}
 		if isFastCompactHistory(m) {
 			flush()
@@ -239,8 +245,14 @@ func (a *App) projectFastCompactHistory(ctx context.Context, sessionID string, h
 	}
 	flush()
 	tailStart := len(out)
-	out = append(out, cloneChatMessages(history[cutoff:])...)
-	changed := cutoff > 0 && (assistantCount > 0 || argumentCount > 0)
+	for _, message := range cloneChatMessages(history[cutoff:]) {
+		keep, flattened := flattenHistoryImageMessage(&message)
+		imageChanged = imageChanged || flattened
+		if keep {
+			out = append(out, message)
+		}
+	}
+	changed := imageChanged || cutoff > 0 && (assistantCount > 0 || argumentCount > 0)
 	// A user-only prefix has no tool/prompt state to compact. Preserve it verbatim.
 	if !changed {
 		out = cloneChatMessages(history)
@@ -276,7 +288,7 @@ func (a *App) commitFastCompactHistory(sessionID string, history []openai.ChatCo
 	if !candidate.messageChange {
 		return candidate.result
 	}
-	a.reasoningStash.retainFastCompactTail(sessionID, history, candidate.history, candidate.cutoff)
+	a.reasoningStash.retainFastCompactTailAt(sessionID, history, candidate.history, candidate.cutoff, candidate.tailStart)
 	result := candidate.result
 	// Rewrites must invalidate measurement anchors even when the message
 	// count stays unchanged. Read-cache hits must stop hiding old files too.

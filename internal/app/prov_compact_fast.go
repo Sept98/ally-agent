@@ -61,11 +61,11 @@ func (s *reasoningStash) hasOldCompactReasoning(sessionID string, history []open
 // untouched task can replay signed/encrypted data. Rebase its assistant ordinal
 // after the old assistants became user-role historical reference records.
 func (s *reasoningStash) retainFastCompactTail(sessionID string, history, compacted []openai.ChatCompletionMessage, cutoff int) bool {
-	if s == nil || cutoff <= 0 {
-		return false
-	}
-	tailStart := len(compacted) - (len(history) - cutoff)
-	if tailStart < 0 {
+	return s.retainFastCompactTailAt(sessionID, history, compacted, cutoff, len(compacted)-(len(history)-cutoff))
+}
+
+func (s *reasoningStash) retainFastCompactTailAt(sessionID string, history, compacted []openai.ChatCompletionMessage, cutoff, tailStart int) bool {
+	if s == nil || cutoff <= 0 || tailStart < 0 || tailStart > len(compacted) {
 		return false
 	}
 	callIDs := map[string]bool{}
@@ -77,9 +77,17 @@ func (s *reasoningStash) retainFastCompactTail(sessionID string, history, compac
 			newOrdinal++
 		}
 	}
+	compactedIndex := tailStart
 	for i, m := range history {
 		if i >= cutoff {
-			next := compacted[tailStart+i-cutoff]
+			if isImageInjectionMessage(&m) {
+				continue
+			}
+			if compactedIndex >= len(compacted) {
+				return false
+			}
+			next := compacted[compactedIndex]
+			compactedIndex++
 			if m.Role == openai.ChatMessageRoleAssistant {
 				for _, call := range m.ToolCalls {
 					callIDs[call.ID] = true

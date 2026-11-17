@@ -107,16 +107,15 @@ func sanitizeHistoryMessagesWithOrigins(messages []openai.ChatCompletionMessage,
 		// the in-memory history (the session should keep seeing them until the
 		// process exits) but are never persisted: their NUL-prefixed marker is
 		// not JSON-portable and the base64 payloads do not go to disk.
-		if flattenImages && isImageInjectionMessage(&original) {
-			continue
-		}
-		if original.Role == openai.ChatMessageRoleSystem {
-			continue
-		}
 		m := original
-		if flattenImages && len(m.MultiContent) > 0 {
-			m.Content = textFromMultiContent(m.MultiContent)
-			m.MultiContent = nil
+		if flattenImages {
+			keep, _ := flattenHistoryImageMessage(&m)
+			if !keep {
+				continue
+			}
+		}
+		if m.Role == openai.ChatMessageRoleSystem {
+			continue
 		}
 		if profile == historyProfileDisk {
 			// Reasoning text is provider-protocol replay state for the tool loop
@@ -299,6 +298,22 @@ func repairDanglingToolCallsWithOrigins(messages []openai.ChatCompletionMessage)
 type pendingToolCall struct {
 	msgIndex  int
 	callIndex int
+}
+
+// flattenHistoryImageMessage applies the same image policy used by restart
+// persistence: attachment parts become the established omission placeholder,
+// while transient read-image injections are dropped because their payload is not
+// persisted and the accompanying lead text would otherwise be misleading.
+func flattenHistoryImageMessage(message *openai.ChatCompletionMessage) (keep, changed bool) {
+	if isImageInjectionMessage(message) {
+		return false, true
+	}
+	if len(message.MultiContent) == 0 {
+		return true, false
+	}
+	message.Content = textFromMultiContent(message.MultiContent)
+	message.MultiContent = nil
+	return true, true
 }
 
 func textFromMultiContent(parts []openai.ChatMessagePart) string {
