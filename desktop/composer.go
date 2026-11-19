@@ -897,7 +897,7 @@ func (a *desktop) modelSelector(c *ui.Context, t *conversation) {
 	wasOpen := st.ModelOpen
 	uikit.MenuButton(c.Key("composer-model"), &st.ModelOpen, uikit.MenuOptions{Width: 340, MaxHeight: 520}, func(b ui.Element) {
 		b, text := uikit.ButtonOn(c, b, short(strings.ReplaceAll(label, " / ", " · "), 34), uikit.ButtonGhost, true, nil, uikit.ActionOptions{Disabled: t.Busy})
-		b.Padding(1, 6).MinWidth(0).Shrink(1).DimDisabled(false).TextColor(a.secondaryInk())
+		b.Padding(1, 6).MinWidth(0).Shrink(1).DimDisabled(false).TextColor(a.secondaryInk()).Background(ui.Transparent)
 		text.TextColor(a.secondaryInk())
 		if t.Busy {
 			b.Cursor(ui.CursorDefault)
@@ -1183,19 +1183,28 @@ func (a *desktop) writeReasoning(model, level string) (backend.ConfigState, reas
 	if err != nil {
 		return backend.ConfigState{}, reasoningSaved, err
 	}
-	next, changed := withModelReasoning(cfg, model, level)
-	if !changed {
-		// withModelReasoning also reports nothing to change for a model that is
-		// gone; telling the two apart keeps a stale Tab from looking saved.
-		if _, found := modelReasoning(cfg, model); !found {
-			return cfg, reasoningMissing, nil
+	var id *backend.ModelIdentity
+	for _, entry := range cfg.Models {
+		if modelOption(entry) == model {
+			value := modelIdentity(entry)
+			id = &value
+			break
 		}
-		return cfg, reasoningUnchanged, nil
 	}
-	if err := a.core.SaveConfig(next); err != nil {
+	if id == nil {
+		return cfg, reasoningMissing, nil
+	}
+	found, changed, err := a.core.SetNativeModelReasoning(*id, level)
+	if err != nil {
 		return backend.ConfigState{}, reasoningSaved, err
 	}
 	fresh, err := a.core.GetConfig()
+	if !found {
+		return fresh, reasoningMissing, err
+	}
+	if !changed {
+		return fresh, reasoningUnchanged, err
+	}
 	return fresh, reasoningSaved, err
 }
 

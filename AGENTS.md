@@ -8,10 +8,11 @@
 - 模块路径保持 `ally-dev`。`desktop/` 可依赖 `internal/app`；工具与纯逻辑包不得反向依赖 app/desktop。app 内非 `host_*` 文件保持宿主中立，桌面适配放 `internal/app/host_*.go`。
 - 页面文件用 `page_*.go`，共享样式与组件收口在 `theme.go`、`widgets.go`，外观微调放 `desktop/uikit`。优先复用 MyGo 组件，不重实现选择、键盘导航、焦点、浮层与滚动。
 - UI 状态只在主线程修改；后台结果经 `Window.Update` 发布；不保存 Element、不把 Context 带进后台；动态控件用 `c.Key`。
+- 表单输入绑定持久状态；临时值或 map 值必须在控件事件回调中写回。可编辑下拉统一用 `uikit.ComboboxField` 的值与回调，输入、清空和选项选择都要验证。SSH 添加/编辑的连接测试使用当前表单，不回退到已保存节点。
 - 渲染期间不读写磁盘、不发网络请求、不启动无条件后台任务；素材通过 `resources` 包嵌入。
 - 测试读写在 `t.TempDir`，读用户目录的测试同时隔离 HOME 与 USERPROFILE；运行全套测试不要设置全局 `ALLY_DATA_DIR`。
 - 构建 `python scripts/build.py dev`（或双击 scripts/build.bat / build.command）；交叉构建与 DMG：macOS 上设 `BUILD_TAG` 后 `bash scripts/build-all.sh`。测试 `python scripts/test.py`；UI 检查 `go tool mygo vet .`。
-- Windows 产物固定 `dist/ally-native.exe`，不加版本/日期后缀，覆盖失败处理文件占用、不改名绕过；`migration/legacy-host` 仅作迁移参考不参与构建；`dist`、`.tmp` 不提交；提交作者 `ally agent <ally@agent.dev>`，推送 `mygo` 分支不改 `main`。
+- Windows 产物固定 `dist/ally-native.exe`，不加版本/日期后缀；覆盖时旧文件正在运行就把它改名为 `ally-native.exe~` 再落新文件，不另造带后缀的产物；`migration/legacy-host` 仅作迁移参考不参与构建；`dist`、`.tmp` 不提交；提交作者 `ally agent <ally@agent.dev>`，推送 `mygo` 分支不改 `main`。
 
 ## 运行形态与 API
 

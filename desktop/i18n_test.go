@@ -4,6 +4,7 @@ package desktop
 import (
 	backend "ally-dev/internal/app"
 	"ally-dev/locales"
+	"fmt"
 	"os"
 	"testing"
 
@@ -14,8 +15,23 @@ import (
 // Existing behavioral fixtures describe the Chinese UI. Pin their language so
 // tests are independent of the developer's system and saved app language.
 func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "ally-desktop-test-home-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	for _, key := range []string{"HOME", "USERPROFILE"} {
+		if err := os.Setenv(key, home); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			_ = os.RemoveAll(home)
+			os.Exit(1)
+		}
+	}
+	_ = os.Unsetenv("ALLY_DATA_DIR")
 	i18n.SetLocaleFunc(func() string { return "zh-Hans" })
-	os.Exit(m.Run())
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 func useTestLocale(t *testing.T, tag string) {
@@ -52,6 +68,35 @@ func TestSSHAuthValuesAcrossLanguages(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSSHGroupEditorTypingAndSelection(t *testing.T) {
+	a := &desktop{prefs: defaultPrefs(), sshServers: []backend.SSHServerNode{{ID: "one", Group: "33"}, {ID: "two", Group: "运维"}}}
+	a.openSSHEditor("one", "33")
+	tt := ui.NewTester(func(c *ui.Context) { c.SetTheme(a.theme()); a.sshEditorDialog(c) }, 900, 1000)
+	input, ok := tt.AccessByRole(ui.RoleComboBox, "分组")
+	if !ok {
+		t.Fatal("missing group input")
+	}
+	tt.ClickAt(input.Bounds.X+input.Bounds.W/2, input.Bounds.Y+input.Bounds.H/2)
+	tt.Key(ui.Cmd, ui.KeyA)
+	tt.Type("自定义")
+	if a.sshF.GroupInput != "自定义" {
+		t.Fatalf("typed group = %q", a.sshF.GroupInput)
+	}
+	tt.Key(ui.Cmd, ui.KeyA)
+	tt.Key(0, ui.KeyBackspace)
+	if a.sshF.GroupInput != "" {
+		t.Fatalf("cleared group = %q", a.sshF.GroupInput)
+	}
+	tt.Key(0, ui.KeyDown)
+	tt.Frame()
+	if err := tt.Click("运维"); err != nil {
+		t.Fatal(err)
+	}
+	if a.sshF.GroupInput != "运维" {
+		t.Fatalf("selected group = %q", a.sshF.GroupInput)
 	}
 }
 

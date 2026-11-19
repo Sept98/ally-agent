@@ -250,6 +250,9 @@ type chatUI struct {
 	AskSelected          map[string][]string
 	AskCustom            map[string]bool
 	AskCustomTxt         map[string]string
+	AskImages            map[string][]preparedAttachment
+	AskImageBitmaps      map[string]*ui.Bitmap
+	AskImageLoading      int
 	AskSubmitted         bool
 	PlanCollapsed        bool
 	GoalDetailsOpen      bool
@@ -319,16 +322,18 @@ type deletePromptState struct {
 
 func newChatUI() chatUI {
 	return chatUI{
-		Round:         map[int]*roundStat{},
-		PromptOpen:    map[int]bool{},
-		PromptHandles: map[int]*ui.Handle{},
-		ToolOpen:      map[string]bool{},
-		GroupOpen:     map[string]bool{},
-		AskSelected:   map[string][]string{},
-		AskCustom:     map[string]bool{},
-		AskCustomTxt:  map[string]string{},
-		Follow:        true,
-		HistoryIndex:  -1,
+		Round:           map[int]*roundStat{},
+		PromptOpen:      map[int]bool{},
+		PromptHandles:   map[int]*ui.Handle{},
+		ToolOpen:        map[string]bool{},
+		GroupOpen:       map[string]bool{},
+		AskSelected:     map[string][]string{},
+		AskCustom:       map[string]bool{},
+		AskCustomTxt:    map[string]string{},
+		AskImages:       map[string][]preparedAttachment{},
+		AskImageBitmaps: map[string]*ui.Bitmap{},
+		Follow:          true,
+		HistoryIndex:    -1,
 		// The transcript follows its own end: the list keeps the newest
 		// message in view as the conversation grows, and stops when the
 		// reader scrolls up.
@@ -571,6 +576,8 @@ type sshForm struct {
 	Draft           backend.SSHServerNode
 	Port            float64
 	Busy            bool
+	EditorTestBusy  bool
+	EditorTestSeq   uint64
 	TestBusy        map[string]bool
 	DeleteID        string
 	DeleteOpen      bool

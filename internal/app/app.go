@@ -10,6 +10,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"ally-dev/internal/tools/pathutil"
 	"ally-dev/internal/tools/schemautil"
 	toolshared "ally-dev/internal/tools/shared"
+	"ally-dev/internal/tools/sshclient"
 	"ally-dev/internal/tools/toolcall"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -321,6 +323,7 @@ type App struct {
 	// in the SSH cluster manager) when a remote tool targets a registered alias;
 	// keys are lowercase user@host[:port]. See orch_ssh_cluster.go.
 	sshCredentials *sshCredentialCache
+	sshPool        *sshclient.Pool
 
 	// sshKnownHostsPath 覆盖 SSH 主机指纹记录文件的位置；为空时用系统默认的
 	// ~/.ssh/known_hosts。存在的意义是让测试能在临时目录里跑完整的
@@ -481,6 +484,7 @@ func newAppState(dataDir string) *App {
 		sessionToolsets:      map[string][]openai.Tool{},
 		pendingAsks:          map[string]*pendingAsk{},
 		sshCredentials:       newSSHCredentialCache(),
+		sshPool:              sshclient.NewPool(),
 		sshClusters:          map[string]SSHServerNode{},
 		sshWorkspaceAllowed:  map[string]map[string]bool{},
 		subRuns:              map[string]*SubagentRun{},
@@ -1069,6 +1073,7 @@ type AskSubmittedAnswer struct {
 	QuestionID        string   `json:"questionId"`
 	SelectedOptionIDs []string `json:"selectedOptionIds"`
 	CustomText        string   `json:"customText,omitempty"`
+	Images            []string `json:"images,omitempty"`
 }
 
 type AskSubmitRequest struct {
@@ -1089,6 +1094,8 @@ type AskResolvedAnswer struct {
 	QuestionID string                 `json:"questionId"`
 	Question   string                 `json:"question"`
 	Selections []AskResolvedSelection `json:"selections"`
+	ImageCount int                    `json:"imageCount,omitempty"`
+	Images     []string               `json:"-"`
 }
 
 type AskResult struct {
@@ -1325,10 +1332,12 @@ type RemoteRunCommandRequest struct {
 }
 
 type remoteTarget struct {
-	Raw        string
-	Host       string
-	Port       string
-	credential *sshCredentialEntry
+	poolKey     string
+	poolVersion uint64
+	Raw         string
+	Host        string
+	Port        string
+	credential  *sshCredentialEntry
 }
 
 type remoteRawFile struct {
@@ -3583,6 +3592,7 @@ func resolveAskSubmission(askID string, req AskRequest, submitted []AskSubmitted
 		answersByQuestion[answer.QuestionID] = answer
 	}
 	result := AskResult{AskID: askID, Answers: make([]AskResolvedAnswer, 0, len(req.Questions))}
+	totalImages := 0
 	for _, question := range req.Questions {
 		submittedAnswer, ok := answersByQuestion[question.ID]
 		if !ok {
@@ -3593,6 +3603,20 @@ func resolveAskSubmission(askID string, req AskRequest, submitted []AskSubmitted
 			options[option.ID] = option
 		}
 		resolved := AskResolvedAnswer{QuestionID: question.ID, Question: question.Question}
+		totalImages += len(submittedAnswer.Images)
+		if totalImages > 8 {
+			return AskResult{}, codedToolError("E_BAD_ASK_ANSWER", errors.New("at most 8 images are allowed"))
+		}
+		for _, image := range submittedAnswer.Images {
+			if !validImageDataURL(image) || attachmentImageDataURLBytes(image) > maxAttachmentImageBytes {
+				return AskResult{}, codedToolError("E_BAD_ASK_ANSWER", errors.New("invalid or oversized image"))
+			}
+			if _, err := base64.StdEncoding.DecodeString(strings.SplitN(image, ",", 2)[1]); err != nil {
+				return AskResult{}, codedToolError("E_BAD_ASK_ANSWER", errors.New("invalid image encoding"))
+			}
+			resolved.Images = append(resolved.Images, image)
+		}
+		resolved.ImageCount = len(resolved.Images)
 		selected := map[string]bool{}
 		for _, optionID := range submittedAnswer.SelectedOptionIDs {
 			if selected[optionID] {
@@ -3610,7 +3634,7 @@ func resolveAskSubmission(askID string, req AskRequest, submitted []AskSubmitted
 		if custom := strings.TrimSpace(submittedAnswer.CustomText); custom != "" {
 			resolved.Selections = append(resolved.Selections, AskResolvedSelection{Label: custom, Custom: true})
 		}
-		if len(resolved.Selections) == 0 {
+		if len(resolved.Selections) == 0 && len(resolved.Images) == 0 {
 			return AskResult{}, codedToolError("E_BAD_ASK_ANSWER", fmt.Errorf("question %s requires at least one selected or custom answer", question.ID))
 		}
 		result.Answers = append(result.Answers, resolved)

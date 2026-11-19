@@ -535,7 +535,10 @@ func renderAskResultForModel(r AskResult) string {
 	var rows []string
 	for _, a := range r.Answers {
 		rows = append(rows, a.QuestionID+": "+a.Question)
-		if len(a.Selections) == 0 {
+		if a.ImageCount > 0 {
+			rows = append(rows, fmt.Sprintf("attached images: %d (provided in following image input)", a.ImageCount))
+		}
+		if len(a.Selections) == 0 && a.ImageCount == 0 {
 			rows = append(rows, "(no answers)")
 		}
 		for _, v := range a.Selections {
@@ -1072,7 +1075,7 @@ func renderMultiEditResultForModel(r MultiEditResult) string {
 	alias := remoteAliasSegment(r.RemoteAlias)
 	var blocks []string
 	for _, f := range r.Files {
-		blocks = append(blocks, "// edit"+alias+" | path="+strconv.Quote(f.Path)+" | version="+strconv.Quote(f.Version))
+		blocks = append(blocks, "// edit"+alias+" | path="+strconv.Quote(f.Path)+" | new version="+strconv.Quote(f.Version))
 	}
 	body := r.Summary
 	if r.Validation != "" {
