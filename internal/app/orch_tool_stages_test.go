@@ -71,6 +71,29 @@ func TestStagedBatchOrdersByStageAndPreservesArguments(t *testing.T) {
 	}
 }
 
+func TestStagedBatchRunsGoalUpdateBeforeAskInSameTurn(t *testing.T) {
+	calls := []openai.ToolCall{
+		stagedCall("ask", `{}`),
+		stagedCall("goal_update", `{"status":"progress"}`),
+	}
+	var order []string
+	results := make([]toolResult, len(calls))
+	a := &App{}
+	a.executeStagedToolBatch(context.Background(), ConfigState{ToolConcurrency: 4}, calls, nil,
+		func(_ context.Context, _ int, call openai.ToolCall) toolResult {
+			order = append(order, call.Function.Name)
+			return toolResult{OK: true}
+		}, func(i int, _ openai.ToolCall, r toolResult, _ int64) { results[i] = r })
+	if !reflect.DeepEqual(order, []string{"goal_update", "ask"}) {
+		t.Fatalf("same-turn clarification calls ran in unsafe order: %v", order)
+	}
+	for i, result := range results {
+		if !result.OK {
+			t.Fatalf("tool %d failed: %+v", i, result)
+		}
+	}
+}
+
 func TestStagedBatchParallelFailureDrainsPeersBeforeSkipping(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

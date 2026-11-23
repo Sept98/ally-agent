@@ -2126,6 +2126,16 @@ func withoutGoalUpdateTool(tools []openai.Tool) []openai.Tool {
 	return filtered
 }
 
+func withoutPlanTool(tools []openai.Tool) []openai.Tool {
+	filtered := make([]openai.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Function == nil || normalizeToolName(tool.Function.Name) != "plan" {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
+}
+
 type builtinToolAvailabilityKey struct{}
 
 // Execution follows the exact tool list injected into this run, including child
@@ -2182,6 +2192,7 @@ func (a *App) buildToolsForSession(sessionID string, cfg ConfigState) []openai.T
 
 	tools := a.buildToolsForConfig(cfg)
 	if a.activeGoalForSession(sessionID) {
+		tools = withoutPlanTool(tools)
 		for _, tool := range builtinToolsForConfig(cfg) {
 			if tool.Function != nil && normalizeToolName(tool.Function.Name) == "goal_update" {
 				tools = append(tools, tool)

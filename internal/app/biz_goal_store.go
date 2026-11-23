@@ -107,6 +107,12 @@ type Goal struct {
 	Title                     string                    `json:"title"`
 	Details                   string                    `json:"details,omitempty"`
 	Acceptance                []string                  `json:"acceptance,omitempty"`
+	PreflightRequired         bool                      `json:"preflight_required,omitempty"`
+	PreflightReady            bool                      `json:"preflight_ready,omitempty"`
+	PreflightSummary          string                    `json:"preflight_summary,omitempty"`
+	ClarificationRequired     bool                      `json:"clarification_required,omitempty"`
+	ClarificationAnswered     bool                      `json:"clarification_answered,omitempty"`
+	ClarificationAskID        string                    `json:"clarification_ask_id,omitempty"`
 	Stages                    []GoalStage               `json:"stages,omitempty"`
 	Verifications             []GoalVerification        `json:"verifications,omitempty"`
 	FinalVerificationAttempts []GoalVerificationAttempt `json:"final_verification_attempts,omitempty"`
@@ -194,6 +200,15 @@ func NewGoalStore(path string) (*GoalStore, error) {
 	}
 	recovered := false
 	for _, g := range records {
+		if !g.PreflightRequired && g.Status != GoalStatusCompleted && g.Status != GoalStatusFailed {
+			// Legacy non-terminal goals predate mandatory preflight; require a fresh review before resuming.
+			g.PreflightRequired = true
+			g.PreflightReady = false
+			g.ClarificationAnswered = false
+			g.ClarificationAskID = ""
+			g.StopReason = "旧版目标需先完成前置理解与计划复核，再继续执行。"
+			recovered = true
+		}
 		if err := validateGoal(g); err != nil {
 			return nil, fmt.Errorf("invalid stored goal: %w", err)
 		}
@@ -237,8 +252,11 @@ func validateGoal(g Goal) error {
 	if g.Model != nil && strings.TrimSpace(g.Model.Model) == "" {
 		return errors.New("goal model identity is invalid")
 	}
-	if len([]rune(g.Progress)) > maxGoalProgressRunes {
-		return errors.New("goal progress is too long")
+	if len([]rune(g.Progress)) > maxGoalProgressRunes || len([]rune(g.PreflightSummary)) > maxGoalProgressRunes {
+		return errors.New("goal progress or preflight summary is too long")
+	}
+	if len([]rune(g.ClarificationAskID)) > maxGoalIDRunes {
+		return errors.New("goal clarification ask ID is too long")
 	}
 	if len(g.Acceptance) > maxGoalAcceptanceItems {
 		return errors.New("too many goal acceptance criteria")

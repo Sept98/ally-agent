@@ -138,13 +138,17 @@ func (a *desktop) chatMessages(c *ui.Context, t *conversation, width float32) {
 			})
 		}
 		goal := a.goals[t.ID]
-		if len(a.plans[t.ID]) > 0 || goalPanelVisible(goal, st) {
+		showGoal := goalPanelVisible(goal, st)
+		showPlan := goal.ID == "" && len(a.plans[t.ID]) > 0
+		if showPlan || showGoal {
 			// The transcript and the composer are capped and centred, so a panel pinned
 			// to the window edge never lines up with either. Same cap, same centre,
 			// same side inset as the composer box it sits directly above.
 			ui.Column(c).FillWidth().MaxWidth(chatMaxWidth).AlignSelf(ui.Center).Shrink(0).Padding(0, 20).Children(func() {
 				a.goalPanel(c, t)
-				a.planPanel(c, t)
+				if showPlan {
+					a.planPanel(c, t)
+				}
 			})
 		}
 	})

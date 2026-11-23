@@ -26,11 +26,52 @@ func TestParseGoalCommand(t *testing.T) {
 	}
 }
 
-func TestGoalProgressSummaryShowsStageAndBoundsProgress(t *testing.T) {
+func TestGoalProgressSummaryShowsCurrentStageAndBoundsProgress(t *testing.T) {
 	goal := backend.Goal{Progress: strings.Repeat("进展", 100), Stages: []backend.GoalStage{{Title: "调查", Status: "completed"}, {Title: "实现", Status: "active"}, {Title: "验收", Status: "pending"}}}
 	got := goalProgressSummary(goal)
-	if !strings.Contains(got, "阶段 1/3 完成") || !strings.Contains(got, "当前 第2步：实现") || len([]rune(got)) > 180 {
-		t.Fatalf("goal progress summary is missing stage info or unbounded: %q", got)
+	if strings.Contains(got, "实现") || strings.Contains(got, "进展") {
+		t.Fatalf("summary must not masquerade stale model progress as live state: %q", got)
+	}
+	if done, total := goalStageProgress(goal); done != 1 || total != 3 {
+		t.Fatalf("stage progress = %d/%d, want 1/3", done, total)
+	}
+	if label := goalStageProgressLabel(goal); label != "当前第 2/3 阶段 · 已完成 1" {
+		t.Fatalf("progress label = %q", label)
+	}
+	if i, stage, ok := goalCurrentStage(goal); !ok || i != 1 || stage.Title != "实现" {
+		t.Fatalf("current stage = %d, %+v, %v", i, stage, ok)
+	}
+	if label := goalCurrentStageLabel(goal); label != "当前第 2 / 共 3 阶段：实现" {
+		t.Fatalf("current stage label = %q", label)
+	}
+	if got := goalCompletedStageCount(goal); got != 1 {
+		t.Fatalf("completed stage count = %d, want 1", got)
+	}
+	if got := goalCurrentStageLabel(backend.Goal{Stages: []backend.GoalStage{{Title: "预备", Status: "pending"}}}); got != "下一阶段：第 1 / 共 1 阶段：预备" {
+		t.Fatalf("upcoming-stage label = %q", got)
+	}
+	if got := goalStageProgressLabel(backend.Goal{Stages: []backend.GoalStage{{Status: "completed"}, {Status: "completed"}}}); got != "全部 2 阶段已完成" {
+		t.Fatalf("completed-goal label = %q", got)
+	}
+}
+
+func TestGoalStageStatusPresentation(t *testing.T) {
+	for _, tc := range []struct {
+		stage  backend.GoalStage
+		label  string
+		marker string
+	}{
+		{backend.GoalStage{Status: "completed"}, "已完成", "✓"},
+		{backend.GoalStage{Status: "active"}, "进行中", "●"},
+		{backend.GoalStage{Status: "pending"}, "待开始", "○"},
+		{backend.GoalStage{Status: "active", ReviewRequired: true}, "需要复核", "!"},
+	} {
+		if got := goalStageStatusLabel(tc.stage); got != tc.label {
+			t.Errorf("goalStageStatusLabel(%+v) = %q, want %q", tc.stage, got, tc.label)
+		}
+		if got := goalStageStatusMarker(tc.stage); got != tc.marker {
+			t.Errorf("goalStageStatusMarker(%+v) = %q, want %q", tc.stage, got, tc.marker)
+		}
 	}
 }
 
@@ -69,12 +110,26 @@ func TestGoalActivityTracksToolEvents(t *testing.T) {
 	tab := &conversation{ID: "s"}
 	a := &desktop{goals: map[string]backend.Goal{"s": {ID: "g", SessionID: "s", Status: backend.GoalStatusActive}}}
 	a.applyToolEvent(tab, "tool:start", map[string]any{"toolCallId": "c1", "name": "command", "args": map[string]any{"purpose": "运行阶段测试"}})
-	if got := tab.uiState().GoalActivity; !strings.Contains(got, "command") || !strings.Contains(got, "运行阶段测试") {
+	if got := tab.uiState().GoalActivity; !strings.Contains(got, "运行命令") || !strings.Contains(got, "运行阶段测试") {
 		t.Fatalf("goal activity did not reflect started tool: %q", got)
 	}
 	a.applyToolEvent(tab, "tool:result", map[string]any{"toolCallId": "c1", "name": "command", "result": map[string]any{"ok": true}})
 	if got := tab.uiState().GoalActivity; got != "" {
-		t.Fatalf("goal activity remained after tool result: %q", got)
+		t.Fatalf("active goal activity remained after tool result: %q", got)
+	}
+	if got := tab.uiState().GoalLastActivity; !strings.Contains(got, "刚完成：") || !strings.Contains(got, "运行阶段测试") {
+		t.Fatalf("completed tool activity was not retained: %q", got)
+	}
+	if got := goalDisplayedActivity(tab.uiState(), tab); !strings.Contains(got, "刚完成：") {
+		t.Fatalf("displayed activity missing last completed tool: %q", got)
+	}
+}
+
+func TestGoalDisplayedActivityRecoversFromTranscript(t *testing.T) {
+	tab := &conversation{Messages: []map[string]any{{"role": "tool_call", "name": "create", "status": "success", "args": `{"path":"internal/sim/world.go"}`}}}
+	got := goalDisplayedActivity(&chatUI{}, tab)
+	if !strings.Contains(got, "最近完成") || !strings.Contains(got, "internal/sim/world.go") {
+		t.Fatalf("transcript activity = %q", got)
 	}
 }
 

@@ -255,9 +255,13 @@ type chatUI struct {
 	AskImageLoading      int
 	AskSubmitted         bool
 	PlanCollapsed        bool
+	GoalPanelOpen        bool
 	GoalDetailsOpen      bool
+	GoalPlanOpen         bool
+	GoalResultsOpen      bool
 	GoalPanelVisible     bool
 	GoalActivity         string
+	GoalLastActivity     string
 	CmdOpen              bool
 	CmdIndex             int
 	Mention              mentionState

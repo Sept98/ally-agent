@@ -92,13 +92,44 @@ func (a *App) executeStagedToolBatch(ctx context.Context, cfg ConfigState, calls
 ) {
 	groups := map[int64][]int{}
 	invalid := map[int]error{}
+	callStages := make([]int64, len(calls))
+	goalUpdateStages := make([]int64, 0, 1)
+	askCalls := make([]int, 0, 1)
 	for i, call := range calls {
 		stage, err := toolCallStage(call)
 		if err != nil {
 			invalid[i] = codedToolError("E_BAD_ARGS", fmt.Errorf("toolCallIndex %d (%s): %w", i, call.Function.Name, err))
 			continue
 		}
-		groups[stage] = append(groups[stage], i)
+		callStages[i] = stage
+		switch normalizeToolName(call.Function.Name) {
+		case "goal_update":
+			goalUpdateStages = append(goalUpdateStages, stage)
+		case "ask":
+			askCalls = append(askCalls, i)
+		}
+	}
+	if len(goalUpdateStages) > 0 && len(askCalls) > 0 {
+		maxUpdateStage := goalUpdateStages[0]
+		for _, stage := range goalUpdateStages[1:] {
+			if stage > maxUpdateStage {
+				maxUpdateStage = stage
+			}
+		}
+		for _, i := range askCalls {
+			if callStages[i] <= maxUpdateStage {
+				if maxUpdateStage >= toolshared.MaxToolStage {
+					invalid[i] = codedToolError("E_BAD_ARGS", fmt.Errorf("ask must run after goal_update, but no later tool stage is available"))
+					continue
+				}
+				callStages[i] = maxUpdateStage + 1
+			}
+		}
+	}
+	for i := range calls {
+		if invalid[i] == nil {
+			groups[callStages[i]] = append(groups[callStages[i]], i)
+		}
 	}
 	if len(invalid) > 0 {
 		for i, call := range calls {

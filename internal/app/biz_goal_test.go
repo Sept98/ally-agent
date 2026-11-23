@@ -27,6 +27,84 @@ func TestGoalUpdatesCannotShareBatchWithOtherTools(t *testing.T) {
 		if len(conflicts) != 2 || toolErrorCode(conflicts[0]) != "E_GOAL_UPDATE_BATCH_CONFLICT" || toolErrorCode(conflicts[1]) != "E_GOAL_UPDATE_BATCH_CONFLICT" {
 			t.Fatalf("terminal goal update batch conflicts = %#v", conflicts)
 		}
+		if !strings.Contains(conflicts[0].Error(), "Run other tools first") || !strings.Contains(conflicts[0].Error(), "goal_update alone") {
+			t.Fatalf("batch conflict did not tell the model how to recover: %v", conflicts[0])
+		}
+	}
+}
+
+func TestGoalSessionUsesGoalStagesInsteadOfSeparatePlanTool(t *testing.T) {
+	app := newAppState(t.TempDir())
+	normal := toolFunctionNames(app.buildToolsForSession("normal-session", ConfigState{}))
+	if !containsString(normal, "plan") || containsString(normal, "goal_update") {
+		t.Fatalf("normal session toolset changed: plan=%v goal_update=%v", containsString(normal, "plan"), containsString(normal, "goal_update"))
+	}
+	store, err := app.goalStoreInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{ID: "goal-plan", SessionID: "goal-session", Workspace: t.TempDir(), Title: "goal plan", Status: GoalStatusActive, MaxRuns: 5}
+	if err := store.Create(goal); err != nil {
+		t.Fatal(err)
+	}
+	goalTools := toolFunctionNames(app.buildToolsForSession(goal.SessionID, ConfigState{}))
+	if containsString(goalTools, "plan") || !containsString(goalTools, "goal_update") {
+		t.Fatalf("goal session should use only the persisted Goal plan: plan=%v goal_update=%v", containsString(goalTools, "plan"), containsString(goalTools, "goal_update"))
+	}
+}
+
+func TestGoalProgressUpdateEmitsRefreshedStages(t *testing.T) {
+	app := newAppState(t.TempDir())
+	store, err := app.goalStoreInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{ID: "stage-sync", SessionID: "s-stage-sync", Workspace: t.TempDir(), Title: "stage sync", Status: GoalStatusActive, PreflightRequired: true, MaxRuns: 5}
+	if err := store.Create(goal); err != nil {
+		t.Fatal(err)
+	}
+	sink := &captureEventSink{}
+	app.events = sink
+	ready, noClarification := true, false
+	stages := []GoalStageUpdate{{Title: "Foundation", Objective: "Create the project structure", Status: "active"}}
+	updated, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{
+		Status: "progress", Progress: "starting implementation", PreflightSummary: "Requirements are clear; implement in ordered stages.",
+		PreflightReady: &ready, ClarificationRequired: &noClarification,
+		Acceptance: []string{"the project builds"}, Stages: stages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sink.count != 1 || sink.name != "goal:update" {
+		t.Fatalf("progress update did not emit goal:update: count=%d event=%q", sink.count, sink.name)
+	}
+	payload, ok := sink.payload.(map[string]any)
+	if !ok {
+		t.Fatalf("goal update payload has type %T", sink.payload)
+	}
+	emitted, ok := payload["goal"].(Goal)
+	if !ok || emitted.Revision != updated.Revision || emitted.PreflightReady != true || len(emitted.Stages) != 1 || emitted.Stages[0].Status != "active" {
+		t.Fatalf("goal:update did not carry the saved preflight and stage state: %#v", payload["goal"])
+	}
+}
+
+func TestUnresolvedPreflightMustWaitOnAskInsteadOfNeedsUser(t *testing.T) {
+	app := newAppState(t.TempDir())
+	store, err := app.goalStoreInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{ID: "ask-first", SessionID: "s-ask-first", Workspace: t.TempDir(), Title: "ask first", Status: GoalStatusActive, PreflightRequired: true, PreflightSummary: "A decision is needed.", ClarificationRequired: true, Acceptance: []string{"the chosen option is implemented"}, MaxRuns: 5}
+	if err := store.Create(goal); err != nil {
+		t.Fatal(err)
+	}
+	_, err = app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "needs_user", Progress: "waiting"})
+	if toolErrorCode(err) != "E_GOAL_CLARIFICATION_REQUIRED" || !strings.Contains(err.Error(), "call ask alone") || !strings.Contains(err.Error(), "status=progress") {
+		t.Fatalf("unresolved preflight returned an unhelpful needs_user error: %v", err)
+	}
+	got, _ := store.Get(goal.ID)
+	if got.Status != GoalStatusActive || got.PreflightReady {
+		t.Fatalf("invalid needs_user call changed the unresolved goal: %+v", got)
 	}
 }
 
@@ -162,6 +240,11 @@ func TestGoalCompletionRequiresOrderedStagesAndEvidence(t *testing.T) {
 	}
 	if _, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "completed", Progress: "done", Acceptance: criteria, Stages: stages}); err == nil {
 		t.Fatal("goal completed with unfinished stages")
+	}
+	stages[0].Status = "completed"
+	stages[0].Evidence = "reviewed relevant files"
+	if _, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "progress", Progress: "done", Acceptance: criteria, Stages: stages}); err == nil || !strings.Contains(err.Error(), "stages[0].verifications") || !strings.Contains(err.Error(), "goal_update runs those commands") {
+		t.Fatalf("missing stage checks did not give a corrective instruction: %v", err)
 	}
 	stages = []GoalStageUpdate{{Title: "Inspect", Objective: "Inspect relevant behavior", Status: "completed", Evidence: "reviewed relevant files", Verifications: []GoalVerificationSpec{{Name: "inspect checkpoint", Command: "echo inspected"}}}, {Title: "Implement", Objective: "Implement and test the feature", Status: "active"}}
 	if _, err := app.updateGoalForSession(goal.SessionID, GoalUpdateRequest{Status: "progress", Progress: "implementation", Acceptance: criteria, Stages: stages}); err != nil {

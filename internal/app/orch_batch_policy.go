@@ -140,7 +140,7 @@ func detectToolBatchConflicts(cfg ConfigState, calls []openai.ToolCall, purposeF
 		if !goalUpdateOwnsBatch(call) {
 			continue
 		}
-		err := codedToolError("E_GOAL_UPDATE_BATCH_CONFLICT", errors.New("goal_update must be the only tool call in its batch; no tool in this batch was executed"))
+		err := codedToolError("E_GOAL_UPDATE_BATCH_CONFLICT", errors.New("goal_update must be the only tool call in its assistant response; no tool in this batch was executed. Run other tools first, then send goal_update alone in a new response"))
 		for i := range calls {
 			conflicts[i] = err
 		}

@@ -476,16 +476,20 @@ func (a *desktop) applyToolEvent(t *conversation, name string, p map[string]any)
 		t.Status = locales.Text("正在使用 ") + toolName
 	}
 	if goal, ok := a.goals[t.ID]; ok && (goal.Status == backend.GoalStatusActive || goal.Status == backend.GoalStatusPending) {
-		if name == "tool:result" || name == "tool:error" {
-			t.uiState().GoalActivity = ""
-		} else {
-			activity := "正在执行：" + toolName
-			if args, ok := p["args"].(map[string]any); ok {
-				if purpose := str(args, "purpose"); purpose != "" {
-					activity += " · " + strings.Join(strings.Fields(purpose), " ")
-				}
+		state := t.uiState()
+		activity := goalToolActivity(m)
+		switch name {
+		case "tool:result":
+			state.GoalActivity = ""
+			state.GoalLastActivity = "刚完成：" + activity
+		case "tool:error":
+			state.GoalActivity = ""
+			state.GoalLastActivity = "刚失败：" + activity
+			if detail := str(p, "error"); detail != "" {
+				state.GoalLastActivity += " · " + boundedGoalText(detail, 140)
 			}
-			t.uiState().GoalActivity = activity
+		default:
+			state.GoalActivity = activity
 		}
 	}
 	if name == "tool:result" || name == "tool:error" {

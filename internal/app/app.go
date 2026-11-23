@@ -2323,12 +2323,25 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 	var planCheckRequest *openai.ChatCompletionMessage
 	var goalInitialRequest *openai.ChatCompletionMessage
 	var goalContinueRequest *openai.ChatCompletionMessage
+	var goalCheckpointRequest *openai.ChatCompletionMessage
 	goalContinuations := 0
 	if req.GoalID != "" {
 		if store, err := a.goalStoreInstance(); err == nil {
 			if goal, ok := store.Get(req.GoalID); ok && goal.SessionID == sessionID {
 				goalInitialRequest = &openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: goalStartMessage(goal)}
 			}
+		}
+	}
+	queueGoalCheckpoint := func() {
+		if req.GoalID == "" || goalInitialRequest != nil {
+			return
+		}
+		store, err := a.goalStoreInstance()
+		if err != nil {
+			return
+		}
+		if goal, ok := store.Get(req.GoalID); ok && goal.SessionID == sessionID && goal.Status == GoalStatusActive {
+			goalCheckpointRequest = goalCheckpointMessage(goal)
 		}
 	}
 	finish := runFinish{
@@ -2455,6 +2468,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 				messages = newMessages
 				bd = syncBreakdown(messages, true)
 				usedTokens = bd.Total
+				queueGoalCheckpoint()
 				a.emit("run:compacted", payload)
 			} else if !isCompactSkip(compactErr) {
 				failure := map[string]any{"sessionId": sessionID, "error": compactErr.Error()}
@@ -2486,6 +2500,11 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			requestTrigger = "goal_continuation"
 			requestMessages = append(append(make([]openai.ChatCompletionMessage, 0, len(messages)+1), messages...), *goalContinueRequest)
 			goalContinueRequest = nil
+		}
+		if goalCheckpointRequest != nil {
+			requestTrigger = "goal_checkpoint"
+			requestMessages = appendGoalCheckpoint(requestMessages, goalCheckpointRequest)
+			goalCheckpointRequest = nil
 		}
 
 		toolCalls := []openai.ToolCall{}
@@ -2596,6 +2615,11 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 				messages = newMessages
 				requestMessages = messages
 				syncBreakdown(messages, true)
+				queueGoalCheckpoint()
+				if goalCheckpointRequest != nil {
+					requestMessages = appendGoalCheckpoint(requestMessages, goalCheckpointRequest)
+					goalCheckpointRequest = nil
+				}
 				a.emit("run:compacted", payload)
 				continue
 			}
@@ -3057,6 +3081,14 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
 			data, err = a.executeAsk(ctx, sessionID, req)
+		}
+		if err == nil {
+			askResult, ok := data.(AskResult)
+			if !ok {
+				err = codedToolError("E_GOAL_STATE", errors.New("ask returned an invalid result"))
+			} else {
+				err = a.markGoalClarificationAnswered(ctx, sessionID, askResult.AskID)
+			}
 		}
 	case "suggest":
 		var req struct {
@@ -3558,6 +3590,9 @@ func (a *App) executeAsk(ctx context.Context, sessionID string, req AskRequest) 
 		}
 		a.askMu.Unlock()
 	}()
+	if err := a.bindGoalClarificationAsk(ctx, sessionID, askID); err != nil {
+		return AskResult{}, err
+	}
 
 	payload := map[string]any{"askId": askID, "sessionId": sessionID, "questions": req.Questions}
 	if meta, ok := ctx.Value(toolExecutionMetaContextKey{}).(toolExecutionMeta); ok {

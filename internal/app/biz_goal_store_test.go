@@ -145,8 +145,8 @@ func TestGoalStoreAcceptsLegacyGoalWithoutNewMetadata(t *testing.T) {
 		t.Fatalf("legacy goal without stage/review/delivery fields rejected: %v", err)
 	}
 	got, ok := store.Get("legacy")
-	if !ok || got.Status != GoalStatusPaused || len(got.Stages) != 0 || len(got.Deliverables) != 0 {
-		t.Fatalf("unexpected legacy goal: %+v, %v", got, ok)
+	if !ok || got.Status != GoalStatusPaused || len(got.Stages) != 0 || len(got.Deliverables) != 0 || !got.PreflightRequired || got.PreflightReady {
+		t.Fatalf("legacy goal was not safely migrated to require preflight: %+v, %v", got, ok)
 	}
 }
 

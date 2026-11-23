@@ -179,6 +179,7 @@ Basic layout primitives and `Base` parts remain directly available from `ui`.
 | 下拉浮层、弹窗 | 淡入淡出，最多 4–6 DIP 位移，不弹跳 | 180ms |
 | 全局悬浮通知 | 淡入淡出、4 DIP 位移，连续通知的位置平滑过渡 | 180ms |
 | 折叠内容 | 优先原生 Collapsible；已有自定义触发器使用 Reveal 平滑高度并裁剪内容 | 200ms |
+| Goal 阶段进度 | 仅阶段检查点变化时平滑插值进度值；不动画化流式文字 | 280ms |
 
 - 只给状态变化添加过渡，不给静态文字、正常输入、流式输出每个 token 加动画。
 - 悬停和按下不得改变按钮尺寸、字重、内边距或文字位置；不使用放大、弹跳或循环闪烁。

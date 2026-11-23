@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	maxGoalAutoContinuations = 3
+	maxGoalAutoContinuations = 8
 	maxGoalStepsPerRun       = 200
 )
 
@@ -46,6 +46,12 @@ func (a *App) checkGoalToolExecution(ctx context.Context, sessionID, name string
 		return codedToolError("E_GOAL_TERMINAL", fmt.Errorf("goal is %q; no more tools may run in this goal turn", goal.Status))
 	}
 	if !goalPreflightToolAllowed(name) {
+		if goal.PreflightRequired && !goal.PreflightReady {
+			return codedToolError("E_GOAL_PREFLIGHT_REQUIRED", errors.New("complete careful goal understanding, ordered stage decomposition, acceptance criteria, and any required user clarification before side effects"))
+		}
+		if goal.ClarificationRequired && !goal.ClarificationAnswered {
+			return codedToolError("E_GOAL_CLARIFICATION_REQUIRED", errors.New("wait for the user's answer to the required clarification before side effects"))
+		}
 		for i, stage := range goal.Stages {
 			if stage.ReviewRequired {
 				return codedToolError("E_GOAL_STAGE_REVIEW_REQUIRED", fmt.Errorf("stage %d failed verification repeatedly; submit a structured stage_review before further side effects", i+1))
@@ -95,14 +101,17 @@ type GoalStageReviewRequest struct {
 }
 
 type GoalUpdateRequest struct {
-	Status           string                 `json:"status"`
-	Progress         string                 `json:"progress"`
-	Acceptance       []string               `json:"acceptance"`
-	Stages           []GoalStageUpdate      `json:"stages"`
-	Verifications    []GoalVerificationSpec `json:"verifications"`
-	StageReview      GoalStageReviewRequest `json:"stage_review"`
-	DeliverablePaths []string               `json:"deliverable_paths"`
-	DeliverySummary  string                 `json:"delivery_summary,omitempty"`
+	Status                string                 `json:"status"`
+	Progress              string                 `json:"progress"`
+	PreflightSummary      string                 `json:"preflight_summary"`
+	PreflightReady        *bool                  `json:"preflight_ready"`
+	ClarificationRequired *bool                  `json:"clarification_required"`
+	Acceptance            []string               `json:"acceptance"`
+	Stages                []GoalStageUpdate      `json:"stages"`
+	Verifications         []GoalVerificationSpec `json:"verifications"`
+	StageReview           GoalStageReviewRequest `json:"stage_review"`
+	DeliverablePaths      []string               `json:"deliverable_paths"`
+	DeliverySummary       string                 `json:"delivery_summary,omitempty"`
 }
 
 func (a *App) goalStoreInstance() (*GoalStore, error) {
@@ -185,7 +194,7 @@ func (a *App) StartGoal(req GoalStartRequest) (Goal, string, error) {
 		identity := *cfg.LastUsedModel
 		model = &identity
 	}
-	g := Goal{ID: newID(), SessionID: sessionID, Workspace: workspace, Title: title, Details: objective, Acceptance: append([]string(nil), req.Acceptance...), Model: model, Status: GoalStatusPending, MaxRuns: maxGoalRunBudget}
+	g := Goal{ID: newID(), SessionID: sessionID, Workspace: workspace, Title: title, Details: objective, Acceptance: append([]string(nil), req.Acceptance...), PreflightRequired: true, Model: model, Status: GoalStatusPending, MaxRuns: maxGoalRunBudget}
 	if err := store.Create(g); err != nil {
 		return Goal{}, "", err
 	}
@@ -210,6 +219,11 @@ func goalStartMessage(g Goal) string {
 	var b strings.Builder
 	b.WriteString("执行这个持久目标，直到达到验收条件；不要只给方案或中途总结。\n\n目标：\n")
 	b.WriteString(g.Details)
+	if !g.PreflightReady {
+		b.WriteString("\n\n【Goal 工具批次规则】每次 assistant 回复最多发出一个 goal_update，且该回复不能同时调用任何其他工具；需要读写或运行命令时先分开调用工具，最后单独调用 goal_update。\n\n【强制前置阶段】在任何副作用操作前，先仔细理解目标：明确用户要解决的问题、范围、预期产物、约束、依赖和风险；再把工作拆成有顺序、可独立验收的阶段。首个 goal_update 必须提交 preflight_summary（理解与拆分摘要）、完整 acceptance 和 stages，并明确设置 clarification_required 与 preflight_ready。若关键细节缺失，且不同答案会改变实现、范围、数据或风险，必须先把 clarification_required=true、preflight_ready=false 写入 status=progress 的 goal_update；之后单独调用 ask 提出具体、精简的问题并等待用户回答。ask 会让运行等待用户，不要再用 status=needs_user 调用 goal_update 来表示等待。收到回答后更新理解摘要/计划，再设 preflight_ready=true。信息足够时也必须明确记录为何无需澄清，并设 clarification_required=false、preflight_ready=true。只读调查可以在 preflight 完成前进行；不得猜测关键要求，不得进行任何写入、命令、发布或其他副作用。后端会拒绝未完成前置阶段的副作用。")
+	} else {
+		b.WriteString("\n\n【Goal 工具批次规则】每次 assistant 回复最多发出一个 goal_update，且该回复不能同时调用任何其他工具；需要读写或运行命令时先分开调用工具，最后单独调用 goal_update。\n\n前置理解与阶段拆分已完成；沿用已保存的范围与验收标准继续，不要重复规划。若后续发现必须由用户决定的关键歧义，先将 clarification_required=true、preflight_ready=false 写入 goal_update，再用 ask 等待答复；答复后更新摘要并重新设为 ready。")
+	}
 	if len(g.Acceptance) > 0 {
 		b.WriteString("\n\n验收条件：\n")
 		for i, item := range g.Acceptance {
@@ -218,8 +232,106 @@ func goalStartMessage(g Goal) string {
 	} else {
 		b.WriteString("\n\n在产生任何副作用前，先整理可观察、可验证的验收条件和有序阶段，并用 goal_update 的 acceptance、stages 字段持久化；阶段包含 title、status（pending/active/completed）、evidence。每次更新都携带完整 stages；每次只推进一个阶段，完成阶段时记录具体证据。若目标有关键歧义，先用 ask 取得用户确认，不要擅自假设。")
 	}
-	b.WriteString("\ngoal_update 首次更新时设定 acceptance；此后不要重写或改述验收条件，后续调用省略 acceptance 字段，已保存条件始终生效。若确需改变目标范围，先用 needs_user 向用户询问。每次携带完整 stages；stage 必须含 title、objective、status、evidence、verifications。完成某阶段前提供该阶段 named verification commands；Ally 实际运行后仅在所有命令退出码为0时才把阶段检查点记为完成。失败计数按阶段持久化，连续失败3次会要求先提交 stage_review，选择 revise（需给新 title/objective）、continue（说明复核理由）或 needs_user；复核前后端阻止所有副作用工具。每阶段 attempt、检查记录和方案修订历史会持久保存。最终 completed 必须再次提供集成验收命令、简短 delivery_summary；若有文件产物，列出 workspace-relative deliverable_paths；每项必须是普通文件路径，目录请拆成实际文件分别列出，Ally 会确认文件存在并记录 SHA-256。命令在目标工作区沙箱内运行，每条最多120秒；文件路径不允许逃出工作区。只有阶段检查、最终命令及交付物路径检查全部成功后，Ally 才会调用使用同一模型、但拥有独立上下文和专用判定提示词的验收子 agent 审核证据；模型自述完成、命令退出码为0都不能单独证明语义达标。复核不通过会重新打开其指出的阶段，你必须补齐证据或修复后再提交，不能继续宣称完成；复核调用失败或结果无效时目标保持未完成。无法继续时报告 needs_user。普通回答不代表完成。每个阶段开始时，主 agent 都要先判断是否有边界清晰、互不冲突的只读调查、测试设计或 diff review 值得委派给 subagent；有明显并行收益时才委派，否则由主 agent 执行并简述原因，避免为形式调用子代理。把是否委派及子代理任务简短写入阶段 progress/evidence，主 agent 必须核实子代理报告并亲自运行验收命令，不能把子代理的完成声明当证据。代码修改及其他副作用仍由主 agent 控制。")
+	b.WriteString("\ngoal_update 首次更新时设定 acceptance；此后不要重写或改述验收条件，后续调用省略 acceptance 字段，已保存条件始终生效。若确需改变目标范围，先用 needs_user 向用户询问。每次携带完整 stages；每个 stage 必须包含 title、objective、status、evidence、verifications（无检查命令时传空数组）；已保存阶段的 title 和 objective 必须逐字照抄，不得改写，只有连续失败达到阈值后才能通过 stage_review 修订。stage_review 的 stage 是从 1 开始的阶段编号，只能复核已达到失败阈值的阶段；未达到阈值时继续修复并重试。完成某阶段前提供该阶段 named verification commands；Ally 实际运行后仅在所有命令退出码为0时才把阶段检查点记为完成。失败计数按阶段持久化，连续失败3次会要求先提交 stage_review，选择 revise（需给新 title/objective）、continue（说明复核理由）或 needs_user；复核前后端阻止所有副作用工具。每阶段 attempt、检查记录和方案修订历史会持久保存。最终 completed 必须再次提供集成验收命令、简短 delivery_summary；若有文件产物，列出 workspace-relative deliverable_paths；每项必须是普通文件路径，目录请拆成实际文件分别列出，Ally 会确认文件存在并记录 SHA-256。命令在目标工作区沙箱内运行，每条最多120秒；文件路径不允许逃出工作区。只有阶段检查、最终命令及交付物路径检查全部成功后，Ally 才会调用使用同一模型、但拥有独立上下文和专用判定提示词的验收子 agent 审核证据；模型自述完成、命令退出码为0都不能单独证明语义达标。复核不通过会重新打开其指出的阶段，你必须补齐证据或修复后再提交，不能继续宣称完成；复核调用失败或结果无效时目标保持未完成。无法继续时报告 needs_user。普通回答不代表完成。每个阶段开始时，主 agent 都要先判断是否有边界清晰、互不冲突的只读调查、测试设计或 diff review 值得委派给 subagent；有明显并行收益时才委派，否则由主 agent 执行并简述原因，避免为形式调用子代理。把是否委派及子代理任务简短写入阶段 progress/evidence，主 agent 必须核实子代理报告并亲自运行验收命令，不能把子代理的完成声明当证据。代码修改及其他副作用仍由主 agent 控制。")
 	return b.String()
+}
+
+// goalCheckpointMessage re-injects the persisted goal state after a history
+// rewrite. Chat summaries are useful context, but are not the source of truth.
+func goalCheckpointMessage(g Goal) *openai.ChatCompletionMessage {
+	type checkpointStage struct {
+		Title               string             `json:"title"`
+		Objective           string             `json:"objective"`
+		Status              string             `json:"status"`
+		Evidence            string             `json:"evidence,omitempty"`
+		FailuresSinceReview int                `json:"failures_since_review,omitempty"`
+		ReviewRequired      bool               `json:"review_required,omitempty"`
+		Checks              []GoalVerification `json:"checks,omitempty"`
+	}
+	type checkpoint struct {
+		Title                 string                `json:"title"`
+		Objective             string                `json:"objective"`
+		Acceptance            []string              `json:"acceptance"`
+		Status                GoalStatus            `json:"status"`
+		Progress              string                `json:"progress,omitempty"`
+		PreflightSummary      string                `json:"preflight_summary,omitempty"`
+		PreflightReady        bool                  `json:"preflight_ready"`
+		ClarificationRequired bool                  `json:"clarification_required"`
+		ClarificationAnswered bool                  `json:"clarification_answered"`
+		Stages                []checkpointStage     `json:"stages"`
+		FinalChecks           []GoalVerification    `json:"final_checks,omitempty"`
+		Review                *GoalCompletionReview `json:"completion_review,omitempty"`
+	}
+	state := checkpoint{
+		Title: g.Title, Objective: g.Details, Acceptance: append([]string(nil), g.Acceptance...),
+		Status: g.Status, Progress: g.Progress, Review: g.CompletionReview,
+		PreflightSummary: g.PreflightSummary, PreflightReady: g.PreflightReady,
+		ClarificationRequired: g.ClarificationRequired, ClarificationAnswered: g.ClarificationAnswered,
+	}
+	for _, stage := range g.Stages {
+		state.Stages = append(state.Stages, checkpointStage{
+			Title: stage.Title, Objective: stage.Objective, Status: stage.Status,
+			Evidence: stage.Evidence, FailuresSinceReview: stage.FailuresSinceReview,
+			ReviewRequired: stage.ReviewRequired, Checks: append([]GoalVerification(nil), stage.Verifications...),
+		})
+	}
+	state.FinalChecks = append([]GoalVerification(nil), g.Verifications...)
+	data, _ := json.Marshal(state)
+	return &openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: "<ally-goal-checkpoint>\nThe transcript was compacted. Treat this persisted goal snapshot as authoritative; continue the unfinished work, preserve the fixed acceptance criteria, and do not repeat completed stages. This is context only, not a user scope change.\n" + string(data) + "\n</ally-goal-checkpoint>",
+	}
+}
+
+func appendGoalCheckpoint(messages []openai.ChatCompletionMessage, checkpoint *openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
+	if checkpoint == nil {
+		return messages
+	}
+	request := make([]openai.ChatCompletionMessage, 0, len(messages)+1)
+	request = append(request, messages...)
+	return append(request, *checkpoint)
+}
+
+func (a *App) bindGoalClarificationAsk(ctx context.Context, sessionID, askID string) error {
+	goalID, _ := ctx.Value(goalRunContextKey{}).(string)
+	if goalID == "" || askID == "" {
+		return nil
+	}
+	store, err := a.goalStoreInstance()
+	if err != nil {
+		return codedToolError("E_GOAL_STATE", err)
+	}
+	return store.Update(goalID, func(goal *Goal) error {
+		if goal.SessionID != sessionID || goal.Status != GoalStatusActive {
+			return codedToolError("E_GOAL_STATE", errors.New("goal is no longer active in this session"))
+		}
+		if goal.PreflightRequired && goal.ClarificationRequired && !goal.PreflightReady {
+			goal.ClarificationAskID = askID
+		}
+		return nil
+	})
+}
+
+func (a *App) markGoalClarificationAnswered(ctx context.Context, sessionID, askID string) error {
+	goalID, _ := ctx.Value(goalRunContextKey{}).(string)
+	if goalID == "" {
+		return nil
+	}
+	store, err := a.goalStoreInstance()
+	if err != nil {
+		return codedToolError("E_GOAL_STATE", err)
+	}
+	return store.Update(goalID, func(goal *Goal) error {
+		if goal.SessionID != sessionID || goal.Status != GoalStatusActive {
+			return codedToolError("E_GOAL_STATE", errors.New("goal is no longer active in this session"))
+		}
+		if !goal.ClarificationRequired || goal.PreflightReady || goal.ClarificationAskID == "" || goal.ClarificationAskID != askID {
+			return nil
+		}
+		goal.ClarificationAnswered = true
+		goal.ClarificationAskID = ""
+		return nil
+	})
 }
 
 func (a *App) attachGoalRun(goalID, sessionID, runID string) error {
@@ -309,6 +421,42 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 	if progress == "" {
 		return Goal{}, errors.New("progress must not be empty")
 	}
+	preflightSummary := strings.TrimSpace(req.PreflightSummary)
+	preflightReady := active.PreflightReady
+	clarificationRequired := active.ClarificationRequired
+	clarificationAnswered := active.ClarificationAnswered
+	if len([]rune(preflightSummary)) > maxGoalProgressRunes {
+		return Goal{}, errors.New("preflight summary is too long")
+	}
+	if active.PreflightRequired {
+		if active.PreflightSummary == "" && (preflightSummary == "" || req.PreflightReady == nil || req.ClarificationRequired == nil) {
+			return Goal{}, errors.New("the first goal update must include a careful preflight summary, preflight_ready, and clarification_required")
+		}
+		if req.PreflightReady != nil {
+			preflightReady = *req.PreflightReady
+		}
+		if req.ClarificationRequired != nil {
+			clarificationRequired = *req.ClarificationRequired
+		}
+		if req.PreflightReady != nil && !*req.PreflightReady && clarificationRequired {
+			clarificationAnswered = false
+		}
+		if preflightSummary == "" {
+			preflightSummary = active.PreflightSummary
+		}
+		if preflightReady && preflightSummary == "" {
+			return Goal{}, errors.New("preflight_ready requires a persisted understanding and stage-decomposition summary")
+		}
+		if preflightReady && (active.ClarificationRequired && !clarificationAnswered || clarificationRequired && !clarificationAnswered) {
+			return Goal{}, codedToolError("E_GOAL_CLARIFICATION_REQUIRED", errors.New("the required ask must be answered before marking preflight_ready"))
+		}
+		if preflightReady && clarificationAnswered && !active.PreflightReady && strings.TrimSpace(req.PreflightSummary) == "" {
+			return Goal{}, errors.New("after user clarification, update preflight_summary with the answer before marking ready")
+		}
+		if status == "needs_user" && !preflightReady {
+			return Goal{}, codedToolError("E_GOAL_CLARIFICATION_REQUIRED", errors.New("do not set status=needs_user while preflight is unresolved; call ask alone and wait for the user's answer. Keep the goal active with preflight_ready=false, then update the summary and plan with status=progress after the answer"))
+		}
+	}
 	acceptance, err := normalizeGoalAcceptance(req.Acceptance)
 	if err != nil {
 		return Goal{}, err
@@ -339,6 +487,14 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 	if stageCount > maxGoalStageItems {
 		return Goal{}, errors.New("too many goal stages")
 	}
+	if active.PreflightRequired && !preflightReady {
+		for i, stage := range req.Stages {
+			wasCompleted := i < len(active.Stages) && active.Stages[i].Status == "completed"
+			if stage.Status == "completed" && !wasCompleted {
+				return Goal{}, fmt.Errorf("stage %d cannot be completed until preflight is ready", i+1)
+			}
+		}
+	}
 	nextStages := make([]GoalStage, stageCount)
 	if len(req.Stages) == 0 {
 		nextStages = append([]GoalStage(nil), active.Stages...)
@@ -362,7 +518,7 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 			if len(active.Stages) > 0 {
 				previous := active.Stages[i]
 				if previous.Title != stage.Title || previous.Objective != "" && previous.Objective != stage.Objective {
-					return Goal{}, errors.New("stage titles and objectives are fixed; repeated failures require stage_review")
+					return Goal{}, fmt.Errorf("stage %d title/objective are fixed: resend the saved values exactly (title=%q, objective=%q); only revise them through stage_review after this stage reaches %d consecutive verification failures", i+1, previous.Title, previous.Objective, goalStageReviewFailureThreshold)
 				}
 				if previous.Status == "completed" && stage.Status != "completed" {
 					return Goal{}, fmt.Errorf("completed stage %d cannot be reopened except through stage_review", i+1)
@@ -428,7 +584,7 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 		}
 		specs := req.Stages[i].Verifications
 		if len(specs) == 0 {
-			return Goal{}, fmt.Errorf("stage %d needs at least one Ally-run verification command before it can be completed", i+1)
+			return Goal{}, fmt.Errorf("stage %d cannot be marked completed: add at least one named command to stages[%d].verifications; goal_update runs those commands itself, then retry the update", i+1, i)
 		}
 		results, failed, runErr := a.runGoalVerificationCommands(ctx, verifyCfg, specs)
 		if runErr != nil {
@@ -450,7 +606,7 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 				nextStages[j].Evidence = ""
 			}
 			reason := stageVerificationFailureMessage(i, nextStages[i])
-			updated, persistErr := a.persistGoalProgress(store, active.ID, acceptance, nextStages, reason)
+			updated, persistErr := a.persistGoalProgress(store, active.ID, acceptance, nextStages, reason, preflightSummary, preflightReady, clarificationRequired, clarificationAnswered)
 			if persistErr != nil {
 				return Goal{}, fmt.Errorf("stage verification failed and checkpoint could not be persisted: %w", persistErr)
 			}
@@ -583,7 +739,7 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 		a.emitGoalUpdate(completed)
 		return completed, nil
 	}
-	updated, persistErr := a.persistGoalProgress(store, active.ID, acceptance, nextStages, progress)
+	updated, persistErr := a.persistGoalProgress(store, active.ID, acceptance, nextStages, progress, preflightSummary, preflightReady, clarificationRequired, clarificationAnswered)
 	if persistErr != nil {
 		return Goal{}, persistErr
 	}
@@ -599,8 +755,8 @@ func (a *App) updateGoalForSessionWithConfig(ctx context.Context, sessionID stri
 			return Goal{}, err
 		}
 		updated, _ = store.Get(active.ID)
-		a.emitGoalUpdate(updated)
 	}
+	a.emitGoalUpdate(updated)
 	return updated, nil
 }
 
@@ -766,7 +922,7 @@ func (a *App) runGoalVerificationCommands(ctx context.Context, cfg ConfigState, 
 	return results, nil, nil
 }
 
-func (a *App) persistGoalProgress(store *GoalStore, goalID string, acceptance []string, stages []GoalStage, progress string) (Goal, error) {
+func (a *App) persistGoalProgress(store *GoalStore, goalID string, acceptance []string, stages []GoalStage, progress, preflightSummary string, preflightReady, clarificationRequired, clarificationAnswered bool) (Goal, error) {
 	if err := store.Update(goalID, func(g *Goal) error {
 		if g.Status != GoalStatusActive {
 			return errors.New("goal is no longer active")
@@ -780,6 +936,12 @@ func (a *App) persistGoalProgress(store *GoalStore, goalID string, acceptance []
 		g.DeliverySummary = ""
 		g.CompletionReview = nil
 		g.Progress = progress
+		if g.PreflightRequired {
+			g.PreflightSummary = preflightSummary
+			g.PreflightReady = preflightReady
+			g.ClarificationRequired = clarificationRequired
+			g.ClarificationAnswered = clarificationAnswered
+		}
 		return nil
 	}); err != nil {
 		return Goal{}, err
@@ -803,7 +965,7 @@ func (a *App) reviewGoalStage(ctx context.Context, store *GoalStore, active *Goa
 		return Goal{}, errors.New("stage_review must be reported with status progress")
 	}
 	if review.Stage < 1 || review.Stage > len(active.Stages) {
-		return Goal{}, errors.New("stage_review stage index is out of range (use one-based indexing)")
+		return Goal{}, fmt.Errorf("stage_review stage %d is out of range; stage is one-based and must be between 1 and %d", review.Stage, len(active.Stages))
 	}
 	rationale := strings.TrimSpace(review.Rationale)
 	if rationale == "" || len([]rune(rationale)) > maxGoalStageEvidenceRunes {
@@ -812,7 +974,7 @@ func (a *App) reviewGoalStage(ctx context.Context, store *GoalStore, active *Goa
 	index := review.Stage - 1
 	stage := active.Stages[index]
 	if !stage.ReviewRequired {
-		return Goal{}, errors.New("this stage has not reached the required repeated-failure review threshold")
+		return Goal{}, fmt.Errorf("stage %d has %d consecutive verification failures; stage_review is allowed only after %d failures", review.Stage, stage.FailuresSinceReview, goalStageReviewFailureThreshold)
 	}
 	decision := strings.TrimSpace(review.Decision)
 	if decision != "revise" && decision != "continue" && decision != "needs_user" {
@@ -941,7 +1103,7 @@ func (a *App) goalContinuation(sessionID, goalID string, count int) (*openai.Cha
 	stages, _ := json.Marshal(g.Stages)
 	return &openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: fmt.Sprintf("<ally-goal-continuation>\n本轮回答结束，但目标状态仍为 %q。请从检查点继续，不重复已完成工作。验收条件已经固定：后续 goal_update 必须省略 acceptance 字段，不要重新生成、改写或增加标准；如果确需改变范围，先用 needs_user 询问用户。每进入一个新阶段，先由主 agent 判断是否值得把独立只读调查、测试设计或 diff review 委派给 subagent；只在有实际并行收益时调用，否则说明由主 agent 执行的原因。主 agent 核实所有子代理报告，修改和验收仍由主 agent 负责。阶段失败达到阈值时必须先用 goal_update 的 stage_review 选择 revise/continue/needs_user；复核前不能做副作用操作。最终完成必须通过每阶段命令、最终集成命令，并提交 delivery_summary 与实际 deliverable_paths（若产物为文件）。\n当前进度：%s\n已固定验收条件（仅供核对，不要复制到请求中）：%s\n阶段检查点（JSON）：%s\n</ally-goal-continuation>", g.Status, g.Progress, criteria, stages),
+		Content: fmt.Sprintf("<ally-goal-continuation>\n本轮回答结束，但目标状态仍为 %q。请从检查点继续，不重复已完成工作。每次回复最多调用一个 goal_update，且 goal_update 必须单独成批、不得与任何其他工具同批；其他工具先分别调用。完成阶段时，在该阶段的 verifications 中提供至少一个具名验收命令；goal_update 会执行这些命令，通过后再标记完成。前置理解与拆分摘要：%s；preflight_ready=%t，clarification_required=%t，clarification_answered=%t。若尚未 ready，继续只读分析；需要用户决定时先以 status=progress 单独提交 clarification_required=true、preflight_ready=false，再单独调用 ask 并等待答复，绝不要用 status=needs_user 表示等待 ask；答复后更新摘要与完整阶段表并重新同步。没有完成前置阶段前不得进行副作用操作。若用户答复改变了范围，更新摘要与阶段计划后再继续。验收条件已经固定：后续 goal_update 必须省略 acceptance 字段，不要重新生成、改写或增加标准；如果确需改变范围，先用 ask 询问用户。每进入一个新阶段，先由主 agent 判断是否值得把独立只读调查、测试设计或 diff review 委派给 subagent；只在有实际并行收益时调用，否则说明由主 agent 执行的原因。主 agent 核实所有子代理报告，修改和验收仍由主 agent 负责。阶段失败达到阈值时必须先用 goal_update 的 stage_review 选择 revise/continue/needs_user；复核前不能做副作用操作。最终完成必须通过每阶段命令、最终集成命令，并提交 delivery_summary 与实际 deliverable_paths（若产物为文件）。\n当前进度：%s\n已固定验收条件（仅供核对，不要复制到请求中）：%s\n阶段检查点（JSON）：%s\n</ally-goal-continuation>", g.Status, g.PreflightSummary, g.PreflightReady, g.ClarificationRequired, g.ClarificationAnswered, g.Progress, criteria, stages),
 	}, true
 }
 
