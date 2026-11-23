@@ -4,6 +4,7 @@ package desktop
 import (
 	"ally-dev/desktop/uikit"
 	"ally-dev/locales"
+	backend "ally-dev/internal/app"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,53 +15,53 @@ import (
 	"github.com/egoist/mygo/ui/markdown"
 )
 
-// toolDescriptor is the single table that classifies tool cards: the verb
-// shown for each state, whether the body expands, and where the preview
-// comes from. Cards never re-derive these per site.
+// toolDescriptor defines a stable operation label and the card's disclosure and timing behavior.
 type toolDescriptor struct {
-	runningVerb string
-	doneVerb    string
-	failedVerb  string
-	expandable  bool
-	showTiming  bool
+	label      string
+	expandable bool
+	showTiming bool
 }
 
-// failedVerb exists because a card in error state must never claim
-// completion: "Edited" on a failed edit misleads the reader. Every state has
-// its own word here, so no failed verb is ever built by suffixing a done verb
-// (that produced "Remote Ran failed"). Cards read English; the folded
-// read/grep/list row writes its own Chinese counts and never reads this table.
+const (
+	mcpSearchToolKind = "toolsearch"
+	// mcpExecToolKind is the envelope every MCP call now arrives in. Its card
+	// shows the remote target instead of the envelope's own name.
+	mcpExecToolKind = "toolexec"
+)
+
 var toolTable = map[string]toolDescriptor{
-	"read":               {"Reading", "Read", "Read failed", false, false},
-	"remote_read":        {"Reading", "Read", "Read failed", false, false},
-	"edit":               {"Editing", "Edited", "Edit failed", false, false},
-	"remote_edit":        {"Editing", "Edited", "Edit failed", false, false},
-	"create":             {"Creating", "Created", "Create failed", false, false},
-	"remote_create_file": {"Creating", "Created", "Create failed", false, false},
-	"delete":             {"Deleting", "Deleted", "Delete failed", true, false},
-	"remote_delete_path": {"Deleting", "Deleted", "Delete failed", true, false},
-	"command":            {"Running", "Ran", "Command failed", true, true},
-	"remote_run_command": {"Running", "Ran", "Failed", true, true},
-	"grep":               {"Grepping", "Grep", "Grep failed", false, false},
-	"list":               {"Listing", "Listed", "List failed", true, false},
-	"glob":               {"Matching", "Matched", "Match failed", true, false},
-	"http_request":       {"Requesting", "Requested", "Request failed", true, true},
-	"web_fetch":          {"Fetching", "Fetched", "Fetch failed", true, true},
-	"calculate":          {"Calculating", "Calculated", "Calculation failed", false, false},
-	"plan":               {"Updating plan", "Plan", "Plan failed", false, false},
-	"skill":              {"Loading skill", "Loaded skill", "Skill failed", false, false},
-	"ask":                {"Asking", "Asked", "Ask failed", true, false},
-	"subagent":           {"Delegating", "Subagent", "Delegation failed", true, true},
-	"ssh_cluster":        {"Checking", "Servers", "Check failed", true, false},
-	"service":            {"Managing service", "Service", "Service failed", true, false},
-	"scheduled_task":     {"Scheduling", "Scheduled", "Scheduling failed", true, true},
-	"remote_transfer":    {"Transferring", "Transferred", "Transfer failed", true, true},
-	"screenshot":         {"Taking screenshot", "Screenshot", "Screenshot failed", true, false},
-	"render_html":        {"Rendering", "Rendered", "Render failed", true, true},
-	"suggest":            {"Suggesting", "Suggested", "Suggestion failed", true, false},
-	"wait":               {"Waiting", "Waited", "Wait failed", false, true},
-	"image_generate":     {"Generating image", "Generated image", "Image generation failed", true, true},
-	"image_edit":         {"Editing image", "Edited image", "Image edit failed", true, true},
+	"read":               {"Read", false, false},
+	"remote_read":        {"Read", false, false},
+	"edit":               {"Edit", false, false},
+	"remote_edit":        {"Edit", false, false},
+	"create":             {"Create", false, false},
+	"remote_create_file": {"Create", false, false},
+	"delete":             {"Delete", true, false},
+	"remote_delete_path": {"Delete", true, false},
+	"command":            {"Command", true, true},
+	"remote_run_command": {"Command", true, true},
+	"grep":               {"Grep", false, false},
+	"list":               {"List", true, false},
+	"fetch":              {"Fetch", true, true},
+	"http_request":       {"Fetch", true, true},
+	"web_fetch":          {"Web Fetch", true, true},
+	"calculate":          {"Calculate", false, false},
+	"plan":               {"Plan", false, false},
+	"skill":              {"Load Skill", false, false},
+	mcpSearchToolKind:    {"ToolSearch", false, false},
+	mcpExecToolKind:      {"MCP", false, false},
+	"ask":                {"Ask", true, false},
+	"subagent":           {"Subagent", true, false},
+	"ssh_cluster":        {"Cluster List", true, false},
+	"service":            {"Service", true, false},
+	"scheduled_task":     {"Scheduled Task", true, true},
+	"remote_transfer":    {"Transfer", true, true},
+	"screenshot":         {"Screenshot", true, false},
+	"render_html":        {"Render", true, true},
+	"suggest":            {"Suggestions", true, false},
+	"wait":               {"Wait", false, true},
+	"image_generate":     {"Image Generation", true, true},
+	"image_edit":         {"Image Edit", true, true},
 }
 
 // Keep the server identity consistent across independent SSH cards.
@@ -80,11 +81,17 @@ func toolSSHAlias(args map[string]any) string {
 }
 
 func toolKind(name string) string {
+	// Both MCP entry points arrive with their declared capitalisation; the table
+	// and every card rule key on the lower-case kind.
+	if strings.EqualFold(name, mcpSearchToolKind) {
+		return mcpSearchToolKind
+	}
+	if strings.EqualFold(name, mcpExecToolKind) {
+		return mcpExecToolKind
+	}
 	switch name {
 	case "list_files":
 		return "list"
-	case "Glob":
-		return "glob"
 	case "Bash":
 		return "command"
 	case "Skill":
@@ -106,9 +113,78 @@ func describeTool(name string) toolDescriptor {
 		return toolTable["edit"]
 	}
 	if strings.HasPrefix(name, "mcp__") {
-		return toolDescriptor{"Calling MCP", "Called MCP", "MCP call failed", true, true}
+		return toolDescriptor{"MCP Tool", true, true}
 	}
-	return toolDescriptor{"Calling", "Called", "Call failed", true, false}
+	return toolDescriptor{name, true, false}
+}
+
+// toolExecTarget renders a running ToolExec card's identity: the remote server
+// and tool, joined the way MCP cards have always shown them. The envelope's
+// arguments stream field by field, so the target is read only from a complete
+// snapshot: parseToolArgs fills in recovered string prefixes for a partial one,
+// and a target built from half a name would change as the call arrives.
+func toolExecTarget(args map[string]any) string {
+	if _, partial := args["_raw"]; partial {
+		return ""
+	}
+	server, tool, ok := backend.SplitMcpToolID(str(args, "name"))
+	if !ok {
+		return ""
+	}
+	return server + "/" + tool
+}
+
+// toolExecArgsSummary is what the remote tool will receive, which is the part
+// worth showing beside a card that already names the target.
+func toolExecArgsSummary(args map[string]any) string {
+	inner, ok := args["arguments"]
+	if !ok || inner == nil {
+		return ""
+	}
+	raw, err := json.Marshal(inner)
+	if err != nil {
+		return ""
+	}
+	text := string(raw)
+	if text == "{}" {
+		return ""
+	}
+	return text
+}
+
+// toolActionLabel keeps operation identity visible while reflecting its state.
+func toolActionLabel(base, state string) string {
+	var running, done string
+	switch base {
+	case "Edit":
+		running, done = "Editing", "Edited"
+	case "Create":
+		running, done = "Creating", "Created"
+	case "Delete":
+		running, done = "Deleting", "Deleted"
+	case "Start":
+		running, done = "Starting", "Started"
+	case "Stop":
+		running, done = "Stopping", "Stopped"
+	case "Restart":
+		running, done = "Restarting", "Restarted"
+	case "Read":
+		running, done = "Reading", "Read"
+	case "List":
+		running, done = "Listing", "Listed"
+	default:
+		return base
+	}
+	switch state {
+	case "running":
+		return running
+	case "success":
+		return done
+	case "error":
+		return base + " failed"
+	default:
+		return base
+	}
 }
 
 func toolState(m map[string]any) string {
@@ -157,7 +233,7 @@ func isFoldableReadTool(m map[string]any) bool {
 		name = str(m, "toolName")
 	}
 	switch toolKind(name) {
-	case "read", "batch_read", "grep", "list", "glob":
+	case "read", "batch_read", "grep", "list":
 		return true
 	}
 	return false
@@ -265,7 +341,7 @@ func toolGroupResultSummary(name string, result map[string]any) string {
 		return toolGroupReadSummary(result)
 	case "grep":
 		return toolGroupGrepSummary(result)
-	case "list", "glob":
+	case "list":
 		return toolGroupListSummary(result)
 	}
 	return ""
@@ -341,7 +417,7 @@ func (s *toolGroupSummary) count(item toolGroupItem, delta int) {
 	switch item.kind {
 	case "grep":
 		s.greps += delta
-	case "list", "glob":
+	case "list":
 		s.lists += delta
 	case "command":
 		s.commands += delta
@@ -506,8 +582,6 @@ func (a *desktop) toolActivityGroupCard(c *ui.Context, t *conversation, index in
 				entry.verb = "Grep"
 			case "list":
 				entry.verb = "List"
-			case "glob":
-				entry.verb = "Glob"
 			default:
 				entry.verb = "Read"
 			}
@@ -547,7 +621,7 @@ func (a *desktop) toolActivityGroupCard(c *ui.Context, t *conversation, index in
 	}
 
 	container.Children(func() {
-		row := ui.ButtonBase(c.Key(key+"-header")).FillWidth().Height(24).Padding(0, 8, 0, 0).Gap(gapTight).AlignItems(ui.Center).Justify(ui.Start).Cursor(ui.CursorPointer).Label(rowLabel)
+		row := ui.ButtonBase(c.Key(key + "-header")).FillWidth().Height(24).Gap(gapTight).AlignItems(ui.Center).Justify(ui.Start).Cursor(ui.CursorPointer).Label(rowLabel)
 		row.Children(func() {
 			ui.Box(c).Absolute().Left(-16).Top(0).Width(16).HeightPercent(100).Center().Children(func() {
 				toolStatusIcon(c, groupStatus)
@@ -584,7 +658,7 @@ func (a *desktop) toolActivityGroupCard(c *ui.Context, t *conversation, index in
 						}
 						purpose = locales.Text(groupPurposeFallbacks[category])
 					}
-					return groupPurposeLabel{purpose, short(purpose, 32)}
+					return groupPurposeLabel{purpose}
 				})
 				if shown > 0 {
 					// Together with the row's two 4px gaps, this separates
@@ -595,7 +669,7 @@ func (a *desktop) toolActivityGroupCard(c *ui.Context, t *conversation, index in
 				ui.Row(c.Key(fmt.Sprintf("latest-%d", category))).MinWidth(0).Shrink(1).Gap(gapTight).AlignItems(ui.Center).Children(func() {
 					disclosureIcon(c, groupToolIcons[category], a.currentPalette().accent)
 					if label.full != "" {
-						uikit.Tooltip(c, ui.Text(c, label.short).FontSize(fsTool).TextColor(a.secondaryInk()).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1), label.full)
+						uikit.Tooltip(c, ui.Text(c, label.full).FontSize(fsTool).TextColor(a.secondaryInk()).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1), label.full)
 					}
 				})
 			}
@@ -715,17 +789,11 @@ func (a *desktop) toolGroupCommandDetail(c *ui.Context, t *conversation, entry t
 	if state == "error" || (result["exitCode"] != nil && num(result, "exitCode") != 0) {
 		metadataInk = c.Theme().Danger
 	}
-	verb := toolTable["command"].doneVerb
-	if state == "pending" || state == "running" {
-		verb = toolTable["command"].runningVerb
-	} else if state == "error" {
-		verb = toolTable["command"].failedVerb
-	}
 	command := entry.title
 	if command == "" {
 		command = locales.Text("命令")
 	}
-	button := ui.ButtonBase(c.Key(key+"-group-row")).FillWidth().MinWidth(0).Height(24).Padding(1, 8, 1, 16).Gap(gapInline).AlignItems(ui.Center).Justify(ui.Start).Cursor(ui.CursorPointer).Label(locales.Text("命令结果 ") + key + " " + verb + " " + short(command, 120))
+	button := ui.ButtonBase(c.Key(key+"-group-row")).FillWidth().MinWidth(0).Height(24).Padding(1, 8, 1, 16).Gap(gapInline).AlignItems(ui.Center).Justify(ui.Start).Cursor(ui.CursorPointer).Label(locales.Text("命令结果 ") + key + " " + toolStatusLabel(state) + " " + short(command, 120))
 	// Same cache as toolCard: an expanded group redraws every frame, so the
 	// arguments must not be decoded again on each one.
 	args := entry.args
@@ -753,10 +821,11 @@ func (a *desktop) toolGroupCommandDetail(c *ui.Context, t *conversation, entry t
 				resultParts = append(resultParts, fmtDur(ms))
 			}
 			if len(resultParts) > 0 {
-				suffix := "(" + strings.Join(resultParts, " · ") + ")"
+				suffix := "(" + strings.Join(resultParts, "  ") + ")"
 				uikit.Tooltip(c, ui.Text(c, short(suffix, 72)).FontSize(fsTool).TextColor(metadataInk).SingleLine().Shrink(0), suffix)
 			}
 		})
+		toolStatusIcon(c, state)
 		caret := "chevron"
 		if open {
 			caret = "chevrondown"
@@ -793,51 +862,107 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 	name = toolKind(name)
 	state := toolState(m)
 	desc := describeTool(name)
-	verb := desc.doneVerb
-	switch state {
-	case "running", "pending":
-		verb = desc.runningVerb
-	case "error":
-		verb = desc.failedVerb
+	operation := desc.label
+	if name == "remote_run_command" {
+		operation = "Run"
+		if state == "success" {
+			operation = "Ran"
+		}
 	}
-	if name == "remote_run_command" && state == "cancelled" {
-		verb = "Cancelled"
+	if name == "edit" || name == "remote_edit" || name == "create" || name == "remote_create_file" {
+		operation = toolActionLabel(operation, state)
 	}
 	container := ui.Column(c.Key("tool-" + toolCardKey(t, index, m))).FillWidth().MinWidth(0).Gap(2)
 	parsed := memoAt[argsMemo](container, "parsed-args")
 	args := parsed.get(str(m, "args"), parseToolArgs)
-	summary := toolArgSummary(name, args)
+	var summary string
+	switch name {
+	case mcpSearchToolKind:
+		summary = memoAt[memoOf[string, string]](container, "search-query").get(str(m, "args"), func(string) string {
+			return toolArgSummary(name, args)
+		})
+	case mcpExecToolKind:
+		summary = memoAt[memoOf[string, string]](container, "exec-args").get(str(m, "args"), func(string) string {
+			return toolExecArgsSummary(args)
+		})
+	default:
+		summary = toolArgSummary(name, args)
+	}
 	if name == "remote_read" && summary == "" && boolOf(m, "fastCompacted") {
 		summary = str(m, "title")
 	}
 	purpose := toolPurpose(m, args)
-	isMCP := isMCPDisplayTool(m)
-	if isMCP {
-		// A failed MCP call must not read as "Called": the state word comes from
-		// the same table the builtin cards use.
-		verb = ""
-		if state == "error" {
-			verb = "MCP call failed"
+	action := str(args, "action")
+	if name == "service" || name == "scheduled_task" || name == "screenshot" {
+		if name == "screenshot" && action == "" {
+			action = "capture"
 		}
-		if state == "running" || state == "pending" {
-			verb = "Calling MCP"
+		switch action {
+		case "start", "stop", "restart", "read", "list", "create", "delete", "capture":
+			label := strings.ToUpper(action[:1]) + action[1:]
+			if name != "screenshot" {
+				label = toolActionLabel(label, state)
+			}
+			operation += " " + label
 		}
-		if verb == "" {
-			verb = "Called MCP"
+		if name == "service" {
+			summary = str(args, "name")
+			if summary == "" {
+				summary = str(args, "id")
+			}
 		}
-		summary = strings.Trim(str(m, "mcpServer")+"/"+str(m, "mcpTool"), "/")
-		if summary == "" {
-			summary = name
+		if name == "screenshot" {
+			summary = str(args, "windowTitle")
+			if summary == "" && args["windowId"] != nil {
+				summary = fmt.Sprint(args["windowId"])
+			}
 		}
 	}
-	if name == "subagent" {
-		// The header says what the card is; the child rows below carry the
-		// role, state, task and counters.
-		verb = "Subagent"
-		summary = ""
-		desc.showTiming = false
+	// The finished call carries the target in its own metadata, but a running one
+	// has to read it from the envelope: otherwise the card says ToolExec and only
+	// becomes the remote target once the call returns.
+	target := strings.Trim(str(m, "mcpServer")+"/"+str(m, "mcpTool"), "/")
+	if name == mcpExecToolKind && target == "" {
+		target = memoAt[memoOf[string, string]](container, "exec-target").get(str(m, "args"), func(string) string {
+			return toolExecTarget(args)
+		})
+	}
+	isMCP := name != mcpSearchToolKind && (target != "" || isMCPDisplayTool(m))
+	if isMCP {
+		operation = target
+		if operation == "" {
+			operation = "MCP"
+		}
+		if name != mcpExecToolKind {
+			summary = str(m, "args")
+		}
+	} else {
+		switch name {
+		case "subagent":
+			summary = ""
+		case "ssh_cluster":
+			summary = ""
+		case "remote_transfer":
+			switch str(args, "action") {
+			case "upload":
+				operation = "Upload"
+			case "download":
+				operation = "Download"
+			}
+		}
 	}
 	result := toolResult(m)
+	if name == "ask" && !isMCP {
+		questions := list(args, "questions")
+		if len(questions) == 0 {
+			questions = list(result, "questions")
+		}
+		if len(questions) == 1 {
+			summary = "1 question"
+		} else if len(questions) > 1 {
+			summary = fmt.Sprintf("%d questions", len(questions))
+		}
+	}
 	filePath := ""
 	if (name == "edit" || name == "create") && !isMCP {
 		filePath = toolFilePath(args, result)
@@ -849,10 +974,16 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 		}
 	}
 	if name == "scheduled_task" {
-		summary = a.scheduledTaskSummary(args, result)
+		summary = strings.TrimPrefix(a.scheduledTaskSummary(args, result), action+" · ")
+		if summary == action {
+			summary = ""
+		}
 	}
 	if name == "service" && str(args, "action") == "read" {
-		summary = a.serviceReadSummary(args, result)
+		summary = strings.TrimPrefix(a.serviceReadSummary(args, result), "read · ")
+		if summary == "read" {
+			summary = ""
+		}
 	}
 	expandable := desc.expandable && !isMCP && name != "screenshot" && name != "image_generate" && name != "image_edit"
 	if isMCP {
@@ -867,7 +998,7 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 	// Tool rows mirror main's .rich-tool-card: transparent, borderless, with a
 	// hanging status icon; the row itself carries the 6px rhythm below.
 	container.Children(func() {
-		row := ui.ButtonBase(c.Key(key+"-header")).FillWidth().Height(24).Padding(0, 8, 0, 0).Gap(gapTight).AlignItems(ui.Center).Justify(ui.Start).MinWidth(0).Label(locales.Text("工具详情 ") + key)
+		row := ui.ButtonBase(c.Key(key + "-header")).FillWidth().Height(24).Gap(gapTight).AlignItems(ui.Center).Justify(ui.Start).MinWidth(0).Label(locales.Text("工具详情 ") + key)
 		if expandable || filePath != "" {
 			row.Cursor(ui.CursorPointer)
 		}
@@ -879,41 +1010,76 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 			if name != "subagent" {
 				ui.Box(c).Absolute().Left(-16).Top(0).Width(16).HeightPercent(100).Center().Children(func() { toolStatusIcon(c, state) })
 			}
-			verbColor := p.accent
-			if state == "error" || name == "delete" || name == "remote_delete_path" {
-				verbColor = c.Theme().Danger
-			}
 			if isSSHTool(name) && !isMCP {
-				ui.Text(c.Key(key+"-ssh"), "SSH").FontSize(fsTool).TextColor(verbColor).Shrink(0).LineHeight(1.4).NoWrap()
+				ui.Text(c.Key(key+"-ssh"), "SSH").FontSize(fsTool).TextColor(p.accent).Shrink(0).LineHeight(1.4).NoWrap()
 			}
-			if verb != "" {
-				ui.Text(c, verb).FontSize(fsTool).TextColor(verbColor).Shrink(0).LineHeight(1.4).NoWrap()
+			if isMCP {
+				ui.Text(c, "MCP").FontSize(fsTool).TextColor(p.accent).Shrink(0).LineHeight(1.4).NoWrap()
+				label := ui.Text(c.Key(key+"-mcp-tool"), operation).FontSize(fsTool).TextColor(p.accent).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1)
+				uikit.Tooltip(c, label, operation)
+			} else {
+				color := p.accent
+				if name == "delete" || name == "remote_delete_path" {
+					color = c.Theme().Danger
+				}
+				ui.Text(c, operation).FontSize(fsTool).TextColor(color).Shrink(0).LineHeight(1.4).NoWrap()
 			}
 			if summary != "" {
 				if name == "command" || name == "remote_run_command" {
 					text := short(summary, 120)
 					label := ui.RichText(c.Key(key+"-summary"), codeSpansWithBase(c, text, "command.sh", commandLineInk(c.Theme(), a.secondaryInk()))...).FontSize(fsTool).SingleLine().MinWidth(0).Shrink(1)
 					uikit.Tooltip(c, label, summary)
+				} else if isMCP {
+					ui.Row(c.Key(key + "-mcp-summary")).MinWidth(0).MaxWidthPercent(20).Shrink(1).AlignItems(ui.Center).Children(func() {
+						color := a.secondaryInk()
+						ui.Text(c, "(").FontSize(fsTool).TextColor(color).Shrink(0)
+						label := ui.Text(c.Key(key+"-summary"), summary).FontSize(fsTool).TextColor(color).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1)
+						uikit.Tooltip(c, label, summary)
+						ui.Text(c, ")").FontSize(fsTool).TextColor(color).Shrink(0)
+					})
 				} else {
-					text := "(" + short(summary, 120) + ")"
-					color := a.secondaryInk()
-					if name == "edit" || name == "create" || name == "delete" || name == "remote_edit" || name == "remote_create_file" || name == "remote_delete_path" {
-						color = color.Mix(c.Theme().Text, 0.4)
+					text := summary
+					var parts []string
+					if name == "remote_transfer" {
+						local, remote := str(args, "localPath"), str(args, "remotePath")
+						if str(args, "action") == "download" {
+							local, remote = remote, local
+						}
+						if local != "" && remote != "" {
+							parts = []string{local, remote}
+						}
 					}
-					label := ui.Text(c.Key(key+"-summary"), text).FontSize(fsTool).TextColor(color).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1)
-					uikit.Tooltip(c, label, summary)
+					if len(parts) == 2 {
+						ui.Row(c.Key(key + "-transfer-summary")).MinWidth(0).Shrink(1).AlignItems(ui.Center).Children(func() {
+							color := a.secondaryInk()
+							ui.Text(c, "(").FontSize(fsTool).TextColor(color).Shrink(0)
+							for i, part := range parts {
+								if i > 0 {
+									ui.Text(c, " → ").FontSize(fsTool).TextColor(color).Shrink(0)
+								}
+								label := ui.Text(c, part).FontSize(fsTool).TextColor(color).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1)
+								uikit.Tooltip(c, label, part)
+							}
+							ui.Text(c, ")").FontSize(fsTool).TextColor(color).Shrink(0)
+						})
+					} else {
+						if name != "ask" && ((name != "delete" && name != "remote_delete_path") || len(list(args, "paths")) == 0) {
+							text = "(" + text + ")"
+						}
+						color := a.secondaryInk()
+						if name == "edit" || name == "create" || name == "delete" || name == "remote_edit" || name == "remote_create_file" || name == "remote_delete_path" {
+							color = color.Mix(c.Theme().Text, 0.4)
+						}
+						label := ui.Text(c.Key(key+"-summary"), text).FontSize(fsTool).TextColor(color).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(1)
+						uikit.Tooltip(c, label, summary)
+					}
 				}
 			}
-			if isSSHTool(name) && !isMCP {
+			if isSSHTool(name) && name != "ssh_cluster" && !isMCP {
 				if alias := toolSSHAlias(args); alias != "" {
-					ui.Text(c, "·").FontSize(fsTool - 2).TextColor(a.secondaryInk()).LineHeight(1.4).Shrink(0).NoWrap()
-					label := ui.Text(c.Key(key+"-ssh-alias"), short(alias, 32)).FontSize(fsTool - 2).TextColor(a.secondaryInk()).LineHeight(1.4).SingleLine().MinWidth(0).MaxWidthPercent(24).Shrink(0)
+					label := ui.Text(c.Key(key+"-ssh-alias"), alias).FontSize(fsTool - 2).TextColor(a.secondaryInk()).LineHeight(1.4).SingleLine().MinWidth(0).MaxWidthPercent(24).Shrink(0)
 					uikit.Tooltip(c, label, alias)
 				}
-			}
-			if isMCP {
-				label := map[string]string{"success": locales.Text("成功"), "error": locales.Text("失败"), "running": locales.Text("运行中"), "pending": locales.Text("等待中"), "cancelled": locales.Text("已取消")}[state]
-				ui.Text(c, label).FontSize(fsAux).TextColor(a.secondaryInk()).Shrink(0).NoWrap()
 			}
 			if name == "screenshot" || name == "image_generate" || name == "image_edit" {
 				if w, h := int(num(result, "width")), int(num(result, "height")); w > 0 && h > 0 {
@@ -949,7 +1115,7 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 					c.After(time.Second)
 				}
 			}
-			if name == "http_request" || name == "web_fetch" {
+			if name == "fetch" || name == "http_request" || name == "web_fetch" {
 				if status := int(num(result, "status")); status > 0 {
 					ui.Text(c, fmt.Sprintf("%d", status)).FontSize(fsAux).TextColor(a.secondaryInk()).Shrink(0).NoWrap()
 				}
@@ -994,19 +1160,16 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 				// where it can be skipped without breaking the sentence before it.
 				ui.Box(c).Grow(1).MinWidth(12)
 				// The reason keeps its full sentence; the target is what gets clipped.
-				label := ui.Text(c.Key(key+"-purpose"), short(purpose, 72)).FontSize(fsAux).TextColor(a.secondaryInk()).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(0)
-				label.MaxWidthPercent(45)
-				if name == "remote_run_command" {
-					// The server, command, and purpose each truncate independently;
-					// keep the status and result metadata visible in narrow windows.
-					label.MaxWidthPercent(30).Shrink(1)
+				label := ui.Text(c.Key(key+"-purpose"), purpose).FontSize(fsAux).TextColor(a.secondaryInk()).LineHeight(1.4).SingleLine().MinWidth(0).Shrink(0)
+				if isMCP {
+					label.MaxWidthPercent(45).Shrink(1)
 				}
 				uikit.Tooltip(c, label, purpose)
 			}
 		})
-		if isMCP {
-			return
-		} // Result payloads stay in model context, outside the UI.
+		if isMCP || name == mcpSearchToolKind {
+			return // Result payloads stay in model context.
+		}
 		if expandable && row.Clicked() {
 			t.uiState().ToolOpen[key] = !open
 			a.holdTranscriptPlace()
@@ -1125,7 +1288,7 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 				a.toolResourceCards(c, key, name, result, open)
 			case name == "remote_transfer":
 				toolFields(c, result, []string{"action", "alias", "target", "localPath", "remotePath", "fileCount", "dirCount", "totalBytes"}, a.secondaryInk())
-			case name == "http_request" || name == "web_fetch":
+			case name == "fetch" || name == "http_request" || name == "web_fetch":
 				// Network tool summaries stay on the header line.
 			case name == "render_html":
 				html := str(args, "html")
@@ -1203,16 +1366,11 @@ func (a *desktop) toolCard(c *ui.Context, t *conversation, index int, m map[stri
 		for _, warning := range list(result, "warnings") {
 			toolWarning(c, fmt.Sprint(warning), a.secondaryInk())
 		}
-		if boolOf(result, "sandboxDenied") {
-			toolWarning(c, str(result, "deniedWriteHint"), a.secondaryInk())
-		}
 		if validation := str(result, "validation"); strings.HasPrefix(validation, "自动校验失败") {
 			toolWarning(c, strings.TrimSpace(strings.TrimPrefix(validation, "自动校验失败（文件已写入）：")), a.secondaryInk())
 		}
 	})
 }
-
-func smallMono() string { return monoFamily }
 
 // easeInOut is the cubic ease-in-out main's tool-svg-blink runs under:
 // slow at both ends, so the dot dwells at full and dim instead of sweeping
@@ -1225,23 +1383,8 @@ func easeInOut(t float32) float32 {
 	return 1 - u*u*u/2
 }
 
-// toolStatusDot is the mark in the transcript gutter: the same filled dot the
-// rest of the app marks status with (pillDot), kept small beside command text and
-// the same size in every state. A tick and a cross read as two different shapes
-// that also shift the line as a call finishes; a dot says the state by colour.
 const toolStatusDot = 6
 
-// toolStatusIcon draws the state of a tool call: green once it finished, red when
-// it failed, the accent blinking while it runs, and the palette's grey while it
-// waits — pillDotColor keeps the grey readable on a light page. Every state owns
-// a 16x16 box, so the line never moves.
-//
-// Running fades 1<->0.3 on a 1.2s ease-in-out loop (main's tool-svg-blink), not a
-// cosine sweep — the cosine never sat at either end, so it read as too fast.
-// Opacity only: no scale, no rotation (a growing/spinning dot reads as urgency
-// instead of "still working").
-// toolStatusLabel names a state for assistive technology: the mark is a dot, so
-// the colour is the only thing telling a reader which state it is.
 func toolStatusLabel(state string) string {
 	switch state {
 	case "success":
@@ -1250,12 +1393,15 @@ func toolStatusLabel(state string) string {
 		return locales.Text("失败")
 	case "running":
 		return locales.Text("运行中")
+	case "cancelled":
+		return locales.Text("已取消")
 	}
 	return locales.Text("等待中")
 }
 
 func toolStatusIcon(c *ui.Context, state string) {
-	ui.Box(c).Size(16, 16).Center().Label(toolStatusLabel(state)).Children(func() {
+	label := toolStatusLabel(state)
+	mark := ui.Box(c).Size(16, 16).Center().Label(label).Children(func() {
 		switch state {
 		case "running":
 			color := c.Theme().Accent
@@ -1287,6 +1433,7 @@ func toolStatusIcon(c *ui.Context, state string) {
 			ui.Box(c).Size(toolStatusDot, toolStatusDot).Radius(toolStatusDot / 2).Background(pillDotColor(c, tone))
 		}
 	})
+	uikit.Tooltip(c, mark, label)
 }
 
 func parseToolArgs(raw string) map[string]any {
@@ -1376,12 +1523,17 @@ func toolArgSummary(name string, args map[string]any) string {
 		}
 	case "grep":
 		return pick("pattern")
-	case "glob":
-		return pick("pattern")
 	case "list":
 		return pick("path")
-	case "http_request", "web_fetch":
-		return pick("url")
+	case "fetch", "http_request", "web_fetch":
+		method := strings.ToUpper(str(args, "method"))
+		if method == "" {
+			method = "GET"
+		}
+		if url := pick("url"); url != "" {
+			return method + " " + url
+		}
+		return method
 	case "calculate":
 		return pick("expression")
 	case "plan":
@@ -1393,12 +1545,33 @@ func toolArgSummary(name string, args map[string]any) string {
 		return pick("finish")
 	case "skill":
 		return pick("name", "skill")
+	case mcpSearchToolKind:
+		// History recorded before the rename still carries "names"; read both so an
+		// old ToolSearch card keeps its summary.
+		values := list(args, "query")
+		if len(values) == 0 {
+			values = list(args, "names")
+		}
+		var ids []string
+		for _, value := range values {
+			if id, ok := value.(string); ok && id != "" {
+				ids = append(ids, id)
+			}
+		}
+		return strings.Join(ids, ", ")
 	case "ask":
 		return pick("question")
 	case "subagent":
 		return pick("description", "task", "prompt")
-	case "ssh_cluster":
-		return pick("action", "alias")
+	case "remote_transfer":
+		local, remote := str(args, "localPath"), str(args, "remotePath")
+		if str(args, "action") == "download" {
+			local, remote = remote, local
+		}
+		if local != "" && remote != "" {
+			return local + " → " + remote
+		}
+		return local + remote
 	case "service":
 		return pick("action", "name", "id")
 	case "scheduled_task":
@@ -1529,45 +1702,9 @@ func stripBlankLines(s string) string {
 	return strings.Join(kept, "\n")
 }
 
-// Match main's collapsed terminal white-space: pre-line. Only the display
-// preview collapses horizontal whitespace; expanded output keeps indentation.
-// The tail is taken first: blank lines are dropped from it rather than from the
-// whole log, which this runs on for every frame while the card is collapsed.
-func commandPreviewText(output string, lines int) string {
-	if lines <= 0 {
-		return ""
-	}
-	trimmed := strings.TrimRight(output, "\n")
-	if trimmed == "" {
-		return ""
-	}
-	// A run of blank lines at the end would leave the window short of rows, so
-	// widen it until enough survive or the whole output is in hand.
-	for window := lines*4 + 8; ; window *= 4 {
-		tail := tailLines(trimmed, window)
-		rows := strings.Split(tail, "\n")
-		kept := rows[:0]
-		for _, row := range rows {
-			// \r is a separator too: Windows output arrives as CRLF, and dropping the
-			// blank-line pass upstream means each row still carries its own \r.
-			row = strings.Join(strings.FieldsFunc(row, func(r rune) bool { return r == ' ' || r == '\t' || r == '\r' || r == '\f' || r == '\v' }), " ")
-			if row != "" {
-				kept = append(kept, row)
-			}
-		}
-		if len(kept) < lines && len(tail) < len(trimmed) {
-			continue
-		}
-		if len(kept) > lines {
-			kept = kept[len(kept)-lines:]
-		}
-		return strings.Join(kept, "\n")
-	}
-}
-
 func toolChips(name, state string, args, result map[string]any) []string {
 	var chips []string
-	if name == "read" || name == "batch_read" || name == "grep" || name == "list" || name == "glob" {
+	if name == "read" || name == "batch_read" || name == "grep" || name == "list" {
 		return nil
 	}
 	switch name {
@@ -1586,10 +1723,6 @@ func toolChips(name, state string, args, result map[string]any) []string {
 			chips = append(chips, "= "+fmt.Sprint(v))
 		} else if v, ok := result["result"]; ok {
 			chips = append(chips, fmt.Sprint(v))
-		}
-	case "ask":
-		if qs := list(result, "questions"); len(qs) > 0 {
-			chips = append(chips, fmt.Sprintf(locales.Text("%d 个问题"), len(qs)))
 		}
 	case "subagent":
 		if steps := int(num(result, "steps")); steps > 0 {
@@ -2069,14 +2202,6 @@ func tailLines(s string, n int) string {
 		start = previous + 1
 	}
 	return s[start:end]
-}
-
-func shortBlock(s string, n int) string {
-	r := []rune(s)
-	if len(r) > n {
-		return string(r[:n]) + locales.Text("\n…（内容已截断）")
-	}
-	return s
 }
 
 func unifiedSnippet(diff string, context int) string {

@@ -373,7 +373,7 @@ func (a *desktop) userMessage(c *ui.Context, t *conversation, i int, m map[strin
 		if p.dark {
 			background = userBubbleDark
 		}
-		ui.Column(c.Key("bubble")).Label(locales.Text("用户消息")).Selectable().MinWidth(0).Padding(10, 16).Radius(16).Background(background).Children(func() {
+		ui.Column(c.Key("bubble")).Label(locales.Text("用户消息")).Selectable().MinWidth(0).MaxWidthPercent(100).Padding(10, 16).Radius(16).Background(background).Children(func() {
 			ui.Column(c).MinWidth(0).Gap(gapInline).Children(func() {
 				if str(m, "skill") != "" || str(m, "skillArgs") != "" {
 					ui.Row(c).AlignItems(ui.Center).Gap(gapInline).Children(func() {
@@ -408,15 +408,6 @@ func (a *desktop) userMessage(c *ui.Context, t *conversation, i int, m map[strin
 			}).IgnoreInput(!show).Disabled(t.Busy).Shrink(0)
 		})
 	})
-}
-
-func lastUserIndex(messages []map[string]any) int {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if str(messages[i], "role") == "user" {
-			return i
-		}
-	}
-	return -1
 }
 
 // collapsiblePrompt keeps very long questions readable: the first lines show,
@@ -539,7 +530,7 @@ func (a *desktop) roundStatsRow(c *ui.Context, t *conversation, i int, stat *rou
 	row.Children(func() {
 		uikit.Tooltip(c, ui.Text(c, fmtDur(stat.DurationMS)).FontSize(fsSmall).TextColor(a.secondaryInk()), locales.Text("本轮耗时"))
 		if hit := stat.CacheHit + stat.CacheMiss; hit > 0 {
-			uikit.Tooltip(c, ui.Text(c, fmt.Sprintf("cache %d%%", int(float64(stat.CacheHit)*100/float64(hit)))).FontSize(fsSmall).
+			uikit.Tooltip(c, ui.Text(c, fmt.Sprintf("cache %.1f%%", float64(stat.CacheHit)*100/float64(hit))).FontSize(fsSmall).
 				TextColor(a.secondaryInk()), fmt.Sprintf("cache hit %d / miss %d", stat.CacheHit, stat.CacheMiss))
 		}
 		if stat.InputTokens > 0 || stat.OutputTokens > 0 {
@@ -750,19 +741,20 @@ func (a *desktop) welcomeView(c *ui.Context, t *conversation) {
 			ui.Column(c).Grow(1).Border(1, surfaceBorder(c)).Radius(radiusCard).Children(func() {
 				rows := [][4]string{
 					{locales.Text("工作区"), workspaceLabel(t.Workspace), "Bash", a.config.GitBashPath},
-					{locales.Text("模型"), strings.ReplaceAll(t.Model, " / ", " · "), "MCP", a.mcpSummary},
-					{locales.Text("技能"), fmt.Sprintf(locales.Text("%d 个可用"), len(availableSkills)), locales.Text("工具"), fmt.Sprintf(locales.Text("%d 个工具"), a.toolCount)},
+					{locales.Text("模型"), strings.ReplaceAll(t.Model, " / ", " · "), locales.Text("MCP 工具池"), a.mcpPoolLabel()},
+					{locales.Text("技能"), fmt.Sprintf(locales.Text("%d 个可用"), len(availableSkills)), locales.Text("内置工具"), fmt.Sprintf(locales.Text("%d 个可用"), a.builtinToolCount)},
 				}
 				if rows[0][3] == "" {
 					rows[0][3] = locales.Text("自动检测")
 				}
-				if rows[1][3] == "" {
-					rows[1][3] = locales.Text("无 MCP 服务")
-				}
 				for i, row := range rows {
 					ui.Row(c).Key(fmt.Sprintf("welcome-row-%d", i)).MinHeight(40).BorderWidth(0, 0, 1, 0).BorderColor(c.Theme().Border).AlignItems(ui.Center).Children(func() {
 						for j := 0; j < 2; j++ {
-							ui.Box(c).Width(64).MinHeight(40).Padding(10, 8).BorderWidth(0, 1, 0, 0).BorderColor(c.Theme().Border).Children(func() {
+							labelWidth := float32(64)
+							if j == 1 {
+								labelWidth = 112
+							}
+							ui.Box(c).Width(labelWidth).MinHeight(40).Padding(10, 8).BorderWidth(0, 1, 0, 0).BorderColor(c.Theme().Border).Children(func() {
 								ui.Text(c, row[j*2]).FontSize(fsSmall).Bold()
 							})
 							value := row[j*2+1]
@@ -834,23 +826,18 @@ func (a *desktop) welcomePopover(c *ui.Context, t *conversation, anchor ui.Eleme
 			Left(bounds.X).Top(bounds.Y).Size(bounds.W, bounds.H).Cursor(ui.CursorPointer).Label(locales.Text("关闭信息面板"))
 		trigger.OnClick(func() { *open = false })
 		popoverPanel(c, trigger, open, 320, func() {
-			title := locales.Text("MCP 服务")
+			title := locales.Text("MCP 工具池")
 			if row == 2 && col == 0 {
 				title = locales.Text("可用技能")
 			} else if row == 2 {
-				title = locales.Text("工具")
+				title = locales.Text("内置工具")
 			}
 			ui.Text(c, title).FontSize(fsSection).Bold().Padding(gapInline, padCard)
 			ui.Scroll(c).MaxHeight(260).Children(func() {
 				ui.Column(c).Gap(3).Padding(4, 10).Children(func() {
 					switch {
 					case row == 1:
-						if len(a.mcpServers) == 0 {
-							fieldNote(c, locales.Text("无 MCP 服务"), a.secondaryInk())
-						}
-						for _, server := range a.mcpServers {
-							ui.Text(c, fmt.Sprintf(locales.Text("%s · %s · %d 个工具"), str(server, "name"), mcpStatusText(str(server, "status")), int(num(server, "toolCount")))).FontSize(fsSmall).TextColor(a.secondaryInk())
-						}
+						a.mcpPoolTools(c)
 					case col == 0:
 						names := a.enabledSkillNames()
 						if len(names) == 0 {
@@ -860,15 +847,20 @@ func (a *desktop) welcomePopover(c *ui.Context, t *conversation, anchor ui.Eleme
 							ui.Text(c, name).FontSize(fsSmall)
 						}
 					default:
-						if len(a.toolInventory) == 0 {
-							fieldNote(c, locales.Text("暂无工具"), a.secondaryInk())
-						}
+						shown := false
 						for _, tool := range a.toolInventory {
+							if tool.Source != "built-in" {
+								continue
+							}
+							shown = true
 							suffix := ""
 							if !tool.Enabled {
 								suffix = locales.Text("（已停用）")
 							}
 							ui.Text(c, tool.Name+suffix).FontSize(fsSmall)
+						}
+						if !shown {
+							fieldNote(c, locales.Text("暂无工具"), a.secondaryInk())
 						}
 					}
 				})
@@ -1025,7 +1017,7 @@ func (a *desktop) askComposer(c *ui.Context, t *conversation) {
 	wkey := "ask-" + t.AskID + ":" + q.ID
 	answered := 0
 	for _, question := range t.Questions {
-		if len(st.AskSelected[question.ID]) > 0 || (st.AskCustom[question.ID] && (strings.TrimSpace(st.AskCustomTxt[question.ID]) != "" || len(st.AskImages[question.ID]) > 0)) {
+		if len(st.AskSelected[question.ID]) > 0 || strings.TrimSpace(st.AskCustomTxt[question.ID]) != "" || len(st.AskImages[question.ID]) > 0 {
 			answered++
 		}
 	}
@@ -1085,45 +1077,30 @@ func (a *desktop) askComposer(c *ui.Context, t *conversation) {
 					}
 				})
 			}
-			custom := st.AskCustom[q.ID]
-			customRow := ui.Row(c.Key("ask-custom-row-"+wkey)).FillWidth().MinHeight(32).Padding(4, 8).
-				AlignItems(ui.Center).Radius(radiusSmall).Cursor(ui.CursorPointer)
-			if customRow.Hovered() {
-				customRow.Background(c.Theme().SurfaceHover)
-			}
-			if customRow.Clicked() {
-				custom = !custom
-			}
-			customRow.Children(func() {
-				uikit.Checkbox(c.Key("ask-custom-"+wkey), &custom, locales.Text("自定义回答")).OnChange(func() { st.AskCustom[q.ID] = custom })
+			txt := st.AskCustomTxt[q.ID]
+			input := uikit.Area(c.Key("ask-custom-text-"+wkey), &txt).Label(locales.Text("自定义回复")).Placeholder(locales.Text("自定义回复")).Height(70).
+				OnChange(func() { st.AskCustomTxt[q.ID] = txt })
+			paste := func() bool { return a.pasteAskImage(c, t, q.ID) }
+			input.OnPaste(func(string) bool { return paste() })
+			input.OnTextKey(func(k ui.TextKey) bool {
+				return k.Key == ui.KeyV && k.Mods == ui.Cmd && paste()
 			})
-			st.AskCustom[q.ID] = custom
-			if custom {
-				txt := st.AskCustomTxt[q.ID]
-				input := uikit.Area(c.Key("ask-custom-text-"+wkey), &txt).Label(locales.Text("输入你的回答")).Placeholder(locales.Text("输入你的回答，可粘贴图片")).Height(70).
-					OnChange(func() { st.AskCustomTxt[q.ID] = txt })
-				paste := func() bool { return a.pasteAskImage(c, t, q.ID) }
-				input.OnPaste(func(string) bool { return paste() })
-				input.OnTextKey(func(k ui.TextKey) bool {
-					return k.Key == ui.KeyV && k.Mods == ui.Cmd && paste()
-				})
-				ui.Row(c).Gap(gapInline).Wrap().Children(func() {
-					for i, item := range st.AskImages[q.ID] {
-						i, item := i, item
-						ui.Row(c.Key(item.input.ID)).AlignItems(ui.Center).Gap(gapInline).Children(func() {
-							if bitmap := st.AskImageBitmaps[item.input.ID]; bitmap != nil {
-								ui.Image(c, bitmap).Size(36, 32).Shrink(0).Fit(ui.Contain)
-							}
-							ui.Text(c, fmt.Sprintf(locales.Text("图片 %d"), i+1)).FontSize(fsSmall)
-							dangerIconAction(c, "ask-remove-"+item.input.ID, locales.Text("移除图片"), "close", 20, func() {
-								images := st.AskImages[q.ID]
-								st.AskImages[q.ID] = append(images[:i], images[i+1:]...)
-								delete(st.AskImageBitmaps, item.input.ID)
-							})
+			ui.Row(c).Gap(gapInline).Wrap().Children(func() {
+				for i, item := range st.AskImages[q.ID] {
+					i, item := i, item
+					ui.Row(c.Key(item.input.ID)).AlignItems(ui.Center).Gap(gapInline).Children(func() {
+						if bitmap := st.AskImageBitmaps[item.input.ID]; bitmap != nil {
+							ui.Image(c, bitmap).Size(36, 32).Shrink(0).Fit(ui.Contain)
+						}
+						ui.Text(c, fmt.Sprintf(locales.Text("图片 %d"), i+1)).FontSize(fsSmall)
+						dangerIconAction(c, "ask-remove-"+item.input.ID, locales.Text("移除图片"), "close", 20, func() {
+							images := st.AskImages[q.ID]
+							st.AskImages[q.ID] = append(images[:i], images[i+1:]...)
+							delete(st.AskImageBitmaps, item.input.ID)
 						})
-					}
-				})
-			}
+					})
+				}
+			})
 		})
 		ui.Row(c).Gap(gapField).AlignItems(ui.Center).Children(func() {
 			ui.Spacer(c)
@@ -1163,11 +1140,9 @@ func (a *desktop) submitAsk(t *conversation) {
 	req := backend.AskSubmitRequest{AskID: t.AskID, SessionID: t.ID}
 	for _, q := range t.Questions {
 		answer := backend.AskSubmittedAnswer{QuestionID: q.ID}
-		if st.AskCustom[q.ID] {
-			answer.CustomText = strings.TrimSpace(st.AskCustomTxt[q.ID])
-			for _, image := range st.AskImages[q.ID] {
-				answer.Images = append(answer.Images, image.input.DataURL)
-			}
+		answer.CustomText = strings.TrimSpace(st.AskCustomTxt[q.ID])
+		for _, image := range st.AskImages[q.ID] {
+			answer.Images = append(answer.Images, image.input.DataURL)
 		}
 		answer.SelectedOptionIDs = append(answer.SelectedOptionIDs, st.AskSelected[q.ID]...)
 		req.Answers = append(req.Answers, answer)
@@ -1225,19 +1200,6 @@ func (a *desktop) pasteAskImage(c *ui.Context, t *conversation, questionID strin
 // Welcome detection shares the append-aware transcript index.
 func hasWelcomeMessage(t *conversation) bool {
 	return t.cachedTranscriptRows().welcome
-}
-
-func hasLaterSuggestion(t *conversation, index int) bool {
-	for n := index + 1; n < len(t.Messages); n++ {
-		m := t.Messages[n]
-		if str(m, "role") == "user" {
-			return false
-		}
-		if toolKind(str(m, "name")) == "suggest" {
-			return true
-		}
-	}
-	return false
 }
 
 type roundIndexKey struct {

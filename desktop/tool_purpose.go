@@ -17,13 +17,13 @@ type groupPurposeKey struct {
 	args, purpose, field, name, state string
 	streaming                         bool
 }
-type groupPurposeLabel struct{ full, short string }
+type groupPurposeLabel struct{ full string }
 
 func toolGroupCategory(name string) int {
 	switch name {
 	case "grep":
 		return 1
-	case "list", "glob":
+	case "list":
 		return 2
 	case "command":
 		return 3
@@ -49,7 +49,7 @@ func toolPurpose(m, args map[string]any) string {
 
 func (a *desktop) toolPurposeText(c *ui.Context, key, purpose string) {
 	// SingleLine clips to available width; the complete text stays on hover.
-	text := ui.Text(c.Key(key), short(purpose, 72)).FontSize(fsTool).TextColor(a.secondaryInk()).SingleLine().MinWidth(0).Grow(1).Shrink(1)
+	text := ui.Text(c.Key(key), purpose).FontSize(fsTool).TextColor(a.secondaryInk()).SingleLine().MinWidth(0).Grow(1).Shrink(1)
 	uikit.Tooltip(c, text, purpose)
 }
 
@@ -108,7 +108,7 @@ func (a *desktop) toolGroupReadEntry(c *ui.Context, t *conversation, entry toolG
 				text += " (" + summary + ")"
 			}
 			if err := str(file, "error"); err != "" {
-				text += " · " + err
+				text += ": " + err
 			}
 			uikit.Tooltip(c, ui.Text(c.Key(fmt.Sprintf("%s-file-%d", key, i)), text).FontSize(fsTool).TextColor(a.secondaryInk()).FillWidth().MinWidth(0).SingleLine(), text)
 		}
@@ -117,7 +117,10 @@ func (a *desktop) toolGroupReadEntry(c *ui.Context, t *conversation, entry toolG
 			if !ok {
 				continue
 			}
-			text := str(file, "path") + " · " + str(file, "error")
+			text := str(file, "path")
+			if err := str(file, "error"); err != "" {
+				text += ": " + err
+			}
 			uikit.ErrorText(c.Key(fmt.Sprintf("%s-missing-%d", key, i)), text).FontSize(fsTool).FillWidth().MinWidth(0)
 		}
 		if len(files) == 0 && entry.title != "" {

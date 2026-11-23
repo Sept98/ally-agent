@@ -36,7 +36,7 @@ func normalizeAutoCompactMethod(value string) string {
 const (
 	CompactThresholdModeRatio     = "ratio"
 	CompactThresholdModeTokens    = "tokens"
-	DefaultCompactThresholdTokens = 100_000
+	DefaultCompactThresholdTokens = 300_000
 	MaxCompactThresholdTokens     = 10_000_000
 )
 
@@ -116,10 +116,8 @@ func (a *App) autoCompactAllowed(sessionID string) bool {
 }
 
 // compactFailureCount / noteCompactFailure / clearCompactFailures are the only
-// readers and writers of a.compactFailures. The write path carries the same
-// lazy-init guard as compactingSessions: a nil map write while a.mu is held
-// panics, and the panic leaves the mutex locked forever — App instances built
-// outside NewApp (tests) must not take the process down with them.
+// readers and writers of a.compactFailures. NewApp initializes it, which is what
+// makes the write path safe while a.mu is held.
 func (a *App) compactFailureCount(sessionID string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -128,9 +126,6 @@ func (a *App) compactFailureCount(sessionID string) int {
 
 func (a *App) noteCompactFailure(sessionID string) int {
 	a.mu.Lock()
-	if a.compactFailures == nil {
-		a.compactFailures = map[string]int{}
-	}
 	a.compactFailures[sessionID]++
 	failures := a.compactFailures[sessionID]
 	a.mu.Unlock()
@@ -139,9 +134,7 @@ func (a *App) noteCompactFailure(sessionID string) int {
 
 func (a *App) clearCompactFailures(sessionID string) {
 	a.mu.Lock()
-	if a.compactFailures != nil {
-		delete(a.compactFailures, sessionID)
-	}
+	delete(a.compactFailures, sessionID)
 	a.mu.Unlock()
 }
 
@@ -223,7 +216,7 @@ func (a *App) compactSessionWithMode(parent context.Context, sessionID, instruct
 			return nil, errors.New("model is required")
 		}
 		if !hasModelCredential(cfg) {
-			return nil, missingModelCredentialError(cfg)
+			return nil, missingModelCredentialError()
 		}
 	}
 	// A live chat run may rewrite history concurrently (auto-compaction,
@@ -249,17 +242,6 @@ func (a *App) compactSessionWithMode(parent context.Context, sessionID, instruct
 	// The summary LLM call runs on a cancellable child of the app context so
 	// CancelCompaction (ESC) can abort it mid-flight.
 	ctx, cancel := context.WithCancel(parent)
-	// Lazy-init guard: a nil map write here panics while a.mu is held, and
-	// the panic escapes before the cleanup defer is registered — the mutex
-	// stays locked forever and every later call (ESC cancel, shutdown, any
-	// binding) deadlocks the whole app. App instances built outside NewApp
-	// (tests) must not take the process down with them.
-	if a.compactingSessions == nil {
-		a.compactingSessions = map[string]struct{}{}
-	}
-	if a.compactingCancels == nil {
-		a.compactingCancels = map[string]context.CancelFunc{}
-	}
 	a.compactingSessions[sessionID] = struct{}{}
 	a.compactingCancels[sessionID] = cancel
 	a.mu.Unlock()
@@ -353,7 +335,7 @@ func (a *App) compactRunHistory(ctx context.Context, cfg ConfigState, sessionID,
 			result = a.commitFastCompactHistory(sessionID, h, candidate)
 			a.clearCompactFailures(sessionID)
 			compacted := a.loadSessionHistoryCopy(sessionID)
-			messages := cloneChatMessages(history[:leadingSystemCount(history)])
+			messages := a.buildSystemContextMessages(sessionID, cfg, a.listCachedSkillsForConfig(cfg))
 			messages = append(messages, compacted...)
 			result["sessionId"] = sessionID
 			result["reason"] = reason

@@ -10,8 +10,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,48 +24,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	openai "github.com/sashabaranov/go-openai"
 )
-
-func TestToolSchemaToMapProducesProviderSafeSchema(t *testing.T) {
-	schema := mcp.ToolInputSchema{
-		Type:       "object",
-		Properties: map[string]any{},
-		Defs: map[string]any{
-			"options": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-				"required":   nil,
-			},
-		},
-		AdditionalProperties: false,
-	}
-
-	got := toolSchemaToMap(schema)
-	if got["type"] != "object" {
-		t.Fatalf("type = %#v, want object", got["type"])
-	}
-	if _, ok := got["properties"].(map[string]any); !ok {
-		t.Fatalf("properties must be an object, got %#v", got["properties"])
-	}
-	if required, exists := got["required"]; exists && required == nil {
-		t.Fatal("required must be omitted or an array, not null")
-	}
-	if got["additionalProperties"] != false {
-		t.Fatalf("additionalProperties was not preserved: %#v", got)
-	}
-	defs, ok := got["$defs"].(map[string]any)
-	if !ok {
-		t.Fatalf("$defs was not preserved: %#v", got)
-	}
-	nested := defs["options"].(map[string]any)
-	if required, exists := nested["required"]; exists && required == nil {
-		t.Fatal("nested required must be omitted or an array, not null")
-	}
-}
 
 func TestMcpTransportName(t *testing.T) {
 	tests := []struct {
@@ -452,7 +412,7 @@ func TestMcpManagerReconcileKeepsUnchangedServers(t *testing.T) {
 	bHandle := &McpClientHandle{ServerName: "b", Config: McpServerConfig{Command: "y", Enabled: &disabled}, Status: "disabled"}
 	manager.clients["b"] = bHandle
 	manager.clients["old"] = &McpClientHandle{ServerName: "old", Status: "connected"}
-	manager.replaceToolLookupLocked("old", []McpDiscoveredTool{{ServerName: "old", Name: "tool", FunctionName: "mcp__old__tool"}})
+	manager.clients["old"].ToolDefs = []McpDiscoveredTool{{ServerName: "old", Name: "tool"}}
 
 	changed, err := manager.ReconcileConfigs(context.Background())
 	if err != nil {
@@ -464,7 +424,7 @@ func TestMcpManagerReconcileKeepsUnchangedServers(t *testing.T) {
 	if _, exists := manager.clients["old"]; exists {
 		t.Fatal("removed server must be disconnected")
 	}
-	if _, exists := manager.toolLookup["mcp__old__tool"]; exists {
+	if _, err := manager.registeredToolLocked("old", "tool"); err == nil {
 		t.Fatal("removed server's tool lookup must be dropped")
 	}
 	if manager.clients["b"] != bHandle {
@@ -531,53 +491,10 @@ func TestMcpServerConfigEqualIgnoresDisabledTools(t *testing.T) {
 	}
 }
 
-// MCP 工具不入参数闸门（没有内置声明可校验），所以一个拼错或多传的参数只能
-// 靠这条警告露面；声明里没有 properties 的工具则保持安静，否则每个参数都会被点名。
-func TestMcpUnknownArgWarningsNamesUndeclaredArguments(t *testing.T) {
-	t.Parallel()
-	app := newIsolatedTestApp(t)
-	manager := NewMcpManager(t.TempDir(), nil)
-	manager.clients = map[string]*McpClientHandle{
-		"fs": {
-			ServerName: "fs",
-			Status:     "connected",
-			Config:     McpServerConfig{Command: "x"},
-			ToolDefs: []McpDiscoveredTool{
-				{
-					ServerName:   "fs",
-					Name:         "read_file",
-					FunctionName: "mcp__fs__read_file",
-					Schema: map[string]any{
-						"type":       "object",
-						"properties": map[string]any{"path": map[string]any{"type": "string"}},
-					},
-				},
-				{ServerName: "fs", Name: "probe", FunctionName: "mcp__fs__probe"},
-			},
-		},
-	}
-	app.mcpManager = manager
-
-	warnings := app.mcpUnknownArgWarnings("mcp__fs__read_file", map[string]any{"path": "a.txt", "recursive": true, "dept": 2})
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "dept, recursive") {
-		t.Fatalf("undeclared MCP arguments must be named together, got %#v", warnings)
-	}
-	if got := app.mcpUnknownArgWarnings("mcp__fs__read_file", map[string]any{"path": "a.txt"}); len(got) != 0 {
-		t.Fatalf("declared arguments must stay silent, got %#v", got)
-	}
-	if got := app.mcpUnknownArgWarnings("mcp__fs__probe", map[string]any{"anything": 1}); len(got) != 0 {
-		t.Fatalf("a tool without declared properties must not flag every argument, got %#v", got)
-	}
-	if got := app.mcpUnknownArgWarnings("mcp__missing__tool", map[string]any{"x": 1}); len(got) != 0 {
-		t.Fatalf("a tool outside the current set must stay silent, got %#v", got)
-	}
-}
-
-// 注入过滤：黑名单内工具不进 GetEnabledTools，但 GetAllTools（清单层）仍全量可见；
-// 黑名单按「对端原始工具名」匹配，未列出的工具（含对端新增）默认启用。
-// 连接状态不参与过滤：failed 服务端已发现的工具照常注入（连接无状态，调用时
-// 按需重连兜底），只有用户显式关掉的 disabled server 才整体排除。
-func TestGetEnabledToolsFiltersDisabledTools(t *testing.T) {
+// 目录、状态面板与勾选清单必须对同一条黑名单给出一致的答案：黑名单里的工具不
+// 进目录（模型看不到也调不到），断连服务端已发现的工具仍留在目录里（会话冻结
+// 后不能凭空消失），清单视图则一律全量可见，好让用户能取消勾选。
+func TestMcpRegistryViewsRespectBlacklistAndStatus(t *testing.T) {
 	manager := NewMcpManager(t.TempDir(), nil)
 	manager.clients = map[string]*McpClientHandle{
 		"fs": {
@@ -601,9 +518,11 @@ func TestGetEnabledToolsFiltersDisabledTools(t *testing.T) {
 	// disabled server: 全部工具都不注入也不出现在任一视图
 	manager.clients["off"] = &McpClientHandle{ServerName: "off", Status: "disabled"}
 
-	enabled := manager.GetEnabledTools()
-	if len(enabled) != 2 || enabled[0].ServerName != "dead" || enabled[1].Name != "read_file" {
-		t.Fatalf("enabled view must keep failed-server tools and drop blacklisted ones, got %#v", enabled)
+	statuses := manager.GetServerStatuses()
+	if len(statuses) != 3 || statuses[0]["toolCount"] != 1 || statuses[0]["enabledToolCount"] != 1 ||
+		statuses[1]["toolCount"] != 2 || statuses[1]["enabledToolCount"] != 1 ||
+		statuses[2]["enabledToolCount"] != 0 {
+		t.Fatalf("server status counts must match the MCP registry: %#v", statuses)
 	}
 	all := manager.GetAllTools()
 	if len(all) != 3 {
@@ -704,124 +623,6 @@ func TestReconcileConnectsChangedServersInBackground(t *testing.T) {
 	}
 }
 
-func TestIsMcpTransportFailure(t *testing.T) {
-	// mcp-go 自己的哨兵错误必须命中：手写子串清单曾经漏掉它们，于是 stdio
-	// 子进程死了、HTTP 会话 404 过期了都不重连（重连形同虚设）。
-	sentinels := []error{
-		transport.ErrTransportClosed,
-		transport.ErrSessionTerminated,
-		fmt.Errorf("MCP call failed: %w", transport.ErrTransportClosed),
-		fmt.Errorf("transport error: failed to send request: %w", transport.ErrSessionTerminated),
-	}
-	for _, err := range sentinels {
-		if !isMcpTransportFailure(err) {
-			t.Fatalf("expected sentinel error %v to count as a transport failure", err)
-		}
-	}
-
-	recoverableCases := []string{
-		"invalid session ID: 123",
-		// The transport error that motivated the marker list: a full JSON-RPC
-		// payload, not just the bare marker substring.
-		`MCP call failed: transport error: request failed with status 400: {"jsonrpc":"2.0","id":null,"error":{"code":-32602,"message":"Invalid session ID"}}`,
-		"remote MCP session expired",
-		"write: broken pipe",
-		"read: closed pipe",
-		"read tcp 127.0.0.1: connection reset by peer",
-		"dial tcp 127.0.0.1: connection refused",
-		"unexpected EOF",
-		"transport is closing",
-		"client is closed",
-		// 两个 mcp-go 没有导出哨兵、只能按文案认的真实错误。
-		"transport error: transport closed",
-		"transport error: connection has been closed",
-	}
-	for _, msg := range recoverableCases {
-		if !isMcpTransportFailure(errors.New(msg)) {
-			t.Fatalf("expected error %q to be a transport failure", msg)
-		}
-	}
-
-	// 标准 JSON-RPC 错误码：服务端收到了请求、明确拒绝，与链路无关，绝不重连。
-	protocolErrors := []error{
-		mcp.ErrInvalidParams,
-		mcp.ErrMethodNotFound,
-		fmt.Errorf("%w: missing required field", mcp.ErrInvalidParams),
-	}
-	for _, err := range protocolErrors {
-		if isMcpTransportFailure(err) {
-			t.Fatalf("protocol error %v must not count as a transport failure", err)
-		}
-	}
-
-	nonRecoverableCases := []string{
-		"validation failed: parameter 'foo' is required",
-		"tool not found: sample_tool",
-		"unsupported operation",
-		"permission denied",
-	}
-	for _, msg := range nonRecoverableCases {
-		if isMcpTransportFailure(errors.New(msg)) {
-			t.Fatalf("expected error %q to not be a transport failure", msg)
-		}
-	}
-	if isMcpTransportFailure(nil) {
-		t.Fatal("a nil error must never be a transport failure")
-	}
-}
-
-func TestMcpCallFailureClassification(t *testing.T) {
-	// 服务端状态决定"请求有没有发出去过"：failed 意味着调用前就没有可用连接
-	// （请求从未发出，重连后照常执行是安全的）；disabled / connecting 不行——
-	// 前者是用户明确关掉的，后者已有连接在飞。
-	cases := []struct {
-		status string
-		want   mcpCallFailure
-	}{
-		{"failed", mcpCallConnectionDead},
-		{"disabled", mcpCallUnavailable},
-		{"connecting", mcpCallUnavailable},
-	}
-	for _, tc := range cases {
-		manager := NewMcpManager("", nil)
-		manager.clients["srv"] = &McpClientHandle{ServerName: "srv", Status: tc.status}
-		outcome, err := manager.callToolOnce(context.Background(), "srv", "tool", nil)
-		if err == nil {
-			t.Fatalf("status %q must fail the call", tc.status)
-		}
-		if outcome.failure != tc.want {
-			t.Fatalf("status %q: got failure %d want %d", tc.status, outcome.failure, tc.want)
-		}
-	}
-
-	manager := NewMcpManager("", nil)
-	outcome, err := manager.callToolOnce(context.Background(), "missing", "tool", nil)
-	if err == nil || outcome.failure != mcpCallUnavailable {
-		t.Fatalf("unknown server must be unavailable, got %#v / %v", outcome, err)
-	}
-}
-
-// 重连之后要不要把这次调用继续跑下去，唯一判据是"请求有没有发出去过"：调用前
-// 连接就是死的（从未发出）可以；请求发出过（链路中途断）不行——服务端可能已经
-// 执行了工具并产生了副作用，重放就是把副作用做第二遍。
-func TestCallReplaySafetyAfterReconnect(t *testing.T) {
-	cases := []struct {
-		failure mcpCallFailure
-		want    bool
-	}{
-		{mcpCallConnectionDead, true},
-		{mcpCallTransportBroken, false},
-		{mcpCallToolFailed, false},
-		{mcpCallUnavailable, false},
-		{mcpCallSucceeded, false},
-	}
-	for _, tc := range cases {
-		if got := replaySafeAfterReconnect(tc.failure); got != tc.want {
-			t.Fatalf("failure %d: replaySafeAfterReconnect = %v, want %v", tc.failure, got, tc.want)
-		}
-	}
-}
-
 func TestCallToolDoesNotRetryToolLevelError(t *testing.T) {
 	// 工具自己回的错误文案里带 "connection refused"（下游连不上，很常见）时
 	// 绝不能重连：旧实现会杀掉并重启整个 MCP 服务端、再把工具跑第二遍。
@@ -850,6 +651,10 @@ func TestCallToolDoesNotRetryToolLevelError(t *testing.T) {
 	manager := NewMcpManager("", nil)
 	handle := &McpClientHandle{ServerName: "srv", Client: mcpClient, Status: "connected", token: &mcpConnToken{}}
 	manager.clients["srv"] = handle
+	handle.ToolDefs, err = listMcpTools(t.Context(), "srv", mcpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = manager.CallTool(context.Background(), "srv", "flaky", map[string]any{})
 	if err == nil {
@@ -857,9 +662,6 @@ func TestCallToolDoesNotRetryToolLevelError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("the server's error text must reach the caller, got %v", err)
-	}
-	if strings.Contains(err.Error(), "reconnect") {
-		t.Fatalf("a tool-level error must not trigger a reconnect, got %v", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("the tool must run exactly once, ran %d times", got)
@@ -1098,7 +900,7 @@ func waitForMcpHandleStatus(t *testing.T, manager *McpManager, name, want string
 	}
 }
 
-func TestMcpStdioServerUsesWorkspaceDirAndHealsAfterCrash(t *testing.T) {
+func TestMcpStdioServerUsesWorkspaceDirAndReportsCrash(t *testing.T) {
 	t.Parallel()
 	python := mcpTestPython(t)
 	script := filepath.Join(t.TempDir(), "server.py")
@@ -1151,18 +953,11 @@ func TestMcpStdioServerUsesWorkspaceDirAndHealsAfterCrash(t *testing.T) {
 	}
 	waitForMcpHandleStatus(t, manager, "echo", "failed")
 
-	// 下一次调用：状态已经是 failed（这次请求从未发出），所以先重连、再把调用
-	// 正常执行一遍——连接自己救回来，而不是把"连接已失效"一直丢给模型。这不是
-	// 重放：服务端不可能已经跑过它。
-	out, err = manager.CallTool(ctx, "echo", "where", map[string]any{})
-	if err != nil {
-		t.Fatalf("调用前重连自愈失败: %v", err)
-	}
-	if !strings.Contains(out, wantDir) {
-		t.Fatalf("重连后的调用应正常返回：got %q", out)
-	}
-	if got := mcpHandleStatus(manager, "echo"); got != "connected" {
-		t.Fatalf("重连后状态应回到 connected，got %q", got)
+	// 调用路径不再自愈：failed 状态下这次调用直接失败，重连交给会话或用户动作
+	// 触发的 RetryFailedMcpServers——不在调用预算里拨号，也不重放可能已经产生
+	// 副作用的请求。
+	if _, err := manager.CallTool(ctx, "echo", "where", map[string]any{}); err == nil {
+		t.Fatal("a failed server must not be reconnected from the call path")
 	}
 }
 
@@ -1408,7 +1203,7 @@ func TestCommitConnectionRecordsLossDuringHandshake(t *testing.T) {
 	if liveHandle.Status != "connected" || liveHandle.Error != "" || liveHandle.token != liveToken {
 		t.Fatalf("正常连接应登记为 connected，got %q/%q", liveHandle.Status, liveHandle.Error)
 	}
-	if _, ok := manager.toolLookup["mcp__live__t"]; !ok {
+	if len(liveHandle.ToolDefs) != 1 || liveHandle.ToolDefs[0].Name != "t" {
 		t.Fatal("工具映射必须跟着登记一起写入")
 	}
 }
@@ -1570,16 +1365,5 @@ func TestMcpToolResultTextStructuredOnlyServerIsNotEmpty(t *testing.T) {
 	got := mcpToolResultText(result)
 	if got != `structured output: {"status":"ok"}` {
 		t.Fatalf("structured-only result = %q", got)
-	}
-}
-
-func TestMCPFunctionNamesRequireRegisteredLookup(t *testing.T) {
-	m := &McpManager{toolLookup: map[string]mcpToolRef{"mcp__opaque": {ServerName: "server__name", ToolName: "tool__name"}}}
-	if _, ok := m.DescribeFunctionTool("mcp__server__tool"); ok {
-		t.Fatal("unregistered legacy name accepted")
-	}
-	ref, ok := m.DescribeFunctionTool("mcp__opaque")
-	if !ok || ref.ServerName != "server__name" || ref.ToolName != "tool__name" {
-		t.Fatalf("registered lookup lost original names: %+v", ref)
 	}
 }

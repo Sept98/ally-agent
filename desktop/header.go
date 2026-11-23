@@ -380,8 +380,8 @@ func moveOpenConversationTabToIndex(tabs []*conversation, positions []tabPositio
 	return active, motions, true
 }
 
-// Header history always creates a fresh tab, matching main's onHistorySelect.
-// The sidebar keeps its separate switch-to-workspace behavior.
+// openWorkspaceEntry opens a workspace every entry point shares: the header
+// menu and the rail's workspace rows both land on this one function.
 func (a *desktop) openWorkspaceEntry(workspace string) { a.newConversation(workspace) }
 
 // Both workspace entries share the same menu builder. Their open flags belong
@@ -391,9 +391,14 @@ func (a *desktop) workspaceHistoryMenu(c *ui.Context, trigger func(ui.Element)) 
 		Width: 300, MaxHeightPercent: 85, Label: locales.Text("工作区历史菜单"),
 		At: ui.AnchorBottomRight, Self: ui.AnchorTopRight, Gap: 6,
 	}, trigger, func(m ui.MenuParts) {
-		uikit.MenuItem(c, m, "add", locales.Text("＋ 添加工作区"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(a.chooseWorkspace)
-		uikit.MenuItem(c, m, "temporary", locales.Text("临时工作区"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() { a.newConversation("") })
-		divider(c)
+		// The two entries that create a workspace stay on top while the history
+		// under them scrolls.
+		header := menuPinnedTop(c)
+		header.Children(func() {
+			uikit.MenuItem(c, m, "add", locales.Text("＋ 添加工作区"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(a.chooseWorkspace)
+			uikit.MenuItem(c, m, "temporary", locales.Text("临时工作区"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() { a.newConversation("") })
+			divider(c)
+		})
 		roots := a.workspaceHistoryRoots()
 		for _, root := range roots {
 			root := root
@@ -473,11 +478,10 @@ func workspaceLabel(root string) string {
 	if root == "" {
 		return locales.Text("未选择工作区")
 	}
-	base := filepath.Base(root)
-	if strings.HasPrefix(base, "ally-temp-") {
+	if tempWorkspace(root) {
 		return locales.Text("临时")
 	}
-	return base
+	return filepath.Base(root)
 }
 
 // sessionTabLabel identifies the workspace; conversation titles stay in the
@@ -486,7 +490,7 @@ func sessionTabLabel(tab *conversation) string {
 	if tab == nil {
 		return workspaceLabel("")
 	}
-	if strings.HasPrefix(filepath.Base(tab.Workspace), "ally-temp-") {
+	if tempWorkspace(tab.Workspace) {
 		return locales.Text("临时工作区")
 	}
 	return workspaceLabel(tab.Workspace)
@@ -506,26 +510,45 @@ func workspaceTip(root string) string {
 	return root
 }
 
-func (a *desktop) closeWorkspaceTab(index int) {
-	if index < 0 || index >= len(a.tabs) || len(a.tabs) <= 1 {
+// tempWorkspace reports a sandbox directory the app created and owns. The name
+// is the only marker, and DeleteTempWorkspace guards on the same prefix.
+func tempWorkspace(root string) bool {
+	return strings.HasPrefix(strings.ToLower(filepath.Base(filepath.Clean(root))), "ally-temp-")
+}
+
+// removeTempWorkspace deletes a sandbox after its last tab closed. A temporary
+// workspace can carry several sessions, and removing the directory with the
+// first closed tab left the rest reading a folder that no longer existed.
+func (a *desktop) removeTempWorkspace(root string) {
+	if a.core == nil || !tempWorkspace(root) {
 		return
+	}
+	go func(path string) {
+		if err := a.core.DeleteTempWorkspace(path); err != nil {
+			a.fail(err)
+		}
+	}(root)
+}
+
+func (a *desktop) closeWorkspaceTab(index int) {
+	if root := a.detachWorkspaceTab(index); root != "" {
+		a.removeTempWorkspace(root)
+	}
+}
+
+// detachWorkspaceTab removes the tab and returns a temporary directory when
+// its last reference in the tab strip is gone.
+func (a *desktop) detachWorkspaceTab(index int) string {
+	if index < 0 || index >= len(a.tabs) || len(a.tabs) <= 1 {
+		return ""
 	}
 	t := a.tabs[index]
 	if t.Busy {
-		return
+		return ""
 	}
 	a.rememberSession(t)
-	if t.Workspace != "" && strings.HasPrefix(filepath.Base(t.Workspace), "ally-temp-") {
-		// Temporary workspaces are removed with the tab, after the backend
-		// finishes anything still using them.
-		go func(path string) {
-			time.Sleep(400 * time.Millisecond)
-			if err := a.core.DeleteTempWorkspace(path); err != nil {
-				a.fail(err)
-			}
-		}(t.Workspace)
-	}
 	a.tabs = slices.Delete(a.tabs, index, index+1)
+	a.refreshNativeTray()
 	stillOpen := false
 	for _, tab := range a.tabs {
 		if sameWorkspace(tab.Workspace, t.Workspace) {
@@ -567,6 +590,10 @@ func (a *desktop) closeWorkspaceTab(index int) {
 		}
 	}
 	a.releaseMemory()
+	if !stillOpen && tempWorkspace(t.Workspace) {
+		return t.Workspace
+	}
+	return ""
 }
 
 // updateDialog mirrors the original card modal: progress, state text, and the

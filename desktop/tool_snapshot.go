@@ -16,10 +16,11 @@ func isMCPDisplayTool(m map[string]any) bool {
 	if name == "" {
 		name = str(m, "toolName")
 	}
-	return str(m, "mcpServer") != "" || str(m, "mcpTool") != "" || strings.HasPrefix(name, "mcp")
+	return str(m, "mcpServer") != "" || str(m, "mcpTool") != "" || strings.HasPrefix(name, "mcp") ||
+		strings.EqualFold(name, mcpSearchToolKind) || strings.EqualFold(name, mcpExecToolKind)
 }
 
-// MCP cards show only status and timing. The runtime keeps the complete result
+// MCP cards retain only arguments and outcome metadata. The runtime keeps the complete result
 // in its own context; never mutate the event or the model's copy here.
 func retainMCPDisplaySummary(m map[string]any) bool {
 	if !isMCPDisplayTool(m) || boolOf(m, "fastCompacted") {
@@ -182,7 +183,7 @@ func readCardSummary(name string, result map[string]any, forDisk bool) map[strin
 		if hits := toolGroupGrepHits(result); hits >= 0 {
 			summary["hits"] = hits
 		}
-	case "list", "glob":
+	case "list":
 		if _, exists := summary["count"]; !exists {
 			count := len(list(result, "entries"))
 			if count == 0 {

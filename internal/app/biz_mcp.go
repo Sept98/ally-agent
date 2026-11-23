@@ -54,7 +54,7 @@ type McpServerConfig struct {
 	ToolTimeoutSec    float64 `json:"toolTimeoutSec,omitempty"`
 	Enabled           *bool   `json:"enabled,omitempty"`
 	// DisabledTools 是按「对端原始工具名」记录的注入黑名单：名单内的工具
-	// 不进入模型请求（buildToolsWithMcp 过滤），但清单/状态接口仍可见。
+	// 不进入模型请求（目录过滤），但清单/状态接口仍可见。
 	// 对端新增工具默认启用；对端删除工具后残留条目 inert 保留，不自动清理，
 	// 以便对端临时下线再恢复时用户的勾选偏好不丢。
 	DisabledTools []string `json:"disabledTools,omitempty"`
@@ -69,7 +69,10 @@ type McpDiscoveredTool struct {
 	Name         string
 	FunctionName string
 	Description  string
-	Schema       map[string]any // JSON Schema for OpenAI tool registration
+	Schema       map[string]any // Original MCP InputSchema
+	Title        string
+	Definition   map[string]any
+	validation   *mcpSchemaValidation
 }
 
 // mcpConnToken 是一次连接尝试的身份，同时记着"这次连接还没被登记就死了"。
@@ -79,9 +82,11 @@ type McpDiscoveredTool struct {
 //   - 顺手记下丢失事件：握手刚成功、进程就死的窗口里，登记时才能如实落
 //     failed，而不是把一条已经没了的连接写成 connected。
 type mcpConnToken struct {
-	mu      sync.Mutex
-	lost    bool
-	lostWhy string
+	mu           sync.Mutex
+	lost         bool
+	lostWhy      string
+	catalogReady bool
+	catalogDirty bool
 	// Set before the transport starts; owned by this connection, never a tool call.
 	cancel context.CancelFunc
 	// stdioPID 是这条连接拉起的子进程组根进程（仅 stdio）。退出时直接对整组
@@ -117,12 +122,14 @@ func (t *mcpConnToken) lostCause() (string, bool) {
 }
 
 type McpClientHandle struct {
-	ServerName string
-	Config     McpServerConfig
-	Client     *client.Client
-	ToolDefs   []McpDiscoveredTool
-	Status     string // "connected", "connecting", "failed", "disabled"
-	Error      string
+	retryQueued  bool // coalesces tab/session triggers while this failed handle waits to dial
+	passiveRetry bool // discovery can proceed while this handle connects
+	ServerName   string
+	Config       McpServerConfig
+	Client       *client.Client
+	ToolDefs     []McpDiscoveredTool
+	Status       string // "connected", "connecting", "failed", "disabled"
+	Error        string
 	// token 是当前 Client 的连接身份，见 mcpConnToken。
 	token *mcpConnToken
 }
@@ -131,39 +138,33 @@ type McpClientHandle struct {
 //
 // 连接是易耗品，不是要守护的资产。远程 MCP 的长连流随时会被对端回收（服务端/
 // 网关/代理的空闲超时、会话过期后直接 RST，mcp-go 的 SSE 传输连干净的 EOF 都
-// 触发断连且无内部重连），"用久了就断"是常态而非故障。Ally 因此不做保活、
-// 不做后台重连、也不做连接重试：心跳换不来什么（重连+握手只要几百毫秒），却添
-// 一套常驻状态机。连接动作只在三处发生——启动、配置变更、调用时发现没有可用
-// 连接；每次只试一次，成不成如实记账（失败是面板上的一行字，不是待办）。
+// 触发断连且无内部重连），"用久了就断"是常态而非故障。Ally 不做保活或定时
+// 重试；启动、配置变更、每轮对话开头（RetryFailedMcpServers），以及新建 tab
+// 或会话时各触发一次重拨。重拨在后台进行，不等待它来构建会话工具清单。
 //
-// 与"重试"配套的那条纪律：请求**发出过**之后再断的调用绝不重放（服务端可能
-// 已经执行了工具，重放等于把副作用做第二遍），只修连接并把判断权交回模型；
-// 调用前连接就是死的（请求从未发出）才继续执行。
+// 与"重拨"配套的那条纪律：调用路径只把断线记成 failed，从不拨号，也绝不重放
+// 一次可能已经执行过的调用（服务端可能已经跑过这个工具，重放等于把副作用做
+// 第二遍）；要不要再来一次由模型按工具语义自己决定。
 //
-// 注入必须跟着配置开关走，绝不跟连接状态走（collectTools 只排除 disabled）。
-// 反过来做（曾经的做法：failed 服务端不参与注入）会两头都坏：
-//  1. 模型侧：一次断流就把工具从模型视图整个抽走，冻结的会话工具集缺了它，
-//     整段会话再也调不到，只能重启应用；
-//  2. 缓存侧：工具集中途增减 = 请求前缀漂移，毒化 KV 前缀缓存——注入视图
-//     必须在一个会话内恒定，而连接状态恰恰是会话内最不稳定的东西。
-//
-// 与此配套的两条纪律：断连绝不清 ToolDefs（handleConnectionLost 保留清单，
-// 注入与重连都靠它）；会话工具集冻结在首次请求（sessionToolsets），运行期的
-// 清单变化只影响新会话。
+// Keep discovered definitions across transient disconnects for on-demand
+// reconnection. Configuration changes and successful discovery replace the
+// affected entries under mu.
 type McpManager struct {
-	mu             sync.RWMutex
-	configMu       sync.Mutex // serializes load + reconcile, not network dialing
-	lifetimeCtx    context.Context
-	cancelLifetime context.CancelFunc
-	changed        chan struct{} // broadcast under mu; waiters always recheck state
-	initialLoading bool
-	reconnectLocks sync.Map // serverName -> *sync.Mutex，per-server 重连互斥
-	clients        map[string]*McpClientHandle
-	toolLookup     map[string]mcpToolRef
-	workDir        string // 构造后不再改，读它无需加锁
-	listener       func()
-	warnHandler    func(message string)
-	networkConfig  func() ConfigState
+	mu              sync.RWMutex
+	configMu        sync.Mutex // serializes load + reconcile, not network dialing
+	lifetimeCtx     context.Context
+	cancelLifetime  context.CancelFunc
+	changed         chan struct{} // broadcast under mu; waiters always recheck state
+	initialLoading  bool
+	reconnectLocks  sync.Map // serverName -> *sync.Mutex，per-server 重连互斥
+	clients         map[string]*McpClientHandle
+	catalog         string
+	catalogExecOnly string
+	catalogReady    bool
+	workDir         string // 构造后不再改，读它无需加锁
+	listener        func()
+	warnHandler     func(message string)
+	networkConfig   func() ConfigState
 	// toolRefresher 是"通知触发的工具清单重拉"动作，默认 refreshServerTools；
 	// 与 listener/warnHandler 同一种注入风格，测试可替换。
 	toolRefresher func(serverName string, token *mcpConnToken)
@@ -223,11 +224,6 @@ func (m *McpManager) currentNetworkConfig() ConfigState {
 	return ConfigState{}
 }
 
-type mcpToolRef struct {
-	ServerName string
-	ToolName   string
-}
-
 func NewMcpManager(workDir string, listener func()) *McpManager {
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
 	m := &McpManager{
@@ -236,13 +232,47 @@ func NewMcpManager(workDir string, listener func()) *McpManager {
 		changed:        make(chan struct{}),
 		initialLoading: true,
 		clients:        make(map[string]*McpClientHandle),
-		toolLookup:     make(map[string]mcpToolRef),
 		refreshSlots:   make(map[string]*mcpToolRefreshSlot),
 		workDir:        workDir,
 		listener:       listener,
 	}
 	m.toolRefresher = m.refreshServerTools
 	return m
+}
+
+// RetryFailedMcpServers starts one non-blocking attempt for each failed server.
+// Concurrent user actions coalesce while an attempt is in flight.
+func (a *App) RetryFailedMcpServers() {
+	if a == nil {
+		return
+	}
+	m := a.activeMcpManager()
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	var pending []*McpClientHandle
+	for _, handle := range m.clients {
+		if handle.Status == "failed" && !handle.retryQueued {
+			handle.retryQueued = true
+			pending = append(pending, handle)
+		}
+	}
+	m.mu.Unlock()
+	for _, handle := range pending {
+		GoSafe("mcp event retry "+handle.ServerName, func() {
+			defer func() {
+				m.mu.Lock()
+				handle.retryQueued = false
+				m.mu.Unlock()
+			}()
+			m.dialServer(m.lifetimeCtx, handle.ServerName, McpServerConfig{}, handle)
+		})
+	}
 }
 
 func mcpUserConfigPath() string {
@@ -304,37 +334,12 @@ func (m *McpManager) loadConfigs() (map[string]McpServerConfig, error) {
 	return merged, nil
 }
 
-// dialConfigSuperseded 报告本次拨号携带的配置已被更新的加载结果取代。生产路径
-// 上 connectOne 的 cfg 总来自某次 LoadConfigs（StartAll / ReconcileConfigs），
-// configSnapshot 就是其中最新的一份：两者对不上，说明拿到拨号锁之前又发生过
-// 一次保存/重载，这次拨号已经过期。snapshot 为 nil（从未加载过，直连拨号的
-// 测试路径）时无从对账，放行。
-func (m *McpManager) dialConfigSuperseded(name string, cfg McpServerConfig) bool {
-	m.mu.RLock()
-	snapshot := m.configSnapshot
-	m.mu.RUnlock()
-	if snapshot == nil {
-		return false
-	}
-	current, ok := snapshot[name]
-	if !ok {
-		return true
-	}
-	return !mcpServerConfigEqual(current, cfg)
-}
-
-// isClosed 报告 manager 是否已被 Shutdown。
-func (m *McpManager) isClosed() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.closed
-}
-
 // registerDisabledServer 只登记一条 "disabled" 记录，不拨号不建客户端：状态
 // 面板因此能看到"配置了但关着"的服务端，而不是把它静默藏掉。登记后照常推送。
 func (m *McpManager) registerDisabledServer(name string, cfg McpServerConfig) {
 	m.mu.Lock()
 	m.clients[name] = &McpClientHandle{ServerName: name, Config: cfg, Status: "disabled"}
+	m.catalogReady = false
 	m.mu.Unlock()
 	m.notifyChange()
 }
@@ -456,16 +461,16 @@ func (m *McpManager) ReconcileConfigs(ctx context.Context) (int, error) {
 		// 生效，成不成是调用时的事——连接是无状态的，下一次工具调用自己会把连接
 		// 建起来，面板上的失败只是一行如实记账，不值得为它花一次拨号的钱（更不
 		// 该由"保存"这个无关动作触发）。
-		// 勾选变化要原地生效：替换 disabledTools，保持 live 连接，只让下一次
-		// buildToolsWithMcp 的注入过滤生效。touched 驱动上层失效上下文缓存并发 status。
+		// 勾选变化要原地生效：替换 disabledTools，保持 live 连接，让目录和实时执行权限同步生效。touched 驱动上层失效上下文缓存并发 status。
 		if !disabledToolsEqual(handle.Config.DisabledTools, cfg.DisabledTools) {
 			handle.Config.DisabledTools = cfg.DisabledTools
+			m.catalogReady = false
 			touched[name] = true
 		}
 	}
 	for _, name := range stale {
 		delete(m.clients, name)
-		m.replaceToolLookupLocked(name, nil)
+		m.catalogReady = false
 		touched[name] = true
 	}
 	m.mu.Unlock()
@@ -512,85 +517,81 @@ func (m *McpManager) ReconcileConfigs(ctx context.Context) (int, error) {
 			m.registerDisabledServer(name, cfg)
 			continue
 		}
-		GoSafe("mcp connect "+name, func() { m.connectOne(ctx, name, cfg) }, func() { m.markConnectPanicked(name) })
+		GoSafe("mcp connect "+name, func() { m.connectOne(ctx, name, cfg) })
 	}
 	return len(touched), nil
 }
 
 func (m *McpManager) connectOne(ctx context.Context, name string, cfg McpServerConfig) {
+	m.dialServer(ctx, name, cfg, nil)
+}
+
+func (m *McpManager) dialServer(ctx context.Context, name string, cfg McpServerConfig, retryFrom *McpClientHandle) {
 	// 拨号互斥与重连共用：同名服务端任何时刻只允许一次拨号在飞，否则并发拨号
 	// 会互相覆盖记录，输的那次连出来的子进程再也没人 Close（常驻孤儿）。
 	unlock := m.lockServerDial(name)
 	defer unlock()
 
-	// 拨号前对账：cfg 是某次 ReconcileConfigs / StartAll 快照里的配置，从快照
-	// 到拿到拨号锁之间用户可能又保存了新配置，而那次保存的拨号可能排在本拨号
-	// 之后才拿锁。旧配置若照常连接并提交，会把用户刚保存的新配置整个顶掉，直到
-	// 下次保存——盘是唯一事实源，已被取代的拨号就地放弃，由携带新配置的那次
-	// 拨号完成连接。
-	if m.dialConfigSuperseded(name, cfg) {
-		return
-	}
-	// manager 已被 Shutdown（重启换新 manager）：继续拨号没有意义，连接提交进
-	// 无人引用的旧 manager 只会悬空。
-	if m.isClosed() {
-		return
-	}
-
-	// 拿到拨号锁后核对现状：两次并发的 ReconcileConfigs（面板快速连点保存）会为
-	// 同一台刚变动的服务端各排一次拨号，赢的那次提交连接后，输的那次若照常
-	// 覆盖 handle，会把刚建好的连接整个换掉、其 client 永远无人 Close。配置相同
-	// 的已连接/拨号在飞直接放弃（按需重连排的那次也走这里）。配置不同的不能
-	// 放弃：旧配置的拨号可能在对账之后才把 handle 登记
-	// 回来（对账拦的是"配置已被更新的加载结果取代"的拨号，拦不住这条——盘上
-	// 已是新配置、新配置的拨号正排在锁后面），这里走整体换记录路径把新配置连上。
-	m.mu.RLock()
-	existing, ok := m.clients[name]
-	status := ""
-	var existingCfg McpServerConfig
-	var existingToolDefs []McpDiscoveredTool
-	var existingClient *client.Client
-	var existingToken *mcpConnToken
-	if ok {
-		status = existing.Status
-		// Config/ToolDefs 必须在锁内拷出、出锁后再比对：ReconcileConfigs 会
-		// 持写锁原地替换 handle.Config.DisabledTools，refreshServerTools 会
-		// 持写锁整体换 handle.ToolDefs，锁外裸读这两个字段（结构体与 slice
-		// header）就是与它们的数据竞争——status 先拷再出锁是同一课。Client
-		// 的写者都持拨号锁（本函数已持有，天然互斥），一并收进快照只为让
-		// "读 handle"只有一种写法。
-		existingCfg = existing.Config
-		existingToolDefs = existing.ToolDefs
-		existingClient = existing.Client
-		existingToken = existing.token
-	}
-	m.mu.RUnlock()
-	if ok && (status == "connected" || status == "connecting") && mcpServerConfigEqual(existingCfg, cfg) {
-		return
-	}
-
-	handle := &McpClientHandle{ServerName: name, Config: cfg, Status: "connecting"}
-	var staleClient *client.Client
-	if ok {
-		// 整体换记录：旧记录按设计留着上一次断连的 client（handleConnectionLost
-		// 不关，见其注释），换记录时必须由这里替它 Close，否则 socket 与传输
-		// goroutine 悬空。ToolDefs 则要继承：注入跟配置走、不跟连接状态走，换
-		// 记录不能让注入视图在本次连接建立期间出现空洞、漂移会话的请求前缀。
-		handle.ToolDefs = existingToolDefs
-		staleClient = existingClient
-	}
+	// Check the latest config and publish the new handle under the same lock.
+	// A queued passive retry only applies to the failed handle that triggered it.
 	m.mu.Lock()
+	existing := m.clients[name]
+	if m.closed || (retryFrom != nil && (existing != retryFrom || retryFrom.Status != "failed")) {
+		m.mu.Unlock()
+		return
+	}
+	if retryFrom != nil {
+		cfg = retryFrom.Config
+	}
+	if m.configSnapshot != nil {
+		current, configured := m.configSnapshot[name]
+		if !configured || !mcpServerConfigEqual(current, cfg) {
+			m.mu.Unlock()
+			return
+		}
+		// Tool filters do not affect the dial. Use the latest selection even
+		// when it changed after this attempt was queued.
+		cfg = current
+	}
+	if existing != nil && (existing.Status == "connected" || existing.Status == "connecting") && mcpServerConfigEqual(existing.Config, cfg) {
+		m.mu.Unlock()
+		return
+	}
+	handle := &McpClientHandle{ServerName: name, Config: cfg, Status: "connecting", passiveRetry: retryFrom != nil}
+	var staleClient *client.Client
+	var staleToken *mcpConnToken
+	if existing != nil {
+		// Keep the prior tool definitions visible while replacing the transport.
+		if mcpServerConfigEqual(existing.Config, cfg) {
+			handle.ToolDefs = existing.ToolDefs
+		} else {
+			m.catalogReady = false
+		}
+		staleClient, staleToken = existing.Client, existing.token
+	}
 	m.clients[name] = handle
 	m.mu.Unlock()
+	defer func() {
+		if failure := recover(); failure != nil {
+			m.mu.Lock()
+			if handle.Status == "connecting" {
+				handle.Status = "failed"
+				handle.Error = "connection setup failed unexpectedly"
+			}
+			m.mu.Unlock()
+			m.notifyChange()
+			panic(failure)
+		}
+	}()
 	m.notifyChange()
 	if staleClient != nil {
-		existingToken.stop()
+		staleToken.stop()
 		m.closeClient(staleClient)
 	}
 
 	// 一次尝试，不重试：重试会把同一个服务端的拨号锁占住十几秒（一次工具调用撞
-	// 上去只能干等，最后拿到的还是同一个失败），失败就如实落 failed 等下次用到
-	// 再连（见 McpManager 总纲）。
+	// 上去只能干等，最后拿到的还是同一个失败）。失败就如实落 failed，等
+	// RetryFailedMcpServers 在下一轮对话或用户动作时重拨。
 	established, err := m.initializeMcpClient(ctx, name, cfg)
 	if err != nil {
 		m.mu.Lock()
@@ -632,9 +633,8 @@ type mcpEstablished struct {
 // 已连接"的老毛病）。
 func (m *McpManager) commitConnectionLocked(handle *McpClientHandle, established mcpEstablished) {
 	handle.Client = established.client
-	handle.ToolDefs = established.tools
+	m.setServerToolsLocked(handle, established.tools)
 	handle.token = established.token
-	m.replaceToolLookupLocked(handle.ServerName, established.tools)
 	if cause, lost := established.token.lostCause(); lost {
 		handle.Status = "failed"
 		handle.Error = cause
@@ -642,6 +642,13 @@ func (m *McpManager) commitConnectionLocked(handle *McpClientHandle, established
 	}
 	handle.Status = "connected"
 	handle.Error = ""
+	established.token.mu.Lock()
+	established.token.catalogReady = true
+	dirty := established.token.catalogDirty
+	established.token.mu.Unlock()
+	if dirty {
+		m.markToolsListDirty(handle.ServerName, established.token)
+	}
 }
 
 // lockServerDial 取得某个服务端的拨号互斥（首连与重连共用），返回释放函数。
@@ -692,40 +699,6 @@ func (m *McpManager) initializeMcpClient(ctx context.Context, name string, cfg M
 		return mcpEstablished{}, fmt.Errorf("list tools failed (timed out or refused after %s): %w", mcpStartupTimeout(cfg), err)
 	}
 	return mcpEstablished{client: mcpClient, tools: discovered, token: token}, nil
-}
-
-// listMcpTools 拉取一个服务端的完整工具清单，三条路径共用：连接握手、通知
-// 触发的重拉。nextCursor 分页要跟着走（分页服务端第一页只有一部分）；页数上限
-// 守住"永远返回 cursor"的服务端。
-func listMcpTools(ctx context.Context, serverName string, mcpClient *client.Client) ([]McpDiscoveredTool, error) {
-	var discovered []McpDiscoveredTool
-	var cursor mcp.Cursor
-	for page := 0; ; page++ {
-		listReq := mcp.ListToolsRequest{}
-		if cursor != "" {
-			listReq.Params.Cursor = cursor
-		}
-		toolsResult, err := mcpClient.ListTools(ctx, listReq)
-		if err != nil {
-			return nil, err
-		}
-		for _, tool := range toolsResult.Tools {
-			discovered = append(discovered, McpDiscoveredTool{
-				ServerName:   serverName,
-				Name:         tool.Name,
-				FunctionName: mcpToolFunctionName(serverName, tool.Name),
-				Description:  tool.Description,
-				Schema:       toolSchemaToMap(tool.InputSchema),
-			})
-		}
-		// page 从 0 计数，已完成 page+1 次请求：上限按已完成的请求数对齐，
-		// 最多发 maxMcpListToolsPages 次（此前 page >= max 会多发第 101 次）。
-		if toolsResult.NextCursor == "" || page+1 >= maxMcpListToolsPages {
-			break
-		}
-		cursor = toolsResult.NextCursor
-	}
-	return discovered, nil
 }
 
 // maxMcpListToolsPages bounds the ListTools pagination loop against servers
@@ -839,7 +812,18 @@ func (m *McpManager) newMcpClient(ctx context.Context, name string, cfg McpServe
 	// 必须另起 goroutine。
 	mcpClient.OnNotification(func(notification mcp.JSONRPCNotification) {
 		if notification.Method == mcpMethodToolListChanged {
-			m.markToolsListDirty(name, token)
+			token.mu.Lock()
+			ready := token.catalogReady
+			token.catalogDirty = !ready
+			token.mu.Unlock()
+			if ready {
+				m.mu.RLock()
+				handle := m.clients[name]
+				if handle != nil && handle.token == token && handle.Status == "connected" {
+					m.markToolsListDirty(name, token)
+				}
+				m.mu.RUnlock()
+			}
 		}
 	})
 	mcpClient.OnConnectionLost(func(err error) {
@@ -965,7 +949,7 @@ func mcpStdioEnvFromBase(base []string, srv McpServerConfig) []string {
 }
 
 // watchStdioProcess 守护一个 stdio MCP 子进程：等它退出，清理可能脱管的孙
-// 进程，并在"这仍是当前那条连接"时把状态翻成 failed（下一次调用会重连自愈）。
+// 进程，并在"这仍是当前那条连接"时把状态翻成 failed（下一轮对话开头重拨）。
 //
 // 退出判据用 os.Process.Wait 而不是轮询 kill(pid,0)：Unix 上子进程退出后会
 // 先变成僵尸，kill(pid,0) 依旧返回成功，只有 wait4 能看出它已经不在了
@@ -1013,10 +997,10 @@ func mcpProcessExitCause(state *os.ProcessState, err error) string {
 // 当成故障，更不能让旧连接的死亡打翻刚建好的新连接。
 //
 // 工具清单与 client 都保留：失败服务端的工具照常注入（collectTools 只排除
-// disabled），而"下一次调用先重连再试"要靠它们把连接救回来（对齐 ZCode 的调用
-// 前按需重连）。client 不在这里关闭——本函数可能就跑在传输层的回调/读取路径上，
-// 同步关闭有自锁风险；它持有的管道与句柄会在下一次重连、配置调和或退出时随
-// Close 一起释放。
+// disabled），重拨由 RetryFailedMcpServers 在下一轮对话或用户动作时发起；
+// 调用路径不会重连，更不会重放一次可能已经执行过的调用。client 不在这里关闭——
+// 本函数可能就跑在传输层的回调/读取路径上，同步关闭有自锁风险；它持有的管道与
+// 句柄会在下一次重拨、配置调和或退出时随 Close 一起释放。
 func (m *McpManager) handleConnectionLost(serverName string, token *mcpConnToken, cause string) {
 	// 先记进 token：连接可能还没被登记到 handle 上（握手刚成功、进程就死），
 	// 登记那一步要靠它把结果落成 failed。
@@ -1078,19 +1062,6 @@ func (m *McpManager) markToolsListDirty(serverName string, token *mcpConnToken) 
 	})
 }
 
-// markConnectPanicked releases a dial that crashed before it could settle: the
-// panel must not sit on "connecting" forever, and the next call has to be able
-// to dial again.
-func (m *McpManager) markConnectPanicked(name string) {
-	m.mu.Lock()
-	if handle, ok := m.clients[name]; ok && handle.Status == "connecting" {
-		handle.Status = "failed"
-		handle.Error = "connection setup failed unexpectedly"
-	}
-	m.mu.Unlock()
-	m.notifyChange()
-}
-
 // runToolRefresh 是一轮"防抖 + 不丢"的刷新循环：refresh 收到的是最新一次通知
 // 的连接身份，连接被换掉时 refreshServerTools 会自行放弃。
 func (m *McpManager) runToolRefresh(serverName string, slot *mcpToolRefreshSlot, refresh func(string, *mcpConnToken)) {
@@ -1117,9 +1088,7 @@ func (m *McpManager) runToolRefresh(serverName string, slot *mcpToolRefreshSlot,
 // 匹配）或当前不是 connected 时直接放弃——那不是这条连接的活。拉取失败不做
 // 任何状态变更：一次临时失败不该把一个好好的连接翻成 failed，等下一次通知或
 // 重连即可。
-//
-// 已冻结的会话工具集（sessionToolsets）不会因此变化，新工具在下一个会话可见
-// ——冻结是提示词前缀缓存的前提，不能被一次通知破掉。
+
 func (m *McpManager) refreshServerTools(serverName string, token *mcpConnToken) {
 	m.mu.RLock()
 	handle, ok := m.clients[serverName]
@@ -1140,103 +1109,10 @@ func (m *McpManager) refreshServerTools(serverName string, token *mcpConnToken) 
 	}
 	m.mu.Lock()
 	if current, ok := m.clients[serverName]; ok && current.token == token && current.Client == mcpClient && current.Status == "connected" {
-		current.ToolDefs = discovered
-		m.replaceToolLookupLocked(serverName, discovered)
+		m.setServerToolsLocked(current, discovered)
 	}
 	m.mu.Unlock()
 	m.notifyChange()
-}
-
-// toolSchemaToMap converts an MCP input schema to provider-safe JSON Schema.
-// Marshaling through mcp-go preserves $defs/additionalProperties and turns nil
-// slices/maps into valid []/{} values. The recursive normalization also removes
-// invalid null schema keywords sometimes emitted by compatible MCP servers.
-func toolSchemaToMap(schema mcp.ToolInputSchema) map[string]any {
-	raw, err := json.Marshal(schema)
-	if err != nil {
-		return map[string]any{"type": "object", "properties": map[string]any{}}
-	}
-	var result map[string]any
-	if err := json.Unmarshal(raw, &result); err != nil || result == nil {
-		return map[string]any{"type": "object", "properties": map[string]any{}}
-	}
-	normalizeMcpSchemaNode(result, true)
-	return result
-}
-
-func normalizeMcpSchemaNode(node map[string]any, root bool) {
-	if root {
-		if typ, ok := node["type"].(string); !ok || strings.TrimSpace(typ) == "" {
-			node["type"] = "object"
-		}
-	}
-	if node["type"] == "object" {
-		if _, ok := node["properties"].(map[string]any); !ok {
-			node["properties"] = map[string]any{}
-		}
-	}
-
-	if required, ok := normalizedMcpRequired(node["required"]); ok && len(required) > 0 {
-		node["required"] = required
-	} else {
-		delete(node, "required")
-	}
-	if node["additionalProperties"] == nil {
-		delete(node, "additionalProperties")
-	}
-
-	for _, key := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
-		children, ok := node[key].(map[string]any)
-		if !ok {
-			if key != "properties" || node["type"] != "object" {
-				delete(node, key)
-			}
-			continue
-		}
-		for _, child := range children {
-			if childSchema, ok := child.(map[string]any); ok {
-				normalizeMcpSchemaNode(childSchema, false)
-			}
-		}
-	}
-	for _, key := range []string{"additionalProperties", "items", "contains", "not", "if", "then", "else", "propertyNames", "unevaluatedProperties", "unevaluatedItems"} {
-		if child, ok := node[key].(map[string]any); ok {
-			normalizeMcpSchemaNode(child, false)
-		}
-	}
-	for _, key := range []string{"allOf", "anyOf", "oneOf", "prefixItems"} {
-		items, ok := node[key].([]any)
-		if !ok {
-			if node[key] == nil {
-				delete(node, key)
-			}
-			continue
-		}
-		for _, item := range items {
-			if child, ok := item.(map[string]any); ok {
-				normalizeMcpSchemaNode(child, false)
-			}
-		}
-	}
-}
-
-func normalizedMcpRequired(value any) ([]string, bool) {
-	switch required := value.(type) {
-	case []string:
-		return required, true
-	case []any:
-		out := make([]string, 0, len(required))
-		for _, item := range required {
-			name, ok := item.(string)
-			if !ok || strings.TrimSpace(name) == "" {
-				return nil, false
-			}
-			out = append(out, name)
-		}
-		return out, true
-	default:
-		return nil, false
-	}
 }
 
 const (
@@ -1275,71 +1151,16 @@ func mcpToolCallTimeout(cfg McpServerConfig) time.Duration {
 	return mcpTimeoutFromSeconds(cfg.ToolTimeoutSec, mcpDefaultToolCallTimeout)
 }
 
-// mcpCallFailure 说明一次 MCP 调用失败的性质，决定"是否值得重连后再试一次"。
-// 只有连接本身不可用才允许重连；服务端已经跑过工具再回错误的情况必须原样
-// 上报——重试会让有副作用的工具发生第二次（对齐 codex：运行期只重试
-// tools/list，工具调用绝不自动重放）。
-type mcpCallFailure int
-
-const (
-	mcpCallSucceeded mcpCallFailure = iota
-	// mcpCallConnectionDead：调用前就没有可用连接（上一次的连接定格在 failed）。
-	// 请求从未发出去，所以重连之后把这次调用执行一遍是安全的——这是"用则连"，
-	// 不是重放。
-	mcpCallConnectionDead
-	// mcpCallTransportBroken：请求已经发出、链路中途断了（子进程死了、管道关了、
-	// 会话 404 过期）。服务端可能已经跑过这个工具、只是结果没回来，所以只修连接、
-	// 绝不重放这次调用（见 replaySafeAfterReconnect）。
-	mcpCallTransportBroken
-	// mcpCallToolFailed：服务端跑过这个工具并回了错误结果（isError:true）。
-	mcpCallToolFailed
-	// mcpCallUnavailable：服务端被停用、仍在连接中、工具不存在，或调用超时
-	// 取消（服务端可能还在跑）——没有可重连的连接。
-	mcpCallUnavailable
-)
-
-// replaySafeAfterReconnect 报告一次失败后连接已经修好时，能不能把这次调用继续
-// 跑下去。唯一判据是"请求有没有发出去过"：没发出去过（连接本来就是死的）可以；
-// 其余一律不行——服务端可能已经执行过并产生了副作用，重放就是把副作用做第二遍，
-// 交给模型结合工具语义自己判断更安全。
-func replaySafeAfterReconnect(failure mcpCallFailure) bool {
-	return failure == mcpCallConnectionDead
-}
-
-// mcpCallOutcome 是一次 callToolOnce 的结果信封：文本、当时用的 client
-// （重连时用来核对是不是同一条连接）与失败归类。
-type mcpCallOutcome struct {
-	text    string
-	client  *client.Client
-	failure mcpCallFailure
-}
-
+// CallTool 执行一次 MCP 工具调用。调用路径上不重连：拨号会吃掉这次调用的预算，
+// 而"重连之后要不要重放"本身就是副作用风险（请求可能已经发出去过）。断开的
+// 服务端由 RetryFailedMcpServers 在会话或用户动作触发时统一重拨一次。
 func (m *McpManager) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (string, error) {
+	if args == nil {
+		args = map[string]any{}
+	}
 	callCtx, cancel := context.WithTimeout(ctx, mcpToolCallTimeout(m.serverConfig(serverName)))
 	defer cancel()
-
-	outcome, err := m.callToolOnce(callCtx, serverName, toolName, args)
-	if err == nil {
-		return outcome.text, nil
-	}
-	if outcome.failure != mcpCallConnectionDead && outcome.failure != mcpCallTransportBroken {
-		return "", err
-	}
-
-	// 连接不可用了：先把连接建回来（用则连）。重连与调用共用 callCtx 的预算——
-	// 重连若超出剩余额度，整个调用按超时失败，而不是"重连成功了、调用却立即
-	// 超时"的自相矛盾结果。
-	if reconnectErr := m.reconnectServer(callCtx, serverName, outcome.client); reconnectErr != nil {
-		return "", fmt.Errorf("MCP call failed: %w; reconnect failed: %w", err, reconnectErr)
-	}
-	if !replaySafeAfterReconnect(outcome.failure) {
-		// 请求已经发出去过：服务端可能跑完了这个工具，再跑一遍就是把副作用做第二遍。
-		// 连接已经修好，把"要不要再来一次"交回模型——它比这里更懂这个工具重做一次
-		// 安不安全。
-		return "", fmt.Errorf("MCP call failed: %w; connection re-established, this call was NOT replayed (the server may already have executed it)", err)
-	}
-	result, callErr := m.callToolOnce(callCtx, serverName, toolName, args)
-	return result.text, callErr
+	return m.callToolOnce(callCtx, serverName, toolName, args)
 }
 
 // serverConfig 取某个服务端的当前配置（超时、cwd、env 都从这里读）；服务端已
@@ -1353,32 +1174,39 @@ func (m *McpManager) serverConfig(serverName string) McpServerConfig {
 	return McpServerConfig{}
 }
 
-func (m *McpManager) callToolOnce(ctx context.Context, serverName, toolName string, args map[string]any) (mcpCallOutcome, error) {
+func (m *McpManager) callToolOnce(ctx context.Context, serverName, toolName string, args map[string]any) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	m.mu.RLock()
-	handle, ok := m.clients[serverName]
-	if !ok {
+	handle := m.clients[serverName]
+	if handle == nil {
 		m.mu.RUnlock()
-		return mcpCallOutcome{failure: mcpCallUnavailable}, fmt.Errorf("MCP server %s not found", serverName)
+		return "", mcpToolNotFound(mcpServerID(serverName) + "." + toolName)
+	}
+	tool, err := m.registeredToolLocked(serverName, toolName)
+	if err == nil && handle.Status == "connected" {
+		err = tool.validateArguments(args)
+	}
+	if err != nil {
+		m.mu.RUnlock()
+		return "", err
 	}
 	status := handle.Status
 	handleErr := handle.Error
 	mcpClient := handle.Client
+	token := handle.token
 	m.mu.RUnlock()
 	if status != "connected" {
-		// failed 是"上一次连接已经死了"，允许调用前重连（请求从未发出，重连后
-		// 照常执行）；disabled 与 connecting 都不该由一次工具调用拉起来（后者已有
-		// 连接在飞）。
-		failure := mcpCallUnavailable
-		if status == "failed" {
-			failure = mcpCallConnectionDead
-		}
-		return mcpCallOutcome{client: mcpClient, failure: failure},
-			fmt.Errorf("MCP server %s status: %s/%s", serverName, status, handleErr)
+		return "", fmt.Errorf("MCP server %s status: %s/%s", serverName, status, handleErr)
 	}
 	if mcpClient == nil {
-		return mcpCallOutcome{failure: mcpCallUnavailable}, fmt.Errorf("MCP server %s has no active client", serverName)
+		return "", fmt.Errorf("MCP server %s has no active client", serverName)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name:      toolName,
@@ -1387,14 +1215,15 @@ func (m *McpManager) callToolOnce(ctx context.Context, serverName, toolName stri
 	}
 	result, err := mcpClient.CallTool(ctx, req)
 	if err != nil {
-		failure := mcpCallUnavailable
-		switch {
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-			// 超时/取消：服务端可能还在跑这个工具，重试就是把副作用放两遍。
-		case isMcpTransportFailure(err):
-			failure = mcpCallTransportBroken
+		// A transport-level failure means the client just used is gone: the
+		// subprocess died, the SSE stream dropped, or the HTTP session expired.
+		// Mark only the status — this call is never re-sent (the server may
+		// already have run it); the redial happens later, off the call path.
+		// Protocol rejections are not connection failures and stay untouched.
+		if errors.Is(err, transport.ErrTransportClosed) || errors.Is(err, transport.ErrSessionTerminated) {
+			m.handleConnectionLost(serverName, token, "MCP call failed: "+err.Error())
 		}
-		return mcpCallOutcome{client: mcpClient, failure: failure}, fmt.Errorf("MCP call failed: %w", err)
+		return "", fmt.Errorf("MCP call failed: %w", err)
 	}
 
 	outText := mcpToolResultText(result)
@@ -1402,13 +1231,10 @@ func (m *McpManager) callToolOnce(ctx context.Context, serverName, toolName stri
 		if strings.TrimSpace(outText) == "" {
 			outText = "MCP tool reported failure (isError: true)"
 		}
-		// 服务端确实执行了这个工具：错误文案再像网络故障也不能重连或重试。
-		// 旧的纯子串判据下，一个回 "connection refused" 的工具会让 Ally 杀掉
-		// 并重启整个 MCP 服务端、再把工具跑第二遍。
-		return mcpCallOutcome{client: mcpClient, failure: mcpCallToolFailed},
-			fmt.Errorf("MCP tool %s error: %s", toolName, outText)
+		// 服务端确实执行了这个工具：错误文案再像网络故障也不能当成连接故障。
+		return "", fmt.Errorf("MCP tool %s error: %s", toolName, outText)
 	}
-	return mcpCallOutcome{text: outText, client: mcpClient, failure: mcpCallSucceeded}, nil
+	return outText, nil
 }
 
 // mcpToolResultText renders every supported MCP content block into
@@ -1486,155 +1312,6 @@ func canonicalMcpJSON(raw []byte) string {
 	return string(canonical)
 }
 
-func (m *McpManager) reconnectServer(ctx context.Context, serverName string, failedClient *client.Client) error {
-	// 拨号互斥（与首连共用）：一台服务端的慢重连不该串住别的服务端，但同名
-	// 服务端不能有两次拨号同时在飞（见 connectOne）。
-	unlock := m.lockServerDial(serverName)
-	defer unlock()
-
-	m.mu.Lock()
-	handle, ok := m.clients[serverName]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("MCP server %s not found", serverName)
-	}
-	if handle.Status == "connected" && handle.Client != nil && handle.Client != failedClient {
-		m.mu.Unlock()
-		return nil
-	}
-	cfg := handle.Config
-	oldClient := handle.Client
-	oldToken := handle.token
-	handle.Status = "connecting"
-	handle.Error = "reconnecting after invalid session"
-	handle.Client = nil
-	m.mu.Unlock()
-	m.notifyChange()
-
-	if oldClient != nil {
-		oldToken.stop()
-		m.closeClient(oldClient)
-	}
-
-	established, err := m.initializeMcpClient(ctx, serverName, cfg)
-	m.mu.Lock()
-	current, ok := m.clients[serverName]
-	// 记录被换掉时不能往上写（配置调和重建了这台服务端）：否则我们刚连出来的
-	// 客户端会挂在别人的记录上，或者反过来变成再也没人关闭的孤儿进程。
-	if !ok || current != handle {
-		m.mu.Unlock()
-		if established.client != nil {
-			established.token.stop()
-			m.closeClient(established.client)
-		}
-		return fmt.Errorf("MCP server %s was replaced during reconnect", serverName)
-	}
-	if err != nil {
-		current.Status = "failed"
-		current.Error = err.Error()
-		m.mu.Unlock()
-		m.notifyChange()
-		return err
-	}
-	m.commitConnectionLocked(current, established)
-	m.mu.Unlock()
-	m.notifyChange()
-	return nil
-}
-
-func (m *McpManager) replaceToolLookupLocked(serverName string, discovered []McpDiscoveredTool) {
-	for functionName, ref := range m.toolLookup {
-		if ref.ServerName == serverName {
-			delete(m.toolLookup, functionName)
-		}
-	}
-	for _, tool := range discovered {
-		m.toolLookup[tool.FunctionName] = mcpToolRef{ServerName: tool.ServerName, ToolName: tool.Name}
-	}
-}
-
-// mcpTransportFailureSentinels 是 mcp-go 自己导出的"连接已不可用"哨兵错误。
-// 判据必须优先走 errors.Is：手写子串清单会漏——曾经漏掉 stdio 的
-// "transport closed" 与 streamable-http 的 "session terminated (404)"，于是
-// 子进程死了、会话过期了都只会把错误丢给模型，自动重连形同虚设。
-var mcpTransportFailureSentinels = []error{
-	transport.ErrTransportClosed,   // stdio：子进程退出 / 管道关闭
-	transport.ErrSessionTerminated, // streamable-http：404 会话已失效
-}
-
-// mcpTransportFailureMarkers 是兜底文案特征：覆盖 mcp-go 没有导出哨兵的传输
-// 错误（SSE 的 "connection has been closed"）与中转服务端自述的会话文案。
-var mcpTransportFailureMarkers = []string{
-	"invalid session id",
-	"invalid session",
-	"session not found",
-	"session expired",
-	"session terminated (404)",
-	"transport closed",
-	"transport is closing",
-	"client is closed",
-	"connection has been closed",
-	"closed pipe",
-	"broken pipe",
-	"connection reset",
-	"connection refused",
-	"eof",
-}
-
-// mcpProtocolErrorSentinels 是 mcp-go 把标准 JSON-RPC 错误码映射出来的哨兵：
-// 它们说明"服务端收到了这个请求并明确拒绝"，与链路无关，绝不重连。
-// （非标准错误码 mcp-go 只留一个字符串错误，分不出来源——所以下面的文案兜底
-// 仍然要覆盖它，中转服务端的"会话失效"就是这么报的。）
-var mcpProtocolErrorSentinels = []error{
-	mcp.ErrParseError,
-	mcp.ErrInvalidRequest,
-	mcp.ErrMethodNotFound,
-	mcp.ErrInvalidParams,
-}
-
-// isMcpTransportFailure 判断一个错误是否意味着当前连接已经不能用了。
-// 只能喂给它链路层/协议层的错误：服务端执行工具后回的 isError 结果绝不能进
-// 这里（见 mcpCallToolFailed）。
-func isMcpTransportFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	for _, sentinel := range mcpProtocolErrorSentinels {
-		if errors.Is(err, sentinel) {
-			return false
-		}
-	}
-	for _, sentinel := range mcpTransportFailureSentinels {
-		if errors.Is(err, sentinel) {
-			return true
-		}
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range mcpTransportFailureMarkers {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *McpManager) CallToolByFunctionName(ctx context.Context, functionName string, args map[string]any) (string, error) {
-	m.mu.RLock()
-	ref, ok := m.toolLookup[functionName]
-	m.mu.RUnlock()
-	if !ok {
-		return "", fmt.Errorf("MCP tool function %s not found", functionName)
-	}
-	return m.CallTool(ctx, ref.ServerName, ref.ToolName, args)
-}
-
-func (m *McpManager) DescribeFunctionTool(functionName string) (mcpToolRef, bool) {
-	m.mu.RLock()
-	ref, ok := m.toolLookup[functionName]
-	m.mu.RUnlock()
-	return ref, ok
-}
-
 // exitingNow 报告进程是否已经进入退出流程。
 func (m *McpManager) exitingNow() bool {
 	m.mu.RLock()
@@ -1667,7 +1344,7 @@ func (m *McpManager) AbandonForExit() {
 		}
 	}
 	m.clients = make(map[string]*McpClientHandle)
-	m.toolLookup = make(map[string]mcpToolRef)
+	m.catalogReady = false
 	m.closed = true
 	m.mu.Unlock()
 	m.cancelLifetime()
@@ -1687,7 +1364,7 @@ func (m *McpManager) shutdown(closeClients func([]*client.Client)) {
 		}
 	}
 	m.clients = make(map[string]*McpClientHandle)
-	m.toolLookup = make(map[string]mcpToolRef)
+	m.catalogReady = false
 	m.closed = true
 	m.mu.Unlock()
 	m.notifyChange()
@@ -1729,23 +1406,19 @@ func (m *McpManager) GetAllTools() []McpDiscoveredTool {
 	return m.collectTools(false)
 }
 
-// GetEnabledTools filters out tools whose original name sits in the server's
-// disabledTools blacklist. This is the model-facing view: the single injection
-// point is buildToolsWithMcp.
-func (m *McpManager) GetEnabledTools() []McpDiscoveredTool {
-	return m.collectTools(true)
-}
-
 // collectTools 按"配置开了的 server 就注入"收敛：连接是无状态的，注入不能跟着
 // 连接状态走。曾经只注入 connected 的清单，一次远端断流（长连 SSE 被服务端/代理
-// 回收是常态）就把工具从模型视图里整个抽走——冻结的工具集不再含它，模型从此调
-// 不到，只能重启应用。现在 connecting/failed 的服务端照常注入已发现的 ToolDefs
-// （断连不清清单，见 handleConnectionLost），调用时由 CallTool 先把连接建回来
-// 再说：请求没发出去过就正常执行一次，发出过则只报错、不重放；首次连接还没拿到
+// 回收是常态）就把工具从模型视图里整个抽走，只能重启应用。现在 connecting/failed 的服务端照常注入已发现的 ToolDefs
+// （断连不清清单，见 handleConnectionLost）；连接在下一轮对话开头由
+// RetryFailedMcpServers 重拨，调用路径只报错、不重连也不重放。首次连接还没拿到
 // 清单时 ToolDefs 为空，自然无可注入。"disabled" 是用户显式关掉的 server，永不注入。
 func (m *McpManager) collectTools(enabledOnly bool) []McpDiscoveredTool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.collectToolsLocked(enabledOnly)
+}
+
+func (m *McpManager) collectToolsLocked(enabledOnly bool) []McpDiscoveredTool {
 	var all []McpDiscoveredTool
 	for _, handle := range m.clients {
 		if handle.Status == "disabled" {
@@ -1784,49 +1457,6 @@ func (a *App) activeMcpManager() *McpManager {
 	manager := a.mcpManager
 	a.mu.Unlock()
 	return manager
-}
-
-// mcpDeclaredParameters returns the parameter declaration Ally sent the model
-// for an MCP tool, or nil when that tool is not part of the current set.
-func (a *App) mcpDeclaredParameters(functionName string) map[string]any {
-	manager := a.activeMcpManager()
-	if manager == nil {
-		return nil
-	}
-	for _, dt := range manager.GetEnabledTools() {
-		name := dt.FunctionName
-		if name == "" {
-			name = mcpToolFunctionName(dt.ServerName, dt.Name)
-		}
-		if name == functionName {
-			return dt.Schema
-		}
-	}
-	return nil
-}
-
-// mcpUnknownArgWarnings names the arguments an MCP call carries that its
-// declaration never promised. MCP tools keep the tolerant path — there is no
-// built-in schema for the argument gate to enforce — so without this notice a
-// typo reaches the server and is dropped there with the model none the wiser.
-// A tool with no declared properties reports nothing: silence beats flagging
-// every argument of an unknown shape.
-func (a *App) mcpUnknownArgWarnings(functionName string, args map[string]any) []string {
-	properties, ok := a.mcpDeclaredParameters(functionName)["properties"].(map[string]any)
-	if !ok || len(properties) == 0 || len(args) == 0 {
-		return nil
-	}
-	unknown := make([]string, 0, len(args))
-	for key := range args {
-		if _, declared := properties[key]; !declared {
-			unknown = append(unknown, key)
-		}
-	}
-	if len(unknown) == 0 {
-		return nil
-	}
-	sort.Strings(unknown)
-	return []string{fmt.Sprintf("以下参数不在工具声明中，已原样转发给 MCP 服务端（服务端可能忽略）：%s", strings.Join(unknown, ", "))}
 }
 
 // IsToolDisabled reports whether a server's tool sits in its injection
@@ -1897,8 +1527,12 @@ func (m *McpManager) GetServerStatuses() []map[string]any {
 		// checkboxes without a second binding. Disabled servers never
 		// discovered tools, so their list is empty by construction.
 		disabled := disabledToolSet(handle.Config.DisabledTools)
+		enabledCount := 0
 		tools := make([]map[string]any, 0, len(handle.ToolDefs))
 		for _, tool := range handle.ToolDefs {
+			if handle.Status != "disabled" && !disabled[tool.Name] {
+				enabledCount++
+			}
 			description := strings.TrimSpace(tool.Description)
 			// 按字符数截断而不是按字节：中文等多字节字符从中间切开会产生
 			// 非法 UTF-8，序列化后前端看到的是 replacement char 乱码。
@@ -1915,12 +1549,13 @@ func (m *McpManager) GetServerStatuses() []map[string]any {
 			return tools[i]["name"].(string) < tools[j]["name"].(string)
 		})
 		result = append(result, map[string]any{
-			"name":      name,
-			"status":    handle.Status,
-			"error":     handle.Error,
-			"toolCount": len(handle.ToolDefs),
-			"transport": mcpTransportName(handle.Config),
-			"tools":     tools,
+			"name":             name,
+			"status":           handle.Status,
+			"error":            handle.Error,
+			"toolCount":        len(handle.ToolDefs),
+			"enabledToolCount": enabledCount,
+			"transport":        mcpTransportName(handle.Config),
+			"tools":            tools,
 		})
 	}
 	return result
@@ -1976,13 +1611,13 @@ func (m *McpManager) waitForDiscovery(ctx context.Context, progress func([]strin
 			if cfg.Enabled != nil && !*cfg.Enabled {
 				continue
 			}
-			if handle := m.clients[name]; handle == nil || handle.Status == "connecting" {
+			if handle := m.clients[name]; handle == nil || (handle.Status == "connecting" && !handle.passiveRetry) {
 				pending = append(pending, name)
 			}
 		}
 		// Also covers direct dials and reconnects not originating in LoadConfigs.
 		for name, handle := range m.clients {
-			if _, configured := m.configSnapshot[name]; !configured && handle.Status == "connecting" {
+			if _, configured := m.configSnapshot[name]; !configured && handle.Status == "connecting" && !handle.passiveRetry {
 				pending = append(pending, name)
 			}
 		}
@@ -2014,8 +1649,8 @@ var errMcpDiscoveryStopped = errors.New("MCP manager stopped while waiting for t
 
 const mcpDiscoveryWaitTimeout = 30 * time.Second
 
-// Only a new/unfrozen chat waits. Existing session schemas remain stable; footer
-// estimates and stateless tool enumeration never wait or freeze anything.
+// Wait for initial discovery on a new chat. Later catalog updates reach the
+// next model step without blocking an existing session.
 func (a *App) waitForSessionMcp(ctx context.Context, runID, sessionID string) error {
 	a.mu.Lock()
 	_, frozen := a.sessionToolsets[sessionID]
@@ -2053,7 +1688,7 @@ func (a *App) waitForSessionMcp(ctx context.Context, runID, sessionID string) er
 		return ctx.Err()
 	}
 	// A bounded wait may finish with only a subset of tools. Tell the user before
-	// freezing that subset; discovery itself continues for future sessions.
+	// sending that subset; discovery continues and later steps see updates.
 	// Settings may replace the manager during this wait. Use the active
 	// manager's currently available tools, preserving run cancellation above.
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errMcpDiscoveryStopped) {
@@ -2063,37 +1698,6 @@ func (a *App) waitForSessionMcp(ctx context.Context, runID, sessionID string) er
 }
 
 // ── MCP tool exposure and frontend bindings ──────────────────
-
-// buildToolsWithMcp combines static tools with dynamically discovered MCP tools.
-// MCP tools go through GetEnabledTools so a server's disabledTools blacklist
-// keeps those schemas out of the model request entirely.
-// buildToolsWithMcp appends the enabled MCP tools to the given builtin set.
-func (a *App) buildToolsWithMcp(builtins []openai.Tool) []openai.Tool {
-	tools := builtins
-	manager := a.activeMcpManager()
-	if manager == nil {
-		return tools
-	}
-	mcpTools := manager.GetEnabledTools()
-	for _, dt := range mcpTools {
-		name := dt.FunctionName
-		if name == "" {
-			name = mcpToolFunctionName(dt.ServerName, dt.Name)
-		}
-		desc := strings.TrimSpace(dt.Description)
-		if desc == "" {
-			desc = fmt.Sprintf("MCP tool %s from %s", dt.Name, dt.ServerName)
-		} else {
-			desc = fmt.Sprintf("[%s] %s", dt.ServerName, desc)
-		}
-		params := dt.Schema
-		if params == nil {
-			params = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
-		tools = append(tools, rawFunctionTool(name, desc, params))
-	}
-	return tools
-}
 
 // builtinToolsForConfig is the shared availability rule for schema injection
 // and UI inventory. The local read/edit/create/delete/command core survives.
@@ -2113,7 +1717,7 @@ func builtinToolsForConfig(cfg ConfigState) []openai.Tool {
 
 // buildToolsForConfig is the live set for stateless callers and new sessions.
 func (a *App) buildToolsForConfig(cfg ConfigState) []openai.Tool {
-	return withToolPurposes(a.buildToolsWithMcp(withoutGoalUpdateTool(builtinToolsForConfig(cfg))))
+	return withToolPurposes(withoutGoalUpdateTool(builtinToolsForConfig(cfg)))
 }
 
 func withoutGoalUpdateTool(tools []openai.Tool) []openai.Tool {
@@ -2167,7 +1771,8 @@ func builtinToolDisabled(ctx context.Context, cfg ConfigState, name string) bool
 		return false
 	}
 	for _, disabled := range cfg.DisabledTools {
-		if normalizeToolName(disabled) == name {
+		disabledName := normalizeToolName(disabled)
+		if disabledName == name || ((name == "fetch" || name == "http_request" || name == "web_fetch") && (disabledName == "fetch" || disabledName == "http_request" || disabledName == "web_fetch")) {
 			return true
 		}
 	}
@@ -2732,36 +2337,6 @@ func (a *App) ReconcileMcpServers() error {
 }
 
 // ── MCP tool execution ───────────────────────────────────────
-
-func (a *App) executeMcpFunctionTool(ctx context.Context, functionName string, args map[string]any) (any, error) {
-	manager := a.activeMcpManager()
-	if manager == nil {
-		return nil, fmt.Errorf("MCP not initialized")
-	}
-	result, err := manager.CallToolByFunctionName(ctx, functionName, args)
-	if err != nil {
-		return nil, fmt.Errorf("MCP tool %s failed: %w", functionName, err)
-	}
-	return map[string]any{"output": result}, nil
-}
-
-func (a *App) mcpToolEventMeta(functionName string) map[string]any {
-	if !isMcpToolFunctionName(functionName) {
-		return nil
-	}
-	manager := a.activeMcpManager()
-	if manager == nil {
-		return nil
-	}
-	ref, ok := manager.DescribeFunctionTool(functionName)
-	if !ok {
-		return nil
-	}
-	return map[string]any{
-		"mcpServer": ref.ServerName,
-		"mcpTool":   ref.ToolName,
-	}
-}
 
 func mergeToolEventMeta(event map[string]any, meta map[string]any) map[string]any {
 	if len(meta) == 0 {

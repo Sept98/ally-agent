@@ -58,22 +58,22 @@ func ReadTextFile(path string) ([]byte, os.FileInfo, error) {
 func ReadRawTextFile(path string) ([]byte, os.FileInfo, error) {
 	pre, err := os.Stat(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, toolerrors.PathError(path, err)
 	}
 	if !pre.Mode().IsRegular() && !pre.IsDir() {
 		return nil, nil, toolerrors.New("E_NOT_REGULAR_FILE", errors.New("path is not a regular file"))
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, toolerrors.PathError(path, err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, toolerrors.PathError(path, err)
 	}
 	if info.IsDir() {
-		return nil, nil, toolerrors.New("E_IS_DIRECTORY", errors.New("path is a directory; use list_files to inspect its entries"))
+		return nil, nil, toolerrors.New("E_IS_DIRECTORY", errors.New("path is a directory; use command to inspect its entries"))
 	}
 	if !info.Mode().IsRegular() {
 		return nil, nil, toolerrors.New("E_NOT_REGULAR_FILE", errors.New("path is not a regular file"))
@@ -98,7 +98,7 @@ const MaxTailBytes = 128 * 1024
 func ReadTextTail(path string) ([]byte, int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, toolerrors.PathError(path, err)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, 0, errors.New("tail requires a regular file")
@@ -178,15 +178,6 @@ func EncodeLike(original []byte, text string) ([]byte, error) {
 		return nil, toolerrors.New("E_EDIT_ENCODING", errors.New("edited text cannot be read back faithfully in the source encoding; nothing was written. Remove binary/NUL content, or explicitly convert the source to UTF-8 or BOM-marked UTF-16 before retrying"))
 	}
 	return data, nil
-}
-
-func hasNUL(data []byte) bool {
-	for _, b := range data {
-		if b == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // DecodeTextBytes decodes raw file bytes into UTF-8 text bytes. UTF-16 LE/BE

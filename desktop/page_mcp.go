@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -24,12 +25,6 @@ type mcpSaveOptions struct {
 // Avoid rebuilding a very long checklist on every frame of a height animation.
 // Large lists use a paint-only fade while the existing page scroll remains instant.
 const mcpAnimatedChecklistLimit = 40
-
-// mcpNoteLine is a one-line note: tab-specific notes must not change height,
-// or the content below the tab strip shifts when the tab changes.
-func mcpNoteLine(c *ui.Context, s string, ink ...ui.Color) {
-	ui.Text(c, s).FontSize(fsTiny).TextColor(uikit.SecondaryInk(c, ink)).SingleLine()
-}
 
 // mcpServerEntry mirrors the fields the editor owns; unknown keys survive in
 // Extra so a hand-edited mcp.json is round-tripped without loss.
@@ -195,7 +190,10 @@ func (a *desktop) mcpPageBody(c *ui.Context) {
 		a.linkMenu(c, "mcp-market", [][2]string{{locales.Text("魔搭 ModelScope"), "https://modelscope.cn/mcp"}, {locales.Text("火山引擎 Volcengine"), "https://www.volcengine.com/mcp"}, {"Glama", "https://glama.ai/mcp/servers"}, {"PulseMCP", "https://www.pulsemcp.com"}})
 		primary(c, locales.Text("添加")).Disabled(a.mcpF.Busy || a.mcpF.ImportBusy).OnClick(func() { a.openMCPEditor("") })
 	})
-	mcpNoteLine(c, locales.Text("支持 stdio / SSE / Streamable HTTP；服务器配置自动保存，工具开关只影响新会话。"), a.secondaryInk())
+	ui.Text(c, locales.Text("支持 stdio / SSE / Streamable HTTP；服务器配置自动保存，工具开关只影响新会话。大量工具只注入元数据，通过ToolSearch按需发现，不会膨胀上下文。")).FontSize(fsTiny).TextColor(a.secondaryInk())
+	ui.Row(c.Key("mcp-pool-overview")).Children(func() {
+		a.mcpPoolChip(c)
+	})
 	ui.Scroll(c).Grow(1).MinHeight(0).Children(func() {
 		ui.Column(c).Gap(gapInline).Children(func() { a.mcpServerList(c) })
 	})
@@ -306,7 +304,90 @@ func (a *desktop) renderMCPServerList(c *ui.Context, data mcpListData) {
 
 func (a *desktop) setMCPServers(servers []map[string]any) {
 	a.mcpServers = servers
+	enabled := 0
+	for _, server := range servers {
+		enabled += int(num(server, "enabledToolCount"))
+	}
+	a.mcpSummary = fmt.Sprintf(locales.Text("%d 个工具"), enabled)
 	a.mcpServersRev++
+}
+
+func (a *desktop) mcpPoolLabel() string {
+	if a.mcpSummary == "" {
+		return fmt.Sprintf(locales.Text("%d 个工具"), 0)
+	}
+	return a.mcpSummary
+}
+
+// mcpPoolChip shows the pool count and opens the list behind it: the same
+// panel the welcome page displays, anchored to the count instead of a table
+// cell so the number itself leads to the tools.
+func (a *desktop) mcpPoolChip(c *ui.Context) {
+	label := a.mcpPoolLabel()
+	chip := accentChip(c, label).Key("mcp-pool-chip").Cursor(ui.CursorPointer).Label(locales.Text("MCP 工具池") + " " + label)
+	uikit.Tooltip(c, chip, locales.Text("勾选的工具注入模型上下文，取消勾选即停用；对端新增工具默认启用；下一会话生效，不触发重连。"))
+	if chip.Clicked() {
+		a.mcpF.PoolOpen = !a.mcpF.PoolOpen
+	}
+	popoverPanel(c, chip, &a.mcpF.PoolOpen, 320, func() {
+		ui.Text(c, locales.Text("MCP 工具池")).FontSize(fsSection).Bold().Padding(gapInline, padCard)
+		ui.Scroll(c).MaxHeight(320).Children(func() {
+			ui.Column(c).Gap(2).Padding(4, 10).Children(func() { a.mcpPoolTools(c) })
+		})
+	})
+}
+
+// mcpPoolTools lists the discovered tools grouped by server, marking the ones
+// a server has switched off. It feeds the pool chip and the welcome panel;
+// both read the same status list, so the rows are written once.
+func (a *desktop) mcpPoolTools(c *ui.Context) {
+	shown := false
+	for _, server := range a.mcpServers {
+		tools := list(server, "tools")
+		if len(tools) == 0 {
+			continue
+		}
+		shown = true
+		enabled := 0
+		for _, item := range tools {
+			if m, ok := item.(map[string]any); ok && !boolOf(m, "disabled") {
+				enabled++
+			}
+		}
+		ui.Row(c).Gap(gapTight).AlignItems(ui.Center).Padding(gapTight, 0, 0).Children(func() {
+			statusDot(c, str(server, "status"))
+			ui.Text(c, str(server, "name")).FontSize(fsSmall).Bold()
+			ui.Spacer(c)
+			fieldNote(c, fmt.Sprintf(locales.Text("工具 %d/%d"), enabled, len(tools)), a.secondaryInk())
+		})
+		for _, item := range tools {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name := str(m, "name")
+			disabled := boolOf(m, "disabled")
+			if disabled {
+				name += locales.Text("（已停用）")
+			}
+			row := ui.Row(c).Padding(0, gapInline).Gap(gapTight).AlignItems(ui.Center)
+			row.Children(func() {
+				text := ui.Text(c, name).FontSize(fsTiny).SingleLine()
+				if disabled {
+					text.TextColor(a.secondaryInk())
+				}
+			})
+			uikit.Tooltip(c, row, str(m, "description"))
+		}
+	}
+	if shown {
+		return
+	}
+	if len(a.mcpServers) == 0 {
+		fieldNote(c, locales.Text("无 MCP 服务"), a.secondaryInk())
+		return
+	}
+	fieldNote(c, locales.Text("连接成功后这里会列出该服务发现的工具。"), a.secondaryInk())
 }
 
 // mcpStatusIndex maps a server name to its status map. It is rebuilt once per
@@ -445,7 +526,7 @@ func (a *desktop) mcpEditorDialog(c *ui.Context) {
 	}
 	formDialog(c, &a.mcpF.EditorOpen, widthModal, height, title, "", func() {
 		ui.Grid(c.Key("mcp-header-fields")).ColumnTracks(ui.Fr(1), ui.Fr(1)).FillWidth().Gap(gapSection).Children(func() {
-			fieldRow(c, "mcp-name", locales.Text("服务名称"), &a.mcpF.Name, false)
+			fieldRowRequired(c, "mcp-name", locales.Text("服务名称"), &a.mcpF.Name)
 			ui.Column(c).Gap(gapTight).Children(func() {
 				fieldLabel(c, locales.Text("传输方式"))
 				current := a.mcpTransport()
@@ -460,7 +541,7 @@ func (a *desktop) mcpEditorDialog(c *ui.Context) {
 			})
 		})
 		if a.mcpTransport() == mcpTransportStdio {
-			fieldRow(c, "mcp-command", locales.Text("命令"), &a.mcpF.Command, false)
+			fieldRowRequired(c, "mcp-command", locales.Text("命令"), &a.mcpF.Command)
 			fieldLabel(c, locales.Text("参数"))
 			textArea(c, "mcp-args", locales.Text("参数"), `["-y", "@playwright/mcp"]`, &a.mcpF.Args, 90).FillWidth()
 			fieldNote(c, locales.Text("填写 JSON 字符串数组，保留参数中的空格和逗号；无参数可留空。"), a.secondaryInk())
@@ -468,7 +549,7 @@ func (a *desktop) mcpEditorDialog(c *ui.Context) {
 			textArea(c, "mcp-env", locales.Text("环境变量"), `{"API_KEY": "your-api-key"}`, &a.mcpF.Env, 70)
 			fieldNote(c, locales.Text("JSON 对象，也支持每行 KEY=value。"), a.secondaryInk())
 		} else {
-			fieldRow(c, "mcp-url", "URL", &a.mcpF.URL, false)
+			fieldRowRequired(c, "mcp-url", "URL", &a.mcpF.URL)
 			fieldNote(c, locales.Text("例如 http://127.0.0.1:9121/mcp（SSE 通常为 /sse）。"), a.secondaryInk())
 			fieldLabel(c, locales.Text("请求头"))
 			textArea(c, "mcp-headers", locales.Text("请求头"), `{"Authorization": "Bearer your-token"}`, &a.mcpF.Headers, 70)
@@ -501,6 +582,18 @@ func (a *desktop) saveMCPEditor() {
 		delete(doc.Servers, a.mcpF.Editing)
 	}
 	transport := a.mcpTransport()
+	// A stdio server without a command and a remote server without an address both
+	// save fine and only fail on the next connect, where the error no longer points
+	// at the field. Reject them here instead.
+	if transport == mcpTransportStdio {
+		if strings.TrimSpace(a.mcpF.Command) == "" {
+			a.notify(locales.Text("请填写启动命令"))
+			return
+		}
+	} else if !mcpURLValid(a.mcpF.URL) {
+		a.notify(locales.Text("请填写有效的 MCP 地址（http:// 或 https://）"))
+		return
+	}
 	if transport == mcpTransportHTTP {
 		transport = "http" // the spelling other MCP clients write
 	}
@@ -533,6 +626,13 @@ func (a *desktop) saveMCPEditor() {
 	}
 	doc.Servers[name] = entry
 	a.saveMCPDoc(doc, mcpSaveOptions{onSuccess: func() { a.mcpF.EditorOpen = false }})
+}
+
+// mcpURLValid reports whether the editor's address is one the remote transports can
+// dial: SSE and Streamable HTTP both speak http(s) and need a host.
+func mcpURLValid(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func formatArgs(args []string) string {
@@ -650,7 +750,6 @@ func (a *desktop) saveMCPDoc(doc *mcpConfigDoc, options ...mcpSaveOptions) {
 			a.mcpText = saved
 			a.mcpServerNames = names
 			a.setMCPServers(servers)
-			a.mcpSummary = mcpSummary(servers)
 			a.refreshMCPInventory()
 			if opt.onSuccess != nil {
 				opt.onSuccess()
@@ -692,7 +791,6 @@ func (a *desktop) refreshMCPAll(manual ...bool) {
 			a.mcpText = raw
 			a.setMCPServers(servers)
 			a.mcpServerNames = names
-			a.mcpSummary = mcpSummary(servers)
 			a.refreshMCPInventory()
 			if len(manual) > 0 && manual[0] {
 				a.notifySuccess(locales.Text("MCP 列表已刷新"))
@@ -714,7 +812,7 @@ func (a *desktop) refreshMCPInventory() {
 				return
 			}
 			a.toolInventory = tools
-			a.toolCount = enabledToolCount(tools)
+			a.builtinToolCount = enabledBuiltinToolCount(tools)
 		})
 	}()
 }

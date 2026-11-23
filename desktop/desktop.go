@@ -37,6 +37,7 @@ type conversation struct {
 	ContextTokens                                     int
 	Messages                                          []map[string]any
 	Busy                                              bool
+	trayOutcome                                       string
 	CancelRequested                                   bool
 	Created                                           int64
 	SnapshotQueued                                    bool
@@ -158,7 +159,6 @@ type desktop struct {
 	upd                                     updateUI
 	filesF                                  fileUI
 	statsChart                              statsBarsData
-	gameF                                   gameUI
 	plans                                   map[string][]backend.PlanStep
 	planRev                                 map[string]int64
 	goals                                   map[string]backend.Goal
@@ -193,7 +193,7 @@ type desktop struct {
 	// move it, and its press outlives a frame.
 	tabStrips                                 map[string]*tabStrip
 	mcpSummary                                string
-	toolCount                                 int
+	builtinToolCount                          int
 	toolInventory                             []backend.ToolDefinitionSummary
 	mcpServers                                []map[string]any
 	mcpTab, mcpNameFilter                     string
@@ -217,7 +217,6 @@ type desktop struct {
 	settingsAllowPrivate                      bool
 	apiState                                  backend.ApiServiceState
 	apiPort                                   float64
-	sandboxState                              backend.SandboxStatus
 	autostartValue                            bool
 
 	core                                                *backend.App
@@ -498,10 +497,9 @@ func Run() {
 				}
 				a.skills = skills
 				a.toolInventory = tools
-				a.toolCount = enabledToolCount(tools)
+				a.builtinToolCount = enabledBuiltinToolCount(tools)
 				a.refreshMCPInventory()
 				a.setMCPServers(servers)
-				a.mcpSummary = mcpSummary(servers)
 				a.sessions, a.sessRev = sessions, a.sessRev+1
 				a.goals = make(map[string]backend.Goal, len(goals))
 				for _, goal := range goals {
@@ -663,8 +661,12 @@ func (a *desktop) newConversation(workspace string) {
 		a.commitSettingsOnLeave()
 	}
 	t := a.freshConversation(workspace)
+	if len(a.tabs) > 0 {
+		a.core.RetryFailedMcpServers()
+	}
 	a.composerFocus = t.ID
 	a.tabs = append(a.tabs, t)
+	a.refreshNativeTray()
 	a.page = "chat"
 	a.activateTab(len(a.tabs) - 1)
 	a.refreshFiles()
@@ -732,6 +734,7 @@ func (a *desktop) newSession() {
 		a.commitSettingsOnLeave()
 	}
 	next := a.freshConversation(t.Workspace)
+	a.core.RetryFailedMcpServers()
 	next.Model = t.Model
 	next.Reasoning = t.Reasoning
 	a.composerFocus = next.ID
@@ -744,6 +747,7 @@ func (a *desktop) newSession() {
 		a.rememberSession(t)
 		a.tabs[a.active] = next
 	}
+	a.refreshNativeTray()
 	a.page = "chat"
 	if keepInTabs {
 		a.activateTab(len(a.tabs) - 1)
@@ -940,6 +944,8 @@ func (a *desktop) send(t *conversation, text string) bool {
 	t.PendingAttachmentImages = nil
 	a.loadSentAttachmentImages(t, attachments)
 	t.Busy = true
+	t.trayOutcome = ""
+	a.refreshNativeTray()
 	t.Draft = ""
 	t.Status = locales.Text("正在连接模型…")
 	followLatest(t)
@@ -949,6 +955,8 @@ func (a *desktop) send(t *conversation, text string) bool {
 		a.win.Update(func() {
 			if err != nil {
 				t.Busy = false
+				t.trayOutcome = "error"
+				a.refreshNativeTray()
 				t.Status = err.Error()
 				a.notifyError(err.Error())
 				invalidateChatSearch(t)
@@ -1213,7 +1221,7 @@ func (a *desktop) openSession(id string) {
 		}
 		// Only replace a cleaned temporary workspace. Never silently route a
 		// missing project to a different directory.
-		if info, statErr := os.Stat(s.Workspace); (s.Workspace == "" || strings.HasPrefix(filepath.Base(s.Workspace), "ally-temp-")) && (statErr != nil || !info.IsDir()) {
+		if info, statErr := os.Stat(s.Workspace); (s.Workspace == "" || tempWorkspace(s.Workspace)) && (statErr != nil || !info.IsDir()) {
 			root, tempErr := a.core.CreateTempWorkspace()
 			if tempErr != nil {
 				a.fail(tempErr)
@@ -1283,6 +1291,7 @@ func (a *desktop) showSession(next *conversation) {
 		a.discardBlankTab(a.tabs[reuse])
 		a.hideFilePreview()
 		a.tabs[reuse] = next
+		a.refreshNativeTray()
 		a.page = "chat"
 		a.activateTab(reuse)
 		a.refreshFiles()
@@ -1291,6 +1300,8 @@ func (a *desktop) showSession(next *conversation) {
 		return
 	}
 	a.tabs = append(a.tabs, next)
+	a.core.RetryFailedMcpServers()
+	a.refreshNativeTray()
 	a.page = "chat"
 	a.activateTab(len(a.tabs) - 1)
 	a.refreshFiles()
@@ -1326,7 +1337,6 @@ func (a *desktop) discardBlankTab(t *conversation) {
 // onEvent is wired to the backend event sink; the dispatcher lives in
 // events.go so the chat, task and update streams stay together.
 func (a *desktop) onEvent(name string, payload any) { a.dispatchEvent(name, payload) }
-func pretty(v any) string                           { b, _ := json.MarshalIndent(v, "", "  "); return string(b) }
 func (a *desktop) refreshFiles(manual ...bool) {
 	if a.core == nil || a.win == nil {
 		return

@@ -800,13 +800,13 @@ func (a *App) TestModelConnection(model ModelConfig) error {
 		return errors.New("model is required")
 	}
 	if !hasModelCredential(cfg) {
-		return missingModelCredentialError(cfg)
+		return missingModelCredentialError()
 	}
 	ctx := context.Background()
 	if a.ctx != nil {
 		ctx = a.ctx
 	}
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	testMaxTokens := cfg.MaxTokens
 	if testMaxTokens <= 0 {
@@ -857,8 +857,8 @@ func identityOfModel(m ModelConfig) ModelIdentity {
 // 物化这一步不能省：顶层字段只有两个写入方（/api/v1/models/activate，以及 2026-09
 // 之前设置页的"使用"按钮），而 stripModelFields 紧跟着就会清空它们、随后任意一次
 // 保存都以新形状落盘——不物化等于把用户的模型、地址与密钥一起静默抹掉（文件里没有
-// 第二份，也没有备份）。没有密钥时不物化：那种顶层字段本身跑不通（发送必然报
-// "API key is required"），凭空多一条空密钥的 preset 只会污染模型列表。
+// 第二份，也没有备份）。没有密钥时不物化：旧版的顶层字段当年只有配上密钥才跑得
+// 通（发送会报缺 key），凭一份空密钥凭空多出一条 preset 只会污染模型列表。
 func migrateLegacyModelFields(cfg *ConfigState, legacy ConfigState) {
 	identity := ModelIdentity{ProviderName: legacy.ProviderName, Model: legacy.Model}
 	if strings.TrimSpace(identity.Model) == "" {
@@ -972,8 +972,8 @@ func applyModelEntry(cfg *ConfigState, m ModelConfig) {
 
 // configForModelEntry 造一份“网络字段取当前配置、模型字段取给定条目”的请求配置。
 // 这是从一条 ModelConfig 造请求配置的唯一路径：“测试连接”（TestModelConnection）
-// 与“和模型下棋”（GameAIAction）以前各自手抄一份字段表，加一个模型字段时只有聊天
-// 主路径会生效——设置里能配、聊天里也生效，偏偏这两条路用不上。
+// 以前自己手抄一份字段表，加一个模型字段时只有聊天主路径会生效——设置里能配、
+// 聊天里也生效，偏偏这条路用不上。
 func (a *App) configForModelEntry(model ModelConfig) ConfigState {
 	cfg := a.effectiveConfig(ConfigState{})
 	// 模型字段整段换掉：applyModelEntry 在条目没填 ContextWindow（0）时会保留

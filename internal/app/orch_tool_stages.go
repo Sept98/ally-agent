@@ -15,7 +15,7 @@ import (
 )
 
 // toolCallStage reads scheduling metadata without changing the tool arguments.
-// MCP calls do not participate in the stage parameter contract (they use 0).
+// ToolExec uses its built-in envelope stage. Target arguments remain opaque.
 func toolCallStage(call openai.ToolCall) (int64, error) {
 	if !toolshared.IsBuiltinTool(normalizeToolName(call.Function.Name)) {
 		return 0, nil
@@ -51,7 +51,7 @@ func toolStageSucceeded(result toolResult) bool {
 	}
 	switch data := result.Data.(type) {
 	case CommandResult:
-		return data.ExitCode == 0 && !data.TimedOut && !data.Cancelled && !data.SandboxDenied && !data.PromotedToService
+		return data.ExitCode == 0 && !data.TimedOut && !data.Cancelled && !data.PromotedToService
 	case *CommandResult:
 		return data != nil && toolStageSucceeded(toolResult{OK: true, Data: *data})
 	case AgentDelegateResult:

@@ -78,7 +78,11 @@ func TestEditPreservesUTF16AndReturnedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := executeRecoveryTestEdit(t, a, context.Background(), a.config, FileTextEdits{Path: "utf16.txt", Version: first.Version, Changes: []TextChange{{OldText: "a", NewText: "b"}}})
+	args, err := json.Marshal(FileTextEdits{Path: "utf16.txt", Version: first.Version, Changes: []TextChange{{OldText: "a", NewText: "b"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := a.executeTool(context.Background(), a.config, "", "edit", args)
 	if !r.OK {
 		t.Fatal(r.Error)
 	}
@@ -236,7 +240,7 @@ func TestMissingReadBlocksDependentStageAndCancellationIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	rendered := renderReadResultForModel(*r)
-	if toolStageSucceeded(toolResult{OK: true, Data: r}) || !strings.Contains(rendered, "E_PATH_NOT_FOUND") || !strings.Contains(rendered, "list_files") {
+	if toolStageSucceeded(toolResult{OK: true, Data: r}) || !strings.Contains(rendered, "E_PATH_NOT_FOUND") {
 		t.Fatalf("missing input lost its next step: %q", rendered)
 	}
 	for i := 0; i < cap(a.fileReadSlots); i++ {

@@ -179,6 +179,7 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 	if instructionContext := a.buildSubagentInstructionContext(cfg, !req.CleanContext); instructionContext != "" {
 		messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: instructionContext})
 	}
+	ctx = context.WithValue(ctx, automaticContextPrefixKey{}, len(messages))
 	messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "## Task\n" + req.Task})
 	messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: subagentBudgetStartNotice(budget)})
 
@@ -206,6 +207,8 @@ func (a *App) executeDelegate(ctx context.Context, cfg ConfigState, sessionID st
 		if notice := subagentBudgetLowNotice(budget-step, budget); notice != "" {
 			messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: notice})
 		}
+
+		messages = a.ensureMcpCatalog(ctx, cfg, messages)
 
 		// Retry transient LLM errors (429/5xx/network) at the sub-agent loop
 		// level. Streaming-adapter retries only cover connection setup and
@@ -689,11 +692,9 @@ func subagentSystemPrompt(role string) string {
 		"# Tool Use\n\n" +
 		"Use only tools declared for this run; guidance about other tools does not make them available.\n\n" +
 		sharedRemoteAccessRules() +
-		"Prefer dedicated tools over shell commands: `grep` for search, `read` for file content, `edit`/`create`/`delete` for file changes, `list_files` for directory listings.\n\n" +
+		"Prefer dedicated tools over shell commands: `grep` for search, `read` for file content, `edit`/`create`/`delete` for file changes, `command` for directory listings.\n\n" +
 		sharedBatchStrategy() +
-		"**Editing discipline**:\n" +
-		sharedEditRules() +
-		"\n# Coding Guidelines\n\n" +
+		"# Coding Guidelines\n\n" +
 		sharedCodingGuidelines() + "\n" +
 		"# Safety\n\n" +
 		sharedSafetyBoundaries() +
@@ -771,8 +772,8 @@ func (a *App) buildSubagentInstructionContext(cfg ConfigState, withProjectMap bo
 		}
 		b.WriteString("## Lower-priority custom instructions\n")
 		b.WriteString("Follow these custom instructions when they do not conflict with the sub-agent system rules or the delegated task.\n\n")
-		b.WriteString(custom)
-		b.WriteString("\n")
+		appendAutomaticContextText(&b, custom)
+		appendAutomaticContextText(&b, "\n")
 	}
 	return strings.TrimSpace(b.String())
 }

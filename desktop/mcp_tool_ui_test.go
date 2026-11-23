@@ -1,11 +1,32 @@
 package desktop
 
 import (
+	"ally-dev/locales"
 	"encoding/json"
+	"fmt"
 	"github.com/egoist/mygo/ui"
 	"reflect"
 	"testing"
 )
+
+func TestMCPURLValidRejectsAddressesTheTransportsCannotDial(t *testing.T) {
+	for _, test := range []struct {
+		url  string
+		want bool
+	}{
+		{"https://mcp.example.com/sse", true},
+		{"http://127.0.0.1:9121/mcp", true},
+		{"  http://127.0.0.1:9121/mcp  ", true},
+		{"", false},
+		{"localhost:9121/mcp", false},
+		{"ftp://mcp.example.com/sse", false},
+		{"https://", false},
+	} {
+		if got := mcpURLValid(test.url); got != test.want {
+			t.Errorf("mcpURLValid(%q) = %v, want %v", test.url, got, test.want)
+		}
+	}
+}
 
 func TestMCPTransportSelectionUpdatesDraft(t *testing.T) {
 	a := &desktop{}
@@ -123,5 +144,23 @@ func TestMCPCheckboxWritesNewValueAndSurvivesRebuild(t *testing.T) {
 				t.Fatalf("disabled tools %v want %v", got, step.want)
 			}
 		}
+	}
+}
+
+func TestMCPOverviewTracksServerStatusUpdates(t *testing.T) {
+	a := &desktop{}
+	a.applyMCPStatus(map[string]any{"servers": []map[string]any{
+		{"status": "connected", "enabledToolCount": 2, "toolCount": 5},
+		{"status": "failed", "enabledToolCount": 1, "toolCount": 1},
+		{"status": "disabled"},
+	}})
+	if want := fmt.Sprintf(locales.Text("%d 个工具"), 3); a.mcpPoolLabel() != want {
+		t.Fatalf("pool label = %q, want %q", a.mcpPoolLabel(), want)
+	}
+	a.applyMCPStatus(map[string]any{"servers": []map[string]any{
+		{"status": "connected", "enabledToolCount": 1, "toolCount": 1},
+	}})
+	if want := fmt.Sprintf(locales.Text("%d 个工具"), 1); a.mcpPoolLabel() != want {
+		t.Fatalf("pool label = %q, want %q", a.mcpPoolLabel(), want)
 	}
 }

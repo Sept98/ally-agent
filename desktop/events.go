@@ -139,7 +139,11 @@ func (a *desktop) applyEvent(name string, p map[string]any) {
 	switch name {
 	case "run:start":
 		ui.GoalActivity = ""
+		t.trayOutcome = ""
 		wasStarting := t.Busy
+		if !wasStarting {
+			defer a.refreshNativeTray()
+		}
 		t.RunID = str(p, "runId")
 		t.Busy = true
 		t.Status = locales.Text("正在连接模型…")
@@ -199,7 +203,6 @@ func (a *desktop) applyEvent(name string, p map[string]any) {
 		t.Selected = make([]string, len(t.Questions))
 		ui.AskIndex = 0
 		ui.AskSelected = map[string][]string{}
-		ui.AskCustom = map[string]bool{}
 		ui.AskCustomTxt = map[string]string{}
 		ui.AskImages = map[string][]preparedAttachment{}
 		ui.AskImageBitmaps = nil
@@ -299,6 +302,15 @@ func (a *desktop) applyEvent(name string, p map[string]any) {
 		t.Status = locales.Text("已注入新消息，继续执行…")
 	case "run:done", "run:error":
 		ui.GoalActivity = ""
+		defer a.refreshNativeTray()
+		t.trayOutcome = str(p, "status")
+		if t.trayOutcome == "" {
+			if name == "run:done" {
+				t.trayOutcome = "done"
+			} else {
+				t.trayOutcome = "error"
+			}
+		}
 		t.toolRev++
 		ui.ThinkingBytes = 0
 		ui.PlanCollapsed = true
@@ -595,7 +607,6 @@ func (a *desktop) applyMCPStatus(p map[string]any) {
 	var servers []map[string]any
 	_ = json.Unmarshal(b, &servers)
 	a.setMCPServers(servers)
-	a.mcpSummary = mcpSummary(servers)
 	a.refreshMCPInventory()
 }
 

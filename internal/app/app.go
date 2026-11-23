@@ -27,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	"ally-dev/internal/chatgpt"
+	"ally-dev/internal/tools/edit"
 	"ally-dev/internal/tools/grep"
 	"ally-dev/internal/tools/imagegen"
 	"ally-dev/internal/tools/pathutil"
@@ -271,14 +272,10 @@ type App struct {
 	// Guarded by mu.
 	frozenTurnNotices map[string]map[string]string
 
-	// sessionToolsets freezes the model-visible tool schema list per session
-	// (sessionID → tools). Tool schemas are part of the provider prompt-cache
-	// prefix, so an MCP server disconnect/reconnect or toggling servers/tools
-	// mid-conversation would otherwise invalidate the whole cache twice per
-	// blip. Frozen tools for a disconnected server surface as an execution
-	// error (the model adapts) instead of the tool silently vanishing. A successful
-	// compaction drops this snapshot too (refreshSessionPromptPrefix). Guarded by
-	// mu.
+	// sessionToolsets freezes the protocol built-in tool schemas at the first
+	// request. The live MCP catalog travels in runtime messages. Successful
+	// compaction drops the snapshot through refreshSessionPromptPrefix.
+	// Guarded by mu.
 	sessionToolsets map[string][]openai.Tool
 
 	// sessionWorkspaces records the workspace each session's runs actually
@@ -1144,31 +1141,6 @@ type ServiceInfo struct {
 	// 任务中心据此显示“超时转后台”徽标。
 	Promoted       bool `json:"promoted,omitempty"`
 	TimeoutSeconds int  `json:"timeoutSeconds,omitempty"`
-	// Sandboxed 标记该服务的进程跑在操作系统级沙箱里（同 CommandResult）。
-	Sandboxed bool `json:"sandboxed,omitempty"`
-	// SandboxDenied 标记该服务的输出里出现过内核拒写（同 CommandResult）：
-	// 事件一旦出现就留住——拒绝那几行很快会被日志刷出尾部，而卡片那行说的
-	// 是「这次写没成」这件已经发生的事。
-	SandboxDenied bool `json:"sandboxDenied,omitempty"`
-	// DeniedWriteHint 与 CommandResult 的同名字段同源（同一句文案）：解释与
-	// 下一步给模型，不进 Output，模型侧由 renderService*ResultForModel 追加。
-	DeniedWriteHint string `json:"deniedWriteHint,omitempty"`
-}
-
-// SandboxStatus 是设置页要如实展示的沙箱环境状态：这台机器上会不会真的包住命令、
-// 是强制开启还是本平台不用、后端是否真的可用。沙箱已不再是用户配置，所以这里没有
-// “用户选的档位”，也没有不可关闭的禁读清单。
-type SandboxStatus struct {
-	// Effective 是这台机器上实际生效的档位：强制平台（macOS）且后端可用时是
-	// "enforce"，其余一律是 ""（不启用）。
-	Effective string `json:"effective"`
-	// Forced 表示本平台强制开启沙箱：没有开关可关。
-	Forced bool `json:"forced"`
-	// Available 表示本机后端真的能应用沙箱。
-	Available bool `json:"available"`
-	// Warning 是给用户看的整句话（无事可说时为空）：强制平台后端不可用时说清
-	// 现在是安全围栏在守。
-	Warning string `json:"warning,omitempty"`
 }
 
 type ServiceListResult struct {
@@ -1203,18 +1175,6 @@ type CommandResult struct {
 	Cancelled       bool  `json:"cancelled"`
 	DurationMS      int64 `json:"durationMs"`
 	Truncated       bool  `json:"truncated"`
-	// Sandboxed 标记本次命令被操作系统级沙箱包裹执行。开启沙箱而包不上时命令
-	// 会被拒绝执行（失败即拒绝），不会出现“标记为 false 但开关是开着的”结果。
-	Sandboxed bool `json:"sandboxed,omitempty"`
-	// SandboxDenied 标记这次命令的写入被内核拦下。命令本身仍是“执行成功”的工具
-	// 结果（内核拒绝按约定是命令结果、不是工具错误），所以前端要显眼报错就需要
-	// 这个结构化字段——去嗅探输出文本会随文案与命令输出漂移。
-	SandboxDenied bool `json:"sandboxDenied,omitempty"`
-	// DeniedWriteHint 是写入被内核拦下时给模型的解释与下一步（原因 / 可写根 /
-	// 处理方式）。它刻意不进 Output：命令卡正体只预览尾部若干行，提示埋在正文里
-	// 既挤掉真正的报错，又和卡片顶部那行固定报错重复；模型侧由
-	// renderCommandResultForModel 追加在输出之后。
-	DeniedWriteHint string `json:"deniedWriteHint,omitempty"`
 	// PromotedToService 标记命令超时后已收编为后台服务：进程未死、端口未
 	// 释放，模型应改用 service 工具交互而不是重跑命令。
 	PromotedToService bool `json:"promotedToService,omitempty"`
@@ -1224,7 +1184,6 @@ type HTTPRequestToolRequest struct {
 	Method              string            `json:"method"`
 	URL                 string            `json:"url"`
 	Headers             map[string]string `json:"headers,omitempty"`
-	Query               map[string]string `json:"query,omitempty"`
 	Body                string            `json:"body,omitempty"`
 	JSON                json.RawMessage   `json:"json,omitempty"`
 	SaveTo              string            `json:"saveTo,omitempty"`
@@ -1277,17 +1236,19 @@ type WebFetchLink struct {
 }
 
 type WebFetchResult struct {
-	URL         string         `json:"url"`
-	FinalURL    string         `json:"finalUrl"`
-	Status      int            `json:"status"`
-	StatusText  string         `json:"statusText"`
-	Title       string         `json:"title,omitempty"`
-	Text        string         `json:"text"`
-	ContentType string         `json:"contentType"`
-	Links       []WebFetchLink `json:"links,omitempty"`
-	BytesRead   int            `json:"bytesRead"`
-	Truncated   bool           `json:"truncated"`
-	DurationMS  int64          `json:"durationMs"`
+	URL         string            `json:"url"`
+	FinalURL    string            `json:"finalUrl"`
+	Status      int               `json:"status"`
+	StatusText  string            `json:"statusText"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Redirects   []string          `json:"redirects,omitempty"`
+	Title       string            `json:"title,omitempty"`
+	Text        string            `json:"text"`
+	ContentType string            `json:"contentType"`
+	Links       []WebFetchLink    `json:"links,omitempty"`
+	BytesRead   int               `json:"bytesRead"`
+	Truncated   bool              `json:"truncated"`
+	DurationMS  int64             `json:"durationMs"`
 }
 
 type RemoteReadFileRequest struct {
@@ -1446,10 +1407,10 @@ type FileTextEdits struct {
 // content without a word. The argument gate enforces the declaration before the
 // edit handler runs (see TestEditRejectsChangeWithoutNewText).
 type TextChange struct {
-	OldText    string `json:"oldText,omitempty"`
-	LineRange  string `json:"lineRange,omitempty"`
-	NewText    string `json:"newText"`
-	ReplaceAll bool   `json:"replaceAll,omitempty"`
+	OldText    string          `json:"oldText,omitempty"`
+	LineRange  *edit.LineRange `json:"lineRange,omitempty"`
+	NewText    string          `json:"newText"`
+	ReplaceAll bool            `json:"replaceAll,omitempty"`
 }
 
 type MultiEditResult struct {
@@ -1764,7 +1725,7 @@ func (a *App) startChatWithConfig(req ChatRequest, cfg ConfigState) (string, err
 		cfg.BaseURL = defaultBaseURLForAPIFormat(cfg.APIFormat)
 	}
 	if !hasModelCredential(cfg) {
-		return "", missingModelCredentialError(cfg)
+		return "", missingModelCredentialError()
 	}
 	if strings.TrimSpace(cfg.Workspace) == "" {
 		return "", errors.New("workspace is required")
@@ -1805,19 +1766,10 @@ func (a *App) startChatWithConfig(req ChatRequest, cfg ConfigState) (string, err
 	// concurrent request cannot overwrite the active run's frozen context.
 	modelChanged := false
 	if req.SessionID != "" {
-		if a.sessionWorkspaces == nil {
-			a.sessionWorkspaces = map[string]string{}
-		}
-		if a.sessionModelConfigs == nil {
-			a.sessionModelConfigs = map[string]sessionModelConfig{}
-		}
 		prev, hasPrev := a.sessionModelConfigs[req.SessionID]
 		modelChanged = hasPrev && isCrossModelSwitch(prev, cfg)
 		a.sessionWorkspaces[req.SessionID] = strings.TrimSpace(cfg.Workspace)
 		a.sessionModelConfigs[req.SessionID] = sessionModelConfigFrom(cfg)
-	}
-	if a.sessionRunOutcomes == nil {
-		a.sessionRunOutcomes = map[string]sessionRunOutcome{}
 	}
 	a.sessionRunOutcomes[req.SessionID] = sessionRunOutcome{RunID: runID, Status: "running"}
 	a.runs[runID] = cancel
@@ -1951,9 +1903,6 @@ func (a *App) syncRunSessionIndex(sessionID string, needed bool) {
 // recordRunOutcome keeps the result that /result and status queries read.
 func (a *App) recordRunOutcome(runID, sessionID string, outcome runOutcome) {
 	a.mu.Lock()
-	if a.sessionRunOutcomes == nil {
-		a.sessionRunOutcomes = map[string]sessionRunOutcome{}
-	}
 	a.sessionRunOutcomes[sessionID] = sessionRunOutcome{
 		RunID: runID, Status: outcome.kind, Error: outcome.message, UpdatedAt: time.Now().UnixMilli(),
 	}
@@ -2292,6 +2241,10 @@ func (a *App) stripSessionReasoning(sessionID string) {
 }
 
 func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg ConfigState) {
+	// One redial attempt per turn for MCP servers whose connection was lost.
+	// It is non-blocking and coalesced per server, so a run never waits on a
+	// dial, and a tool call that already failed is never re-sent on its behalf.
+	a.RetryFailedMcpServers()
 	cfg = a.contextSettingsForSession(req.SessionID, cfg, true)
 	ctx, closeBlackboard := newRunBlackboard(ctx)
 	ctx = withModelRunUsage(ctx)
@@ -2383,8 +2336,8 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		end = runOutcome{kind: kind, message: err.Error()}
 		return
 	}
-	// This run sends the same immutable tool list on every step. Count it once
-	// from that exact list, including across in-run history compaction.
+	// Keep the tool list stable until successful compaction rebuilds the prefix.
+	// Recount the exact list together with its execution availability then.
 	tools := a.buildToolsForSession(sessionID, cfg)
 	if req.GoalID != "" && !toolListHasName(tools, "goal_update") {
 		end = runOutcome{kind: "error", message: "goal_update is not available in this session's frozen tool set; start the goal in a fresh session"}
@@ -2392,7 +2345,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 	}
 	ctx = withBuiltinToolAvailability(ctx, tools)
 	toolEventMeta := func(name string) map[string]any { return a.toolEventMeta(ctx, name) }
-	toolSchemaTokens, mcpSchemaTokens := estimateToolSchemaTokenParts(tools)
+	toolSchemaTokens := estimateToolSchemaTokens(tools)
 	breakdownAcc := newLiveBreakdownAccumulator(messages)
 	// Read de-duplication is scoped to the session, not to this run: a file range
 	// the conversation already carries is omitted instead of re-sent, until a
@@ -2407,7 +2360,6 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		}
 		b := breakdownAcc.update(msgs)
 		b.ToolSchemas = toolSchemaTokens
-		b.MCPToolSchemas = mcpSchemaTokens
 		b.SystemPrompt, _ = a.sessionPrefixBreakdown(sessionID, cfg, nil)
 		a.finalizeSessionBreakdown(sessionID, &b, msgs)
 		a.mu.Lock()
@@ -2449,6 +2401,7 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			// the next response starts on a fresh one.
 			a.emit("run:inject", map[string]any{"runId": runID, "sessionId": sessionID})
 		}
+		messages = a.ensureMcpCatalog(ctx, cfg, messages)
 		// Update live breakdown for context display (includes all tool calls/results)
 		bd := syncBreakdown(messages, false)
 
@@ -2465,7 +2418,10 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 			// rewrite is accepted only when its estimate drops below half;
 			// otherwise it falls back to a full summary before sending the request.
 			if newMessages, payload, compactErr := a.compactRunHistory(ctx, cfg, sessionID, compactReasonThreshold, req, messages, usedTokens); compactErr == nil {
-				messages = newMessages
+				tools = a.buildToolsForSession(sessionID, cfg)
+				ctx = withBuiltinToolAvailability(ctx, tools)
+				toolSchemaTokens = estimateToolSchemaTokens(tools)
+				messages = a.ensureMcpCatalog(ctx, cfg, newMessages)
 				bd = syncBreakdown(messages, true)
 				usedTokens = bd.Total
 				queueGoalCheckpoint()
@@ -2612,7 +2568,10 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 					end = runOutcome{kind: "error", message: fmt.Sprintf("%v；上下文超出模型窗口且压缩失败(%v)，请删除部分历史或改用窗口更大的模型后重试", err, compactErr)}
 					return
 				}
-				messages = newMessages
+				tools = a.buildToolsForSession(sessionID, cfg)
+				ctx = withBuiltinToolAvailability(ctx, tools)
+				toolSchemaTokens = estimateToolSchemaTokens(tools)
+				messages = a.ensureMcpCatalog(ctx, cfg, newMessages)
 				requestMessages = messages
 				syncBreakdown(messages, true)
 				queueGoalCheckpoint()
@@ -2769,9 +2728,9 @@ func (a *App) runChat(ctx context.Context, runID string, req ChatRequest, cfg Co
 		// correctly. messages append stays ordered below.
 		emitOutcome := func(o toolOutcome) {
 			if o.result.OK {
-				a.emit("tool:result", mergeToolEventMeta(map[string]any{"runId": runID, "sessionId": sessionID, "toolBatchId": toolBatchID, "toolCallIndex": o.index, "toolCallId": o.callID, "name": o.name, "result": o.json, "durationMs": o.duration}, a.mcpToolEventMeta(o.name)))
+				a.emit("tool:result", mergeToolEventMeta(map[string]any{"runId": runID, "sessionId": sessionID, "toolBatchId": toolBatchID, "toolCallIndex": o.index, "toolCallId": o.callID, "name": o.name, "result": o.json, "durationMs": o.duration}, mcpExecEventMeta(o.name, toolCalls[o.index].Function.Arguments)))
 			} else {
-				a.emit("tool:error", mergeToolEventMeta(map[string]any{"runId": runID, "sessionId": sessionID, "toolBatchId": toolBatchID, "toolCallIndex": o.index, "toolCallId": o.callID, "name": o.name, "error": o.result.Error, "errorCode": o.result.ErrorCode, "durationMs": o.duration}, a.mcpToolEventMeta(o.name)))
+				a.emit("tool:error", mergeToolEventMeta(map[string]any{"runId": runID, "sessionId": sessionID, "toolBatchId": toolBatchID, "toolCallIndex": o.index, "toolCallId": o.callID, "name": o.name, "error": o.result.Error, "errorCode": o.result.ErrorCode, "durationMs": o.duration}, mcpExecEventMeta(o.name, toolCalls[o.index].Function.Arguments)))
 			}
 		}
 
@@ -3109,7 +3068,7 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		if err == nil {
 			data, err = a.executeScheduledTaskTool(cfg, req)
 		}
-	case "http_request":
+	case "fetch", "http_request":
 		var req HTTPRequestToolRequest
 		err, argWarnings = decodeJSON(&req)
 		if err == nil {
@@ -3120,7 +3079,11 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 			}
 		}
 		if err == nil {
-			data, err = a.httpRequestToolWithConfig(ctx, cfg, req)
+			if name == "http_request" {
+				data, err = a.httpRequestToolWithConfig(ctx, cfg, req)
+			} else {
+				data, err = a.fetchToolWithConfig(ctx, cfg, req)
+			}
 		}
 	case "web_fetch":
 		var req WebFetchRequest
@@ -3276,27 +3239,19 @@ func (a *App) executeTool(ctx context.Context, cfg ConfigState, sessionID, name 
 		if err == nil {
 			data, err = a.handleSkillToolCall(cfg, sessionID, skReq.Skill, skReq.Args)
 		}
-	default:
-		// Route MCP tool calls by their sanitized OpenAI function name.
-		if isMcpToolFunctionName(name) {
-			var mcpArgs map[string]any
-			if decodeErr := json.Unmarshal(args, &mcpArgs); decodeErr == nil {
-				// stage is Ally scheduling metadata, never an MCP tool argument.
-				delete(mcpArgs, "stage")
-				// Other MCP arguments pass through without a built-in schema gate;
-				// surface undeclared ones here so the model can correct them.
-				argWarnings = append(argWarnings, a.mcpUnknownArgWarnings(name, mcpArgs)...)
-				result, callErr := a.executeMcpFunctionTool(ctx, name, mcpArgs)
-				if callErr != nil {
-					err = callErr
-				} else {
-					data = result
-				}
-			} else {
-				err = fmt.Errorf("invalid MCP tool args: %w", decodeErr)
-			}
-			break
+	case mcpSearchName:
+		var req mcpSearchRequest
+		err, argWarnings = decodeJSON(&req)
+		if err == nil {
+			data, err = a.searchMcpTools(ctx, cfg, req)
 		}
+	case mcpExecName:
+		var req mcpExecRequest
+		err, argWarnings = decodeJSON(&req)
+		if err == nil {
+			data, err = a.execMcpTool(ctx, req)
+		}
+	default:
 		err = fmt.Errorf("unknown tool: %s", name)
 	}
 	if err != nil {
@@ -4059,6 +4014,59 @@ func violationPath(v schemautil.Violation) string {
 	return v.Path + "." + v.UnsupportedKey
 }
 
+// toolArgDecodeError renders a failed tool-argument decode for the model. The
+// declared schema is the only source that names the problem in the model's own
+// vocabulary ("changes[0].lineRange.start: must be integer, got string"); the
+// raw encoding/json error is never echoed because it names internal Go structs
+// ("FileTextEdits.changes.0.lineRange.start of type int") and carries no code.
+// The schema gate further down never sees this failure — decoding runs first —
+// so the code has to be attached here.
+func toolArgDecodeError(name string, args []byte, err error) error {
+	if schema, ok := toolshared.BuiltinSchema(name); ok {
+		violations := schemautil.ValidateArgs(schema, args)
+		fatal := make([]schemautil.Violation, 0, len(violations))
+		for _, violation := range violations {
+			if violation.UnsupportedKey == "" {
+				fatal = append(fatal, violation)
+			}
+		}
+		if len(fatal) > 0 {
+			return codedToolError("E_BAD_ARGS", fmt.Errorf("invalid arguments for %s: %s", name, schemautil.DescribeViolations(fatal)))
+		}
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && typeErr.Field != "" {
+		return codedToolError("E_BAD_ARGS", fmt.Errorf("invalid arguments for %s: %s must be %s, got %s; correct that field and call again", name, typeErr.Field, goJSONTypeName(typeErr.Type), typeErr.Value))
+	}
+	return codedToolError("E_BAD_ARGS", fmt.Errorf("invalid arguments for %s: arguments do not match the declared schema", name))
+}
+
+// goJSONTypeName names the JSON type a Go decode target expects, for the rare
+// tool with no declared schema (MCP targets decode into a map instead).
+func goJSONTypeName(t reflect.Type) string {
+	for t != nil && t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t == nil {
+		return "the declared type"
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	case reflect.Map, reflect.Struct:
+		return "an object"
+	}
+	return "the declared type"
+}
+
 func decodeToolArguments(name string, args []byte, v any) (error, []string) {
 	// Missing arguments decode as an empty object so the gate reports the
 	// absent required parameters explicitly instead of letting the handler
@@ -4076,11 +4084,11 @@ func decodeToolArguments(name string, args []byte, v any) (error, []string) {
 		// calls look as if they had exhausted max_tokens.
 		if isIncompleteStreamJSON(err) {
 			if name == "edit" || name == "replace_exact" || name == "replace_lines" || name == "remote_edit" {
-				return fmt.Errorf("tool arguments JSON was truncated (output cut off or stream interrupted). Merge small changes into one edit call; split large changes (a whole function or section) into separate edit calls; use lineRange (inclusive A-B whole-line range) for large deletions or replacements of a contiguous line range: %w", err), nil
+				return fmt.Errorf("tool arguments JSON was truncated (output cut off or stream interrupted). Merge small changes into one edit call; split large changes (a whole function or section) into separate edit calls; use lineRange (start/end plus the exact startText/endText of those lines) for large deletions or replacements of a contiguous line range: %w", err), nil
 			}
 			return fmt.Errorf("tool arguments JSON was truncated (output cut off or stream interrupted): %w", err), nil
 		}
-		return fmt.Errorf("invalid tool arguments JSON for %s: %w", name, err), nil
+		return toolArgDecodeError(name, rawArgs, err), nil
 	}
 	// Unmarshal into the actual target (allows unknown fields). Type errors
 	// trigger one repair round per offending field path: double-encoded
@@ -4088,7 +4096,7 @@ func decodeToolArguments(name string, args []byte, v any) (error, []string) {
 	// does not waste a model round trip.
 	var repairedFields []string
 	cur := rawArgs
-	if name == "http_request" {
+	if name == "fetch" || name == "http_request" {
 		if fixed, ok := repairHTTPRequestJSONArg(cur); ok {
 			cur = fixed
 			repairedFields = append(repairedFields, "json")
@@ -4101,11 +4109,11 @@ func decodeToolArguments(name string, args []byte, v any) (error, []string) {
 		}
 		var typeErr *json.UnmarshalTypeError
 		if !errors.As(err, &typeErr) || round >= maxToolArgRepairRounds {
-			return fmt.Errorf("invalid tool arguments JSON for %s: %w", name, err), nil
+			return toolArgDecodeError(name, cur, err), nil
 		}
 		fixed, ok := repairToolArgJSON(cur, typeErr)
 		if !ok {
-			return fmt.Errorf("invalid tool arguments JSON for %s: %w", name, err), nil
+			return toolArgDecodeError(name, cur, err), nil
 		}
 		cur = fixed
 		repairedFields = append(repairedFields, typeErr.Field)
@@ -4117,7 +4125,7 @@ func decodeToolArguments(name string, args []byte, v any) (error, []string) {
 	if fixed, ok := repairDisplayBounds(name, cur); ok {
 		cur = fixed
 		if err := json.Unmarshal(cur, v); err != nil {
-			return fmt.Errorf("invalid tool arguments JSON for %s: %w", name, err), nil
+			return toolArgDecodeError(name, cur, err), nil
 		}
 	}
 	var warnings []string

@@ -100,16 +100,6 @@ func TestMcpFirstSessionWaitsBeforeFreezingAndReportsProgress(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("completion did not wake waiter")
 	}
-	tools := a.buildToolsForSession("session", a.config)
-	found := false
-	for _, tool := range tools {
-		if tool.Function.Name == mcpToolFunctionName("slow", "found") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("discovered tool missing from frozen session")
-	}
 	events = sink.snapshot()
 	if events[len(events)-1]["state"] != "ready" {
 		t.Fatalf("wait label was not cleared: %+v", events)
@@ -289,31 +279,6 @@ func TestMcpSSEStartupDeadlineCoversResponseHeaders(t *testing.T) {
 	}
 }
 
-func TestMcpReconnectedStdioOutlivesCallingContext(t *testing.T) {
-	t.Parallel()
-	a := newApiTestApp(t)
-	script := filepath.Join(t.TempDir(), "server.py")
-	if err := os.WriteFile(script, []byte(mcpStdioTestServerScript), 0600); err != nil {
-		t.Fatal(err)
-	}
-	m := NewMcpManager(a.config.Workspace, nil)
-	defer m.Shutdown()
-	m.clients["echo"] = &McpClientHandle{ServerName: "echo", Status: "failed", Config: McpServerConfig{Command: mcpTestPython(t), Args: []string{script}}}
-	ctx, cancel := context.WithCancel(t.Context())
-	first, err := m.CallTool(ctx, "echo", "where", nil)
-	cancel()
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := m.CallTool(t.Context(), "echo", "where", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != second || !strings.Contains(second, "pid=") {
-		t.Fatalf("call cancellation replaced live process: %q / %q", first, second)
-	}
-}
-
 func TestMcpSSEConnectionOutlivesStartupBudgetAndCaller(t *testing.T) {
 	t.Parallel()
 	a := newApiTestApp(t)
@@ -344,5 +309,60 @@ func TestMcpSSEConnectionOutlivesStartupBudgetAndCaller(t *testing.T) {
 	response, err := established.client.CallTool(callCtx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "echo"}})
 	if err != nil || response.IsError || mcpToolResultText(response) != "still connected" {
 		t.Fatalf("startup context leaked into transport lifetime: %v / %+v", err, response)
+	}
+}
+
+func TestEventRetryDoesNotBlockDiscovery(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	m := NewMcpManager(t.TempDir(), nil)
+	defer m.Shutdown()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	var releaseDial sync.Once
+	defer releaseDial.Do(func() { close(release) })
+	cfg := McpServerConfig{Command: filepath.Join(t.TempDir(), "missing-mcp")}
+	failed := &McpClientHandle{ServerName: "failed", Config: cfg, Status: "failed"}
+	m.initialLoading = false
+	m.clients["failed"] = failed
+	cfg.DisabledTools = []string{"hidden"}
+	m.configSnapshot = map[string]McpServerConfig{"failed": cfg}
+	m.listener = func() {
+		m.mu.RLock()
+		connecting := m.clients["failed"] != nil && m.clients["failed"].Status == "connecting"
+		m.mu.RUnlock()
+		if connecting {
+			close(started)
+			<-release
+		}
+	}
+	a := &App{mcpManager: m}
+	a.RetryFailedMcpServers()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("retry did not start")
+	}
+	if err := m.waitForDiscovery(ctx, nil); err != nil {
+		t.Fatalf("retry blocked discovery: %v", err)
+	}
+
+	// Replacing the configuration while a passive retry is in flight puts
+	// discovery back into the normal waiting path for the new connection.
+	m.mu.Lock()
+	filters := m.clients["failed"].Config.DisabledTools
+	delete(m.clients, "failed")
+	m.mu.Unlock()
+	if len(filters) != 1 || filters[0] != "hidden" {
+		t.Fatalf("retry discarded the latest tool filter: %v", filters)
+	}
+	waitCtx, stopWaiting := context.WithCancel(ctx)
+	defer stopWaiting()
+	var pending []string
+	err := m.waitForDiscovery(waitCtx, func(names []string) {
+		pending = names
+		stopWaiting()
+	})
+	if !errors.Is(err, context.Canceled) || len(pending) != 1 || pending[0] != "failed" {
+		t.Fatalf("replacement dial was skipped: pending=%v err=%v", pending, err)
 	}
 }

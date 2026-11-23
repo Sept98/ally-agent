@@ -4,7 +4,6 @@ package desktop
 import (
 	"ally-dev/desktop/uikit"
 	"ally-dev/locales"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"runtime"
@@ -18,8 +17,8 @@ import (
 var settingsSections = []string{"通用", "高级", "网络", "API", "无头模式", "安全围栏", "版本亮点", "支持开源", "关于"}
 
 // settingsGeneralSections 是「通用」分区标签的源文案。下标只在这里决定：
-// 欢迎页按名称定位「上下文加载」，增删分区不会让入口指错页面。
-var settingsGeneralSections = []string{"外观", "提示词", "路径", "对话行为", "应用", "语音输入", "上下文加载"}
+// 欢迎页按名称定位「上下文」，增删分区不会让入口指错页面。
+var settingsGeneralSections = []string{"外观", "提示词", "路径", "对话行为", "应用", "语音输入", "上下文"}
 
 func settingsGeneralSection(label string) int { return slices.Index(settingsGeneralSections, label) }
 
@@ -189,7 +188,7 @@ func (a *desktop) settingsGeneral(c *ui.Context) {
 }
 
 func (a *desktop) settingsGeneralContent(c *ui.Context, selected int) {
-	if selected == settingsGeneralSection("上下文加载") {
+	if selected == settingsGeneralSection("上下文") {
 		a.settingsContextLoading(c)
 	}
 	if selected == 0 {
@@ -335,28 +334,6 @@ func (a *desktop) settingsGeneralContent(c *ui.Context, selected int) {
 				return uikit.NumberInput(c, "tool-concurrency", locales.Text("工具执行并发度"), &a.settings.Concurrency, 1, 16, 1, a.secondaryInk())
 			})
 		})
-		a.settingsCard(c, "settings-context", locales.Text("上下文管理"), locales.Text("在接近上下文上限时精简历史，为后续任务留出空间。"), func() {
-			a.settingsRow(c, "compact-method-row", locales.Text("上下文自动压缩方式"), locales.Text("全文总结调用模型；本地裁剪优先在本机精简。悬浮选择框查看详情，修改对新任务生效。"), settingsControlWidth, func() ui.Element {
-				stored := a.configDraft.AutoCompactMethod
-				method := stored
-				if method == "" {
-					method = backend.DefaultAutoCompactMethod
-				}
-				options := make([]uikit.Option, len(autoCompactOptions))
-				for i, option := range autoCompactOptions {
-					options[i] = uikit.Option{Value: option.Value, Label: locales.Text(option.Label)}
-				}
-				control := uikit.SelectField(c.Key("compact-method"), &method, options, a.secondaryInk()).Label(locales.Text("压缩方式")).FillWidth()
-				if method != stored && method != "" {
-					a.configDraft.AutoCompactMethod = method
-				}
-				return uikit.Tooltip(c, control, locales.Text("全文总结：调用模型生成摘要。本地裁剪：保留最近一轮完整任务，旧工具只留目的与结果元信息，移除旧推理，保留用户消息和助手回复正文；减不下来时自动回退到全文总结。"))
-			})
-			a.settingsCompactThreshold(c)
-			a.settingsRow(c, "compact-timeout-row", locales.Text("压缩超时时间"), locales.Text("等待摘要生成的最长时间；30–3600 秒，默认 180 秒。"), settingsNumberWidth, func() ui.Element {
-				return uikit.NumberInput(c, "compact-timeout", locales.Text("压缩超时时间"), &a.settings.CompactTimeout, 30, 3600, 30, a.secondaryInk())
-			})
-		})
 		a.settingsCard(c, "settings-session-headers", locales.Text("会话请求头"), locales.Text("保存后对后续任务生效；手动配置的同名请求头不受影响。"), func() {
 			if sw := a.settingsSwitch(c, "send-session-id", locales.Text("自动发送 session-id"), locales.Text("用于同一会话的后端路由与缓存复用，默认开启。"), &a.settings.SendSessionID); sw.Changed() && !a.settings.SendSessionID {
 				a.settings.SendSessionID = true
@@ -398,14 +375,14 @@ func (a *desktop) settingsGeneralContent(c *ui.Context, selected int) {
 func (a *desktop) settingsCompactThreshold(c *ui.Context) {
 	note := fmt.Sprintf(locales.Text("当前 %.0f%%；范围 20%%–95%%，默认 60%%。按模型上下文窗口的占用比例触发。"), a.settings.Threshold*100)
 	if a.settings.ThresholdMode == backend.CompactThresholdModeTokens {
-		note = locales.Text("超过指定 token 数时触发，不随模型窗口变化。范围 1–10,000,000，默认 100,000 tokens。")
+		note = locales.Text("超过指定 token 数时触发，不随模型窗口变化。范围 1–10,000,000，默认 300,000 tokens。")
 	}
 	a.settingsRow(c, "compact-threshold-row", locales.Text("上下文自动压缩阈值"), note, settingsControlWidth, func() ui.Element {
 		return ui.Column(c.Key("compact-threshold-controls")).FillWidth().Gap(gapField).Children(func() {
 			modes := []uikit.RadioOption[string]{{Value: compactThresholdModes[0].Value, Label: locales.Text(compactThresholdModes[0].Label)}, {Value: compactThresholdModes[1].Value, Label: locales.Text(compactThresholdModes[1].Label)}}
 			uikit.Radios(c.Key("compact-threshold-mode"), &a.settings.ThresholdMode, modes, false)
 			if a.settings.ThresholdMode == backend.CompactThresholdModeTokens {
-				uikit.NumberInput(c, "compact-threshold-tokens", locales.Text("压缩阈值（tokens）"), &a.settings.ThresholdTokens, 1, backend.MaxCompactThresholdTokens, 1000, a.secondaryInk()).AlignSelf(ui.End)
+				uikit.NumberInput(c, "compact-threshold-tokens", locales.Text("压缩阈值（tokens）"), &a.settings.ThresholdTokens, 1, backend.MaxCompactThresholdTokens, 50_000, a.secondaryInk()).AlignSelf(ui.End)
 			} else {
 				uikit.Slider(c.Key("compact-threshold"), &a.settings.Threshold, 0.2, 0.95).Label(locales.Text("压缩阈值")).FillWidth()
 			}
@@ -773,7 +750,7 @@ func (a *desktop) settingsFence(c *ui.Context) {
 			locales.Text("各平台使用同一套规则，不因系统不同而放宽。"),
 			locales.Text("写工具可写范围 = 工作区 + Ally 数据目录。"),
 			locales.Text("密钥与凭据位置禁止读取。"),
-			locales.Text("命令在超时或取消时终止整个进程组。"),
+			locales.Text("命令取消时终止整个进程组；超时则收编为后台服务继续运行。"),
 			locales.Text("后台服务同样受工作区与代理设置约束。"),
 			locales.Text("插件 HTTP 只能访问清单声明的域名。"),
 			locales.Text("更新包在应用前校验摘要与来源。"),
@@ -1067,37 +1044,6 @@ func (a *desktop) settingsAbout(c *ui.Context) {
 			})
 		})
 	}
-}
-
-func (a *desktop) settingsRaw(c *ui.Context) {
-	card(c, "settings-raw", func() {
-		sectionTitle(c, locales.Text("完整配置 JSON"))
-		fieldNote(c, locales.Text("高级用法：直接编辑后端完整配置（包含密钥），保存后立即生效。"), a.secondaryInk())
-		textArea(c, "raw-config", locales.Text("配置 JSON"), "{}", &a.settings.FullJSON, 420)
-		ui.Row(c).Gap(gapField).Children(func() {
-			settingsAction(c, locales.Text("保存 JSON"), uikit.Primary).OnClick(func() {
-				var cfg backend.ConfigState
-				if err := json.Unmarshal([]byte(a.settings.FullJSON), &cfg); err != nil {
-					a.notifyError(locales.Text("配置解析失败：") + err.Error())
-					return
-				}
-				a.saveConfig(cfg)
-			})
-			settingsAction(c, locales.Text("从后端重新载入")).OnClick(func() {
-				go func() {
-					cfg, err := a.core.GetConfig()
-					a.win.Update(func() {
-						if err != nil {
-							a.notifyError(err.Error())
-							return
-						}
-						a.configDraft = cfg
-						a.settings.FullJSON = pretty(cfg)
-					})
-				}()
-			})
-		})
-	})
 }
 
 func (a *desktop) settingsModule(c *ui.Context, key string, labels ...string) int {

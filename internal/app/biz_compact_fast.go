@@ -4,7 +4,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -166,6 +165,9 @@ func (a *App) projectFastCompactHistory(ctx context.Context, sessionID string, h
 				return nil, err
 			}
 		}
+		if isMcpCatalogMessage(m) {
+			continue
+		}
 		if isFastCompactHistory(m) {
 			flush()
 			out = append(out, m)
@@ -221,7 +223,14 @@ func (a *App) projectFastCompactHistory(ctx context.Context, sessionID string, h
 				}
 			}
 			if meta.Headers == "" {
-				meta.Headers = fmt.Sprintf("// %s | status=%s", normalizeToolName(call.Function.Name), status)
+				// Same shape a live result carries: the tool name, plus an error marker
+				// only when the call actually failed. There is no success token to keep
+				// in sync with the live header.
+				header := "// " + normalizeToolName(call.Function.Name)
+				if status == "error" {
+					header += " | status=error"
+				}
+				meta.Headers = header
 			}
 			content := fastCompactRecordMarker
 			if meta.Purpose != "" {
@@ -239,7 +248,11 @@ func (a *App) projectFastCompactHistory(ctx context.Context, sessionID string, h
 	}
 	flush()
 	tailStart := len(out)
-	out = append(out, cloneChatMessages(history[cutoff:])...)
+	for _, message := range cloneChatMessages(history[cutoff:]) {
+		if !isMcpCatalogMessage(message) {
+			out = append(out, message)
+		}
+	}
 	changed := cutoff > 0 && (assistantCount > 0 || argumentCount > 0)
 	// A user-only prefix has no tool/prompt state to compact. Preserve it verbatim.
 	if !changed {
@@ -276,12 +289,19 @@ func (a *App) commitFastCompactHistory(sessionID string, history []openai.ChatCo
 	if !candidate.messageChange {
 		return candidate.result
 	}
+	prefixBefore := a.getContextBreakdown(sessionID, "")
+	before := computeLiveBreakdown(history)
+	beforeTotal := prefixBefore.SystemPrompt + prefixBefore.ToolSchemas + before.Total
+	if before.MCPCatalog == 0 {
+		beforeTotal += prefixBefore.MCPCatalog
+	}
 	a.reasoningStash.retainFastCompactTail(sessionID, history, candidate.history, candidate.cutoff)
 	result := candidate.result
 	// Rewrites must invalidate measurement anchors even when the message
 	// count stays unchanged. Read-cache hits must stop hiding old files too.
 	a.clearContextAnchor(sessionID)
 	a.invalidateSessionReadCache(sessionID)
+	a.refreshSessionPromptPrefix(sessionID)
 	if candidate.tailStart < len(candidate.history) {
 		m := candidate.history[candidate.tailStart]
 		a.mu.Lock()
@@ -297,11 +317,9 @@ func (a *App) commitFastCompactHistory(sessionID string, history []openai.ChatCo
 	}
 	a.mu.Unlock()
 
-	// Refresh comparable totals after the measurement anchor has been dropped.
-	prefix := a.getContextBreakdown(sessionID, "")
-	before := computeLiveBreakdown(history)
-	result["tokensBefore"] = prefix.SystemPrompt + prefix.ToolSchemas + before.Total
-	result["tokensAfter"] = prefix.SystemPrompt + prefix.ToolSchemas + after.Total
+	// Compare the old and rebuilt prefixes using the same text-estimate basis.
+	result["tokensBefore"] = beforeTotal
+	result["tokensAfter"] = a.getContextBreakdown(sessionID, "").Total
 	return result
 }
 

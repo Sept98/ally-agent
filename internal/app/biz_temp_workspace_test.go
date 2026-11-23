@@ -148,3 +148,4 @@ func TestCleanupStaleTempWorkspaces(t *testing.T) {
 		t.Fatalf("foreign dir was wrongly deleted: %v", err)
 	}
 }
+

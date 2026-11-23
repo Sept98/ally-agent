@@ -85,7 +85,7 @@ func (a *desktop) pageContent(c *ui.Context, width float32) {
 	case a.page == "models":
 		a.panelPage(c, locales.Text("模型"), locales.Text("按 Provider 管理对话模型与生图模型"), nil, a.modelsPageBody)
 	case a.page == "mcp":
-		a.panelPage(c, "MCP", "", nil, a.mcpPageBody)
+		a.panelPage(c, locales.Text("MCP 工具池"), "", nil, a.mcpPageBody)
 	case a.page == "skills":
 		a.panelPage(c, locales.Text("技能"), "", func() { a.skillSourcesHelp(c) }, a.skillsPageBody)
 	case a.page == "ssh":
@@ -107,7 +107,7 @@ func (a *desktop) pageContent(c *ui.Context, width float32) {
 // a padded, scrollable body. Pages own their own toolbars so search fields and
 // action buttons stay next to the content they act on.
 func (a *desktop) panelPage(c *ui.Context, title, subtitle string, headerActions func(), body func(*ui.Context)) {
-	fixed := a.page == "models" || a.page == "mcp" || a.page == "skills" || a.page == "ssh" || a.page == "tasks" || a.page == "settings"
+	fixed := a.page == "models" || a.page == "mcp" || a.page == "skills" || a.page == "ssh" || a.page == "tasks" || a.page == "settings" || a.page == "plugins"
 	if fixed {
 		ui.Column(c).Grow(1).MinHeight(0).Padding(padPage, padPage, padPage+8).Gap(gapSection).Children(func() {
 			if title != "" {

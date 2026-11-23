@@ -699,22 +699,25 @@ func (a *desktop) sessionsMenu(c *ui.Context, t *conversation, anchor ui.Element
 						if selected {
 							rail.Background(p.accent)
 						}
-						ui.Text(c, fmt.Sprint(i+1)).Font(monoFamily).FontSize(fsTiny).TextColor(a.secondaryInk())
-						ui.Text(c, fmtTime(s.UpdatedAt)).FontSize(fsTiny).TextColor(a.secondaryInk())
-						ui.Text(c, fmt.Sprintf(locales.Text("%d条"), s.MessageCount)).FontSize(fsTiny).TextColor(a.secondaryInk())
+						// 序号/时间/条数是固定列：标题变长时只能标题让位，不能把它们挤成省略号。
+						ui.Text(c, fmt.Sprint(i+1)).Font(monoFamily).FontSize(fsTiny).TextColor(a.secondaryInk()).Shrink(0)
+						ui.Text(c, fmtTime(s.UpdatedAt)).FontSize(fsTiny).TextColor(a.secondaryInk()).Shrink(0)
+						ui.Text(c, fmt.Sprintf(locales.Text("%d条"), s.MessageCount)).FontSize(fsTiny).TextColor(a.secondaryInk()).Shrink(0)
 						title := s.Title
 						if title == "" {
 							title = locales.Text("会话")
 						}
-						label := ui.Text(c, short(title, 50)).FontSize(fsSmall).SingleLine()
+						// 不预先按字数截：行到底能给多宽由布局算，工具行同一套写法。
+						label := ui.Text(c, title).FontSize(fsSmall).SingleLine().MinWidth(0).Shrink(1)
 						if selected {
 							label.TextColor(p.accent).FontWeight(600)
 						}
+						uikit.Tooltip(c, label, title)
 						if s.ID == t.ID {
 							accentChip(c, locales.Text("当前"))
 						}
 						if busy {
-							ui.Box(c).Size(5, 5).Radius(3).Background(p.accent)
+							ui.Box(c).Size(5, 5).Shrink(0).Radius(3).Background(p.accent)
 						}
 						ui.Spacer(c)
 						iconAction(c, "sess-rename-"+s.ID, locales.Text("重命名会话"), "edit", 18, func() {
@@ -766,15 +769,6 @@ func (a *desktop) composerStatusRow(c *ui.Context, t *conversation) {
 		}
 		ui.Spacer(c)
 	})
-}
-
-func lastUserPrompt(t *conversation) string {
-	for i := len(t.Messages) - 1; i >= 0; i-- {
-		if str(t.Messages[i], "role") == "user" {
-			return firstLine(str(t.Messages[i], "content"))
-		}
-	}
-	return ""
 }
 
 // thinkingTokensLine draws the one "Thinking N tokens" line shared by the
@@ -913,8 +907,6 @@ func (a *desktop) modelSelector(c *ui.Context, t *conversation) {
 		hover := uikit.NewHoverMenus(body)
 		rows := map[string]ui.Element{}
 		body.Children(func() {
-			input := uikit.Input(c.Key("model-menu-search"), &st.ModelSearch).Placeholder(locales.Text("搜索模型或供应商")).Label(locales.Text("搜索模型或供应商")).FillWidth()
-			hover.ClearOnHover(input)
 			query := strings.ToLower(strings.TrimSpace(st.ModelSearch))
 			models := a.config.Models
 			catalog := memoAt[modelMenuCatalog](body, "model-catalog")
@@ -944,23 +936,30 @@ func (a *desktop) modelSelector(c *ui.Context, t *conversation) {
 				}
 				return item.OnClick(func() { st.ModelOpen = false; a.selectChatModel(t, model) })
 			}
-			shownRecent := false
+			recentIdx := make([]int, 0, len(recent))
 			for _, identity := range recent {
 				for i, entry := range entries {
-					if entry.option != identity || !matches(i) {
-						continue
+					if entry.option == identity && matches(i) {
+						recentIdx = append(recentIdx, i)
 					}
-					if !shownRecent {
-						head := ui.Text(c, locales.Text("最近使用")).FontSize(fsTiny).TextColor(a.secondaryInk()).Padding(gapInline, padCard)
-						hover.ClearOnHover(head)
-						shownRecent = true
-					}
-					hover.ClearOnHover(modelItem(m, i, "recent-"+entry.option, models[i].ProviderName))
 				}
 			}
-			if shownRecent {
+			// The field and the recent models steer the list below them, so they
+			// hold the top of the panel instead of scrolling away with it.
+			top := menuPinnedTop(c)
+			top.Children(func() {
+				input := uikit.Input(c.Key("model-menu-search"), &st.ModelSearch).Placeholder(locales.Text("搜索模型或供应商")).Label(locales.Text("搜索模型或供应商")).FillWidth()
+				hover.ClearOnHover(input)
+				if len(recentIdx) == 0 {
+					return
+				}
+				head := ui.Text(c, locales.Text("最近使用")).FontSize(fsTiny).TextColor(a.secondaryInk()).Padding(gapInline, padCard)
+				hover.ClearOnHover(head)
+				for _, i := range recentIdx {
+					hover.ClearOnHover(modelItem(m, i, "recent-"+entries[i].option, models[i].ProviderName))
+				}
 				divider(c)
-			}
+			})
 			groups := map[string][]int{}
 			rank := map[string]int{}
 			for i, entry := range entries {
@@ -1020,9 +1019,14 @@ func (a *desktop) modelSelector(c *ui.Context, t *conversation) {
 			if len(groups) == 0 {
 				fieldNote(c, locales.Text("没有匹配的模型"), a.secondaryInk())
 			}
-			divider(c)
-			manage := uikit.MenuItem(c, m, "manage", locales.Text("管理模型"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() { a.changePage("models") })
-			hover.ClearOnHover(manage)
+			// The footer says where models are managed, so it stays put while the
+			// provider list scrolls under it.
+			footer := menuPinnedBottom(c)
+			footer.Children(func() {
+				divider(c)
+				manage := uikit.MenuItem(c, m, "manage", locales.Text("管理模型"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() { a.changePage("models") })
+				hover.ClearOnHover(manage)
+			})
 			hover.Popup(c, body, func(id string) ui.Element { return rows[id] }, uikit.MenuOptions{Width: 260, MaxHeight: 360}, func(provider string, child ui.MenuParts) {
 				for _, i := range groups[provider] {
 					modelItem(child, i, entries[i].option, "")
@@ -1230,31 +1234,6 @@ func persistedReasoning(cfg backend.ConfigState, option string) string {
 	return level
 }
 
-// withModelReasoning writes level onto the model entry behind option. changed is
-// false when that model is gone (deleted, or the Tab points at a stale option)
-// or already carries the level: there is nothing to persist then.
-func withModelReasoning(cfg backend.ConfigState, option, level string) (backend.ConfigState, bool) {
-	for i, m := range cfg.Models {
-		if modelOption(m) != option {
-			continue
-		}
-		// An entry that never carried a level means "auto", so picking auto on
-		// it is no change and must not rewrite the config or announce one.
-		stored := cfg.Models[i].ReasoningEffort
-		if stored == "" {
-			stored = "auto"
-		}
-		if stored == level {
-			return cfg, false
-		}
-		models := append([]backend.ModelConfig(nil), cfg.Models...)
-		models[i].ReasoningEffort = level
-		cfg.Models = models
-		return cfg, true
-	}
-	return cfg, false
-}
-
 // workspaceButton is the workspace entry of the info bar: the folder glyph on
 // its own, the same 26px box and 16px glyph as the icons beside it, with the
 // workspace and its path in the tip. The name already shows in the header tab.
@@ -1314,8 +1293,12 @@ func (a *desktop) extraRootsButton(c *ui.Context, t *conversation) {
 			root := root
 			uikit.MenuItem(c, m, root, "📁 "+filepath.Base(root), uikit.MenuItemOptions{Subtitle: root + locales.Text(" · 点击移除")}, a.secondaryInk()).OnClick(func() { a.removeExtraRoot(t, root) })
 		}
-		divider(c)
-		uikit.MenuItem(c, m, "add-root", locales.Text("＋ 添加目录"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() { a.addExtraRoot(t) })
+		// Adding a directory must stay reachable however many roots are listed.
+		add := menuPinnedBottom(c)
+		add.Children(func() {
+			divider(c)
+			uikit.MenuItem(c, m, "add-root", locales.Text("＋ 添加目录"), uikit.MenuItemOptions{}, a.secondaryInk()).OnClick(func() { a.addExtraRoot(t) })
+		})
 	})
 }
 
@@ -1474,29 +1457,6 @@ func gitRepoStatusChip(c *ui.Context, label string, tone uikit.Tone) {
 	})
 }
 
-func gitStatsText(git backend.GitStatus) string {
-	var parts []string
-	if git.Ahead > 0 {
-		parts = append(parts, fmt.Sprintf("↑%d", git.Ahead))
-	}
-	if git.Behind > 0 {
-		parts = append(parts, fmt.Sprintf("↓%d", git.Behind))
-	}
-	if git.Added > 0 {
-		parts = append(parts, fmt.Sprintf("+%d", git.Added))
-	}
-	if git.Modified > 0 {
-		parts = append(parts, fmt.Sprintf("~%d", git.Modified))
-	}
-	if git.Deleted > 0 {
-		parts = append(parts, fmt.Sprintf("-%d", git.Deleted))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return " " + strings.Join(parts, " ")
-}
-
 // Leave room for both schema rows and expanded prompt parts before scrolling.
 const contextBreakdownHeight float32 = 420
 
@@ -1575,8 +1535,8 @@ func (a *desktop) contextUsage(c *ui.Context, t *conversation) {
 						})
 					})
 				})
-				contextPart(c, locales.Text("工具 Schema · 内置"), b.ToolSchemas-b.MCPToolSchemas, a.secondaryInk())
-				contextPart(c, locales.Text("工具 Schema · MCP"), b.MCPToolSchemas, a.secondaryInk())
+				contextPart(c, locales.Text("工具 Schema · 内置"), b.ToolSchemas, a.secondaryInk())
+				contextPart(c, locales.Text("MCP 工具池"), b.MCPCatalog, a.secondaryInk())
 				contextPart(c, locales.Text("用户提问"), b.UserMessages, a.secondaryInk())
 				contextPart(c, locales.Text("AI 回复"), b.AssistantMsgs, a.secondaryInk())
 				contextPart(c, locales.Text("工具结果"), b.ToolResults, a.secondaryInk())
@@ -1689,6 +1649,7 @@ func (a *desktop) compact(t *conversation, fast bool) {
 		return
 	}
 	st.CompactBusy = true
+	a.refreshNativeTray()
 	st.CompactThinking = 0
 	// The summarising model is the Tab's, exactly as a chat request would use it:
 	// the backend cannot read Tab state, and a session restored from disk has no
@@ -1714,6 +1675,7 @@ func (a *desktop) compact(t *conversation, fast bool) {
 		a.win.Update(func() {
 			if err != nil {
 				st.CompactBusy = false
+				a.refreshNativeTray()
 				st.CompactThinking = 0
 				st.CompactNote = ""
 				a.notify(locales.Text("压缩失败：") + err.Error())
@@ -1729,6 +1691,7 @@ func (a *desktop) compact(t *conversation, fast bool) {
 // Both tiers end here, so the toast and the context footer never disagree with
 // what the history now contains.
 func (a *desktop) finishCompact(t *conversation, result map[string]any, fast bool) {
+	defer a.refreshNativeTray()
 	st := t.uiState()
 	st.CompactBusy = false
 	st.CompactThinking = 0
@@ -1809,10 +1772,6 @@ func inputHistory(t *conversation) []string {
 		unique[i], unique[j] = unique[j], unique[i]
 	}
 	return unique
-}
-
-func composerFlat(c *ui.Context, text string) ui.Element {
-	return button(c, nil, text, btnGhost, true, "").Padding(1, 6).MinWidth(0).Shrink(1)
 }
 
 // composerFlatParts is composerFlat for a label whose colour carries meaning

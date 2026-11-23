@@ -23,9 +23,6 @@ func TestCommandPreviewMatchesPreLineWithoutChangingExpandedOutput(t *testing.T)
 	if got := stripBlankLines(commandOutput(result)); got != "    first    column\n\tsecond\t\tcolumn\n        third line" {
 		t.Fatalf("expanded output lost indentation: %q", got)
 	}
-	if got := commandPreviewText(original, 2); got != "second column\nthird line" {
-		t.Fatalf("tail preview changed: %q", got)
-	}
 }
 
 func TestCommandHeaderKeepsExitAndDurationAfterTheCommand(t *testing.T) {
@@ -99,7 +96,7 @@ func TestCommandOutputHasNoExtraIndent(t *testing.T) {
 		conv.uiState().CommandDetails = map[string]*commandDetail{"command": {Result: map[string]any{"_text": "OUTMARK"}}}
 		msg := map[string]any{"name": "command", "toolCallId": "command", "status": "success", "args": `{"command":"echo OUTMARK"}`, "result": map[string]any{"stdout": "OUTMARK"}}
 		tt := ui.NewTester(func(c *ui.Context) { ui.Column(c).Padding(20).Children(func() { a.toolCard(c, conv, 0, msg) }) }, 600, 400)
-		heading, ok := tt.Find("Ran")
+		heading, ok := tt.Find("Command")
 		if !ok {
 			t.Fatalf("missing heading: %v", tt.Texts())
 		}

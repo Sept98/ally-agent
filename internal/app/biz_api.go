@@ -474,7 +474,7 @@ func (a *App) apiModelConfig(r *http.Request, index *int) (ConfigState, error) {
 }
 
 // apiHandleAIComplete is a tool-free, stateless call through the existing model
-// adapters. Its cancellation is scoped to this HTTP request, not the games UI.
+// adapters. Its cancellation is scoped to this HTTP request.
 func (a *App) apiHandleAIComplete(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ModelIndex *int   `json:"modelIndex"`
@@ -502,8 +502,12 @@ func (a *App) apiHandleAIComplete(w http.ResponseWriter, r *http.Request) {
 		apiWriteError(w, status, err.Error())
 		return
 	}
-	if strings.TrimSpace(cfg.Model) == "" || !hasModelCredential(cfg) {
-		apiWriteError(w, http.StatusBadRequest, "model and API key are required")
+	if strings.TrimSpace(cfg.Model) == "" {
+		apiWriteError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	if !hasModelCredential(cfg) {
+		apiWriteError(w, http.StatusBadRequest, missingModelCredentialError().Error())
 		return
 	}
 	if cfg.MaxTokens <= 0 {
@@ -695,6 +699,7 @@ func (a *App) apiHandleCreateSession(w http.ResponseWriter, r *http.Request) {
 		apiWriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.RetryFailedMcpServers()
 	apiWriteOK(w, map[string]any{
 		"id":         entry.ID,
 		"title":      entry.Title,

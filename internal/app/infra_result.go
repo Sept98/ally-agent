@@ -9,7 +9,6 @@ package app
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -28,9 +27,6 @@ type toolResult struct {
 	// Warnings carries non-fatal notices (e.g. ignored unknown tool
 	// arguments) on successful results; error results never set it.
 	Warnings []string `json:"warnings,omitempty"`
-	// Recovery source is private to the model's tool message. Never serialize
-	// it into UI/API results or concatenate it into the displayed error.
-	modelRead *BatchReadResult
 }
 
 func codedToolError(code string, err error) error {
@@ -45,12 +41,7 @@ func toolErrorResult(err error) toolResult {
 	if err == nil {
 		return toolResult{OK: true}
 	}
-	result := toolResult{OK: false, Error: err.Error(), ErrorCode: toolErrorCode(err), Details: toolerrors.Details(err)}
-	var recovery *editRecoveryError
-	if errors.As(err, &recovery) {
-		result.modelRead = &recovery.read
-	}
-	return result
+	return toolResult{OK: false, Error: err.Error(), ErrorCode: toolErrorCode(err), Details: toolerrors.Details(err)}
 }
 
 func toolResultSummary(name string, result *toolResult) string {
@@ -215,22 +206,18 @@ func compactToolResultForModel(name string, result toolResult, fullJSON string) 
 			body += "\ndetails: " + string(raw)
 		}
 		body, reduced := compactTextForModel(body, compactTextSpec{limit: maxModelToolOutput, head: modelToolHeadBytes, tail: modelToolTailBytes})
-		header := "// " + normalizeToolName(name) + " | status=error"
+		header := "// " + normalizeToolName(name)
 		if result.ErrorCode != "" {
 			header += " | error=" + strconv.Quote(result.ErrorCode)
 		}
 		if reduced {
 			header += " | truncated"
 		}
-		out := header + "\n\n" + body
-		if result.modelRead != nil {
-			out += "\n\nCurrent source for recovery; no extra read is needed:\n\n" + renderReadResultForModel(*result.modelRead)
-		}
-		return out
+		return header + "\n\n" + body
 	}
 	out := compactToolDataForModel(name, result, fullJSON)
 	if !strings.HasPrefix(out, "// ") {
-		out = "// " + normalizeToolName(name) + " | status=ok\n\n" + out
+		out = "// " + normalizeToolName(name) + "\n\n" + out
 	}
 	if len(result.Warnings) > 0 {
 		i := strings.IndexByte(out, '\n')
@@ -253,7 +240,7 @@ func compactToolDataForModel(name string, result toolResult, fullJSON string) st
 	}
 	// MCP tool output is third-party text with no producer-side cap; clamp it
 	// to the built-in bound so one runaway server cannot flood model context.
-	if isMcpToolFunctionName(name) {
+	if isMcpToolFunctionName(name) || normalizeToolName(name) == mcpExecName {
 		return renderMcpResultForModel(result, fullJSON)
 	}
 	switch name {
@@ -349,7 +336,10 @@ func compactToolDataForModel(name string, result toolResult, fullJSON string) st
 			return modelFallbackResult(name, result.Data, fullJSON)
 		}
 		return renderGrepResultForModel(r)
-	case "http_request":
+	case "fetch", "http_request":
+		if r, ok := result.Data.(WebFetchResult); ok {
+			return renderWebFetchResultForModel(r)
+		}
 		var r HTTPRequestToolResult
 		if !decodeToolData(result.Data, &r) {
 			return modelFallbackResult(name, result.Data, fullJSON)
@@ -749,7 +739,7 @@ func renderGrepResultForModel(r GrepResult) string {
 		// those files with no notice.
 	default:
 		// Unknown mode: render a minimal block rather than a malformed one.
-		return "// grep | status=error | error=unknown-mode"
+		return "// grep | error=unknown-mode"
 	}
 	var b strings.Builder
 	// The mode is spelled out on every block: a count row ("path: count=N")
@@ -825,7 +815,7 @@ func renderHTTPResultForModel(r HTTPRequestToolResult) string {
 		}
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "// http_request | status=%d | duration=%dms", r.Status, r.DurationMS)
+	fmt.Fprintf(&b, "// fetch | status=%d | duration=%dms", r.Status, r.DurationMS)
 	if r.FinalURL != "" && r.FinalURL != r.URL {
 		b.WriteString(" | final-url=" + strconv.Quote(r.FinalURL))
 	}
@@ -867,7 +857,7 @@ func renderHTTPResultForModel(r HTTPRequestToolResult) string {
 
 func renderWebFetchResultForModel(r WebFetchResult) string {
 	body, reduced := compactTextForModel(r.Text, compactTextSpec{limit: maxModelWebOutput})
-	header := fmt.Sprintf("// web_fetch | status=%d | duration=%dms", r.Status, r.DurationMS)
+	header := fmt.Sprintf("// fetch | status=%d | duration=%dms", r.Status, r.DurationMS)
 	if r.Title != "" {
 		header += " | title=" + strconv.Quote(r.Title)
 	}
@@ -964,9 +954,9 @@ func missingReadPathHint(code, remoteAlias string) string {
 	}
 	switch code {
 	case "E_IS_DIRECTORY":
-		return "path is a directory; use list_files to inspect its entries"
+		return "path is a directory; use command to inspect its entries"
 	case "E_PATH_NOT_FOUND":
-		return "path does not exist; check the name with list_files on the parent directory, or pass an empty path for the workspace root"
+		return "path does not exist; use command to inspect the parent directory"
 	}
 	return ""
 }
@@ -1013,9 +1003,6 @@ func renderCommandResultForModel(r CommandResult) string {
 		fmt.Fprintf(&b, " | %s=%s", key, strconv.Quote(r.OutputFilePath))
 	}
 	b.WriteString("\n\n" + output)
-	if r.DeniedWriteHint != "" {
-		b.WriteString("\n\n" + strings.TrimRight(r.DeniedWriteHint, "\n"))
-	}
 	if r.OutputWarning != "" {
 		b.WriteString("\n\n" + r.OutputWarning)
 	}
@@ -1154,9 +1141,6 @@ func renderServiceReadResultForModel(r ServiceReadResult) string {
 	if fromByte > 0 {
 		header += fmt.Sprintf(" | from-byte=%d", fromByte)
 	}
-	if r.DeniedWriteHint != "" {
-		output += "\n\n" + r.DeniedWriteHint
-	}
 	return modelResultBody(header, output)
 }
 
@@ -1180,9 +1164,6 @@ func renderServiceInfoResultForModel(r ServiceInfo) string {
 	}
 	if r.Error != "" {
 		body += "\n" + r.Error
-	}
-	if r.DeniedWriteHint != "" {
-		body += "\n" + r.DeniedWriteHint
 	}
 	return modelResultBody(header, body)
 }
@@ -1280,11 +1261,11 @@ func modelResultBody(header, body string) string {
 
 func modelFallbackResult(name string, data any, fallback string) string {
 	if data == nil {
-		return modelResultBody("// "+normalizeToolName(name)+" | status=ok", fallback)
+		return modelResultBody("// "+normalizeToolName(name), fallback)
 	}
 	raw, err := json.Marshal(data)
 	if err == nil && string(raw) != "null" {
 		fallback = string(raw)
 	}
-	return modelResultBody("// "+normalizeToolName(name)+" | status=ok", fallback)
+	return modelResultBody("// "+normalizeToolName(name), fallback)
 }

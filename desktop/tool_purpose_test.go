@@ -9,7 +9,7 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-func TestGroupHeaderUsesLatestDescriptionsAndClipsWithinWindow(t *testing.T) {
+func TestGroupHeaderUsesLatestDescriptions(t *testing.T) {
 	a := &desktop{}
 	longPurpose := strings.Repeat("检查文件末尾内容", 12)
 	makeCall := func(id, name, purpose string) map[string]any {
@@ -29,26 +29,12 @@ func TestGroupHeaderUsesLatestDescriptionsAndClipsWithinWindow(t *testing.T) {
 		c.DisableAnimations()
 		ui.Column(c).FillWidth().Padding(24).Children(func() { a.toolActivityGroupCard(c, conv, 0) })
 	}, 900, 500)
-	if tt.HasText("较早的读取说明") || tt.HasText(longPurpose) || !tt.HasText(short(longPurpose, 32)) {
-		t.Fatalf("header did not use latest bounded description: %v", tt.Texts())
-	}
-	for _, width := range []int{900, 420} {
-		tt.SetSize(width, 500)
-		tt.Frame()
-		header, ok := tt.Find("工具分组 latest-readgroup-0")
-		if !ok {
-			t.Fatal("missing group header")
-		}
-		for _, text := range []string{short(longPurpose, 32), "定位调用入口", "查看目录结构", "测试项目"} {
-			box, ok := tt.Find(text)
-			if !ok || box.X < header.X || box.X+box.W > header.X+header.W+1 {
-				t.Fatalf("description outside header: %q %v header=%v", text, box, header)
-			}
-		}
+	if tt.HasText("较早的读取说明") || !tt.HasText(longPurpose) {
+		t.Fatalf("header did not use latest description: %v", tt.Texts())
 	}
 	conv.Messages[4]["purpose"] = "更新后的读取说明"
 	tt.Frame()
-	if !tt.HasText("更新后的读取说明") || tt.HasText(short(longPurpose, 32)) {
+	if !tt.HasText("更新后的读取说明") || tt.HasText(longPurpose) {
 		t.Fatal("description update retained an old header")
 	}
 	conv.Messages = append(conv.Messages, makeCall("last", "command", "执行最后验证"))
@@ -113,7 +99,7 @@ func TestPurposeGroupDisclosesCallsBeforeFilesAndOutput(t *testing.T) {
 	if !tt.HasText("go test ./internal/app") || tt.HasText("RESULT_OUTPUT") {
 		t.Fatal("command disclosure lost command/output boundary")
 	}
-	if err := tt.Click("命令结果 cmd Ran go test ./internal/app"); err != nil {
+	if err := tt.Click("命令结果 cmd 已完成 go test ./internal/app"); err != nil {
 		t.Fatal(err)
 	}
 	tt.Frame()
@@ -167,16 +153,6 @@ func TestPurposeSitsInlineInIndependentHeaders(t *testing.T) {
 				}
 			}
 		})
-	}
-	// The facts stay left; the reason sits at the row's right edge.
-	editArgs, _ := json.Marshal(map[string]any{"purpose": "补上标题行说明", "path": "desktop/tool_cards.go"})
-	tt := compactToolView(&desktop{}, map[string]any{"name": "edit", "toolCallId": "order", "status": "success", "args": string(editArgs)})
-	header, hasHeader := tt.Find("工具详情 order")
-	verb, hasVerb := tt.Find("Edited")
-	reason, hasReason := tt.Find("补上标题行说明")
-	target, hasTarget := tt.Find("(desktop/tool_cards.go)")
-	if !hasHeader || !hasVerb || !hasReason || !hasTarget || !(verb.X < target.X && target.X < reason.X) || reason.X+reason.W < header.X+header.W-40 {
-		t.Fatalf("facts stay left and the reason keeps the right edge: %v %v %v %v", verb, target, reason, header)
 	}
 	a := &desktop{}
 	conv := &conversation{ID: "events"}

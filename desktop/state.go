@@ -248,7 +248,6 @@ type chatUI struct {
 	GroupOpen            map[string]bool
 	AskIndex             int
 	AskSelected          map[string][]string
-	AskCustom            map[string]bool
 	AskCustomTxt         map[string]string
 	AskImages            map[string][]preparedAttachment
 	AskImageBitmaps      map[string]*ui.Bitmap
@@ -332,7 +331,6 @@ func newChatUI() chatUI {
 		ToolOpen:        map[string]bool{},
 		GroupOpen:       map[string]bool{},
 		AskSelected:     map[string][]string{},
-		AskCustom:       map[string]bool{},
 		AskCustomTxt:    map[string]string{},
 		AskImages:       map[string][]preparedAttachment{},
 		AskImageBitmaps: map[string]*ui.Bitmap{},
@@ -389,7 +387,6 @@ type settingsForm struct {
 	APIBusy         bool
 	APIRevision     uint64
 	APINote         string
-	FullJSON        string
 	NewToken        bool
 
 	SessionHeaderConfirmOpen  bool
@@ -397,6 +394,17 @@ type settingsForm struct {
 	ContextLoadingConfirmOpen bool
 	ContextLoadingToDisable   string
 	BackgroundPath            *string
+}
+
+func (a *desktop) setProxyModeDraft(mode string) {
+	a.configDraft.ProxyMode = mode
+	a.settings.ProxyModeIndex = 0
+	switch mode {
+	case "system":
+		a.settings.ProxyModeIndex = 1
+	case "manual":
+		a.settings.ProxyModeIndex = 2
+	}
 }
 
 func (a *desktop) syncSettingsForm() {
@@ -408,13 +416,7 @@ func (a *desktop) syncSettingsForm() {
 	if a.prefs.Appearance == "auto" {
 		f.AppearanceMode = 2
 	}
-	f.ProxyModeIndex = 0
-	switch a.configDraft.ProxyMode {
-	case "system":
-		f.ProxyModeIndex = 1
-	case "manual":
-		f.ProxyModeIndex = 2
-	}
+	a.setProxyModeDraft(a.configDraft.ProxyMode)
 	f.Tab = a.settingsTab
 	f.Retries = float64(a.configDraft.LLMRetries)
 	f.Concurrency = float64(a.configDraft.ToolConcurrency)
@@ -519,7 +521,15 @@ type modelForm struct {
 	Providers      []string
 	ProviderIdx    int
 	TestBusy       bool
-	Fetched        []string
+	// EntryTestBusy tracks the connection tests started from the list, keyed by
+	// the model's option label, so two rows can run at once.
+	EntryTestBusy map[string]bool
+	// EntryBalance keeps the DeepSeek balance read from the list, keyed by the
+	// model identity so saving an edit drops the amount the old key produced.
+	// It is filled on click only; nothing polls or refreshes it.
+	EntryBalance     map[backend.ModelIdentity]string
+	EntryBalanceBusy map[backend.ModelIdentity]bool
+	Fetched          []string
 }
 
 // mcpForm is the MCP page + server editor state.
@@ -538,6 +548,7 @@ type mcpForm struct {
 	URL          string
 	Headers      string
 	ToolOpen     map[string]bool
+	PoolOpen     bool
 	ToolsDirty   bool
 	ImportBusy   bool
 }
@@ -692,40 +703,6 @@ type fileUI struct {
 	RenameTo       string
 	PromptErr      string
 	HelpOpen       bool
-}
-
-// gameUI keeps one local match per game kind plus the model choices.
-type gameUI struct {
-	Kind          int
-	Started       bool
-	Finished      bool
-	VsAI          bool
-	ModelA        string
-	ModelB        string
-	EffortA       string
-	EffortB       string
-	Thinking      bool
-	RequestSeq    uint64
-	Calls         int
-	InTokens      int
-	OutTokens     int
-	Status        string
-	Winner        int
-	Board         []int
-	Turn          int
-	LastIndex     int
-	Passes        int
-	Ko            int
-	XQ            [10][9]string
-	Selected      int
-	Hands         [3][]int
-	Bottom        []int
-	Landlord      int
-	Phase         string
-	LastCards     []int
-	LastPlayer    int
-	DDZPasses     int
-	SelectedCards []int
 }
 
 // Confirm helper ----------------------------------------------------------

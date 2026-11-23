@@ -50,15 +50,6 @@ func (s *planCheckServer) count() int {
 	return len(s.requests)
 }
 
-func (s *planCheckServer) requestBody(round int) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if round < 1 || round > len(s.requests) {
-		return ""
-	}
-	return s.requests[round-1]
-}
-
 // runPlanCheckSession starts one run against the fake provider with a running
 // two-step plan already in place, and waits for the terminal event.
 func runPlanCheckSession(t *testing.T, baseURL, sessionID, workspace string) (*App, *compactRecorder) {
@@ -110,7 +101,7 @@ func TestToolDidPlanWorkClassifiesByName(t *testing.T) {
 			t.Fatalf("%q must count as work a plan could have moved past", name)
 		}
 	}
-	for _, name := range []string{"read", "grep", "list_files", "web_fetch", "http_request", "plan", "wait", "ask", "suggest"} {
+	for _, name := range []string{"read", "grep", "fetch", "plan", "wait", "ask", "suggest"} {
 		if toolDidPlanWork(name) {
 			t.Fatalf("%q must not count as work", name)
 		}

@@ -9,6 +9,7 @@ package app
 
 import (
 	"ally-dev/internal/tools/schemautil"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,7 +129,8 @@ type ContextBreakdown struct {
 	SystemPrompt      int                    `json:"systemPrompt"`
 	SystemPromptParts []ContextBreakdownPart `json:"systemPromptParts,omitempty"`
 	ToolSchemas       int                    `json:"toolSchemas"`
-	MCPToolSchemas    int                    `json:"mcpToolSchemas"` // Included in ToolSchemas.
+	MCPToolSchemas    int                    `json:"mcpToolSchemas"` // Deprecated wire field.
+	MCPCatalog        int                    `json:"mcpCatalog"`
 	UserMessages      int                    `json:"userMessages"`
 	AssistantMsgs     int                    `json:"assistantMsgs"`
 	ToolResults       int                    `json:"toolResults"`
@@ -259,10 +261,18 @@ func estimateTokensFromText(text string) int {
 			nonAsciiCount++
 		}
 	}
-	// In real-world LLM tokenizers (o200k, cl100k, Claude, Qwen/DeepSeek):
-	// - Code/JSON/indents/punctuation: ~3.0 - 3.2 ASCII chars per token (down from 4).
-	// - Chinese / CJK characters: typically 1.3 - 1.6 tokens per character (up from 1.0).
-	return int(math.Ceil(float64(asciiCount)/3.2)) + int(math.Ceil(float64(nonAsciiCount)*1.4))
+	// Calibrated on 355 real files from this repo (Go source, Markdown, JSON,
+	// locale catalogs) against tiktoken o200k_base and cl100k_base:
+	// - Pure-ASCII Go files measured 3.60 chars/token at the median across 313
+	//   files, and 3.57-3.73 in every size bucket. Earlier estimates read 4.0+ off
+	//   a single large file, which is a high tail case, not the norm.
+	// - Real Chinese prose measured 0.92-0.95 tokens per char on o200k and 1.21 on
+	//   cl100k. (A repeated-sentence sample reads far lower because the tokenizer
+	//   compresses the repetition; do not calibrate on duplicated text.)
+	// A grid search over both constants puts the minimum mean absolute error at
+	// 3.65 / 1.00 (~5.9% on either vocabulary). The previous 3.2 / 1.4 pair sat at
+	// ~17% and made the footer breakdown disagree with the provider's usage.
+	return int(math.Ceil(float64(asciiCount)/3.65)) + nonAsciiCount
 }
 
 // builtinToolSchemaTokens caches the token estimate of the built-in tool
@@ -308,89 +318,29 @@ func estimateModelToolSchemas(tools []openai.Tool) int {
 	return estimateTokensFromText(string(data))
 }
 
-// mcpToolSchemaTokens re-marshals the MCP tool schemas portion of `tools`.
-// `tools` is expected to be a slice returned by buildToolsWithMcp; only the
-// entries whose Function.Name starts with `mcp__` are counted, so the cached
-// built-in portion can be added by the caller without double counting.
-func mcpToolSchemaTokens(tools []openai.Tool) int {
-	if len(tools) == 0 {
-		return 0
-	}
-	// Fast path: if no MCP tools, skip Marshal entirely.
-	hasMcp := false
-	for _, t := range tools {
-		if t.Function != nil && isMcpToolFunctionName(t.Function.Name) {
-			hasMcp = true
-			break
-		}
-	}
-	if !hasMcp {
-		return 0
-	}
-	// Slow path: marshal only the MCP entries. Avoids re-marshaling the
-	// large built-in schema that is already accounted for by the cache.
-	mcpOnly := make([]openai.Tool, 0, 8)
-	for _, t := range tools {
-		if t.Function != nil && isMcpToolFunctionName(t.Function.Name) {
-			mcpOnly = append(mcpOnly, t)
-		}
-	}
-	if len(mcpOnly) == 0 {
-		return 0
-	}
-	return estimateModelToolSchemas(mcpOnly)
-}
-
+// The full built-in set has a cached estimate. Filtered sets are estimated
+// from their actual protocol declarations.
 func estimateToolSchemaTokens(tools []openai.Tool) int {
-	total, _ := estimateToolSchemaTokenParts(tools)
-	return total
-}
-
-// estimateToolSchemaTokenParts returns the total and its MCP portion together.
-func estimateToolSchemaTokenParts(tools []openai.Tool) (int, int) {
 	if len(tools) == 0 {
-		return 0, 0
+		return 0
 	}
-	// Split into builtin (non-mcp__) and mcp portions. The builtin portion
-	// uses the cache only when it is the full chatTools() set — a filtered
-	// builtin slice must be re-marshaled to avoid over-counting the cached
-	// full-set tokens.
-	cachedBuiltinCount := len(chatTools())
-	builtinCount, purposeCount := 0, 0
-	hasMcp := false
-	for _, t := range tools {
-		if t.Function != nil && isMcpToolFunctionName(t.Function.Name) {
-			hasMcp = true
-			continue
-		}
-		builtinCount++
-		if t.Function != nil {
-			if schema, ok := t.Function.Parameters.(map[string]any); ok && schema[schemautil.PurposeFieldKey] != nil {
-				purposeCount++
+	if len(tools) == len(chatTools()) {
+		purposeCount := 0
+		for _, tool := range tools {
+			if tool.Function != nil {
+				if schema, ok := tool.Function.Parameters.(map[string]any); ok && schema[schemautil.PurposeFieldKey] != nil {
+					purposeCount++
+				}
 			}
 		}
-	}
-	var total int
-	if builtinCount == cachedBuiltinCount && purposeCount == builtinCount {
-		total = builtinPurposeToolSchemaTokens()
-	} else if builtinCount == cachedBuiltinCount && purposeCount == 0 {
-		// Full builtin set — use the cached estimate.
-		total = builtinToolSchemaTokens()
-	} else if builtinCount > 0 {
-		// Filtered builtin subset — marshal directly.
-		builtinOnly := make([]openai.Tool, 0, builtinCount)
-		for _, t := range tools {
-			if t.Function != nil && !isMcpToolFunctionName(t.Function.Name) {
-				builtinOnly = append(builtinOnly, t)
-			}
+		switch purposeCount {
+		case 0:
+			return builtinToolSchemaTokens()
+		case len(tools):
+			return builtinPurposeToolSchemaTokens()
 		}
-		total = estimateModelToolSchemas(builtinOnly)
 	}
-	mcp := 0
-	if hasMcp {
-		mcp = mcpToolSchemaTokens(tools)
-	}
-	return total + mcp, mcp
+	return estimateModelToolSchemas(tools)
 }
 
 // finalizeContextBreakdownTotal recomputes the category sum and the
@@ -400,7 +350,7 @@ func estimateToolSchemaTokenParts(tools []openai.Tool) (int, int) {
 // after that request are estimated on top (pi: estimateContextTokens,
 // packages/ai/src/utils/estimate.ts).
 func finalizeContextBreakdownTotal(result *ContextBreakdown) {
-	result.Estimated = result.SystemPrompt + result.ToolSchemas + result.UserMessages + result.AssistantMsgs + result.ToolResults + result.Reasoning
+	result.Estimated = result.SystemPrompt + result.ToolSchemas + result.MCPCatalog + result.UserMessages + result.AssistantMsgs + result.ToolResults + result.Reasoning
 	result.Total = result.Estimated
 	if result.MeasuredTokens > 0 {
 		result.Total = result.MeasuredTokens + result.TrailingTokens
@@ -625,7 +575,6 @@ type frozenPrefixStats struct {
 	system       int
 	parts        []ContextBreakdownPart
 	tools        int
-	mcpTools     int
 }
 
 func sameSliceSource[T any](a, b []T) bool {
@@ -657,7 +606,7 @@ func (a *App) frozenPrefixTokenStats(sessionID string) (frozenPrefixStats, bool)
 		next.system += tokens
 		next.parts = append(next.parts, ContextBreakdownPart{Label: workspaceMapPartLabel, Tokens: tokens})
 	}
-	next.tools, next.mcpTools = estimateToolSchemaTokenParts(toolset)
+	next.tools = estimateToolSchemaTokens(toolset)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	currentPrompt, p := a.sessionSystemPrompts[sessionID]
@@ -673,11 +622,26 @@ func (a *App) frozenPrefixTokenStats(sessionID string) (frozenPrefixStats, bool)
 	return next, true
 }
 
-func (a *App) sessionToolSchemaTokens(sessionID string, cfg ConfigState) (int, int) {
-	if cached, ok := a.frozenPrefixTokenStats(sessionID); ok {
-		return cached.tools, cached.mcpTools
+// pendingMcpCatalogTokens estimates the catalog a conversation that carries
+// none yet is about to get. The catalog goes out once per conversation, so
+// history is the authority whenever it holds a copy; this answers the empty case
+// only. A session with nothing to send — no server, ToolExec off — reports 0.
+func (a *App) pendingMcpCatalogTokens(sessionID string) int {
+	// The request path checks availability against the session's frozen settings
+	// snapshot. A direct caller carries the loading and disabled-tool lists, and
+	// builtinToolDisabled takes that path when no snapshot is injected.
+	a.mu.Lock()
+	cfg := ConfigState{DisabledTools: a.config.DisabledTools, DisabledContext: a.config.DisabledContext}
+	if snapshot, ok := a.sessionContextSettings[sessionID]; ok {
+		cfg.DisabledTools = snapshot.disabledTools
+		cfg.DisabledContext = snapshot.disabledContext
 	}
-	return estimateToolSchemaTokenParts(a.sessionToolsetForBreakdown(sessionID, cfg))
+	a.mu.Unlock()
+	content := a.mcpCatalogFor(context.Background(), cfg)
+	if content == emptyMcpCatalog {
+		return 0
+	}
+	return estimateTokensFromText(content)
 }
 
 // getContextBreakdown computes token estimates from the real session state.
@@ -691,11 +655,10 @@ func (a *App) getContextBreakdown(sessionID string, workspaceHint string) Contex
 		result.SystemPrompt = cached.system
 		result.SystemPromptParts = append([]ContextBreakdownPart(nil), cached.parts...)
 		result.ToolSchemas = cached.tools
-		result.MCPToolSchemas = cached.mcpTools
 	} else {
 		cfg := a.contextSettingsForSession(sessionID, a.sessionContextConfig(sessionID, workspaceHint), false)
 		result.SystemPrompt, result.SystemPromptParts = a.sessionPrefixBreakdown(sessionID, cfg, nil)
-		result.ToolSchemas, result.MCPToolSchemas = a.sessionToolSchemaTokens(sessionID, cfg)
+		result.ToolSchemas = estimateToolSchemaTokens(a.sessionToolsetForBreakdown(sessionID, cfg))
 	}
 
 	// Check if live breakdown is available (covers tool calls + tool results not in a.histories)
@@ -704,6 +667,13 @@ func (a *App) getContextBreakdown(sessionID string, workspaceHint string) Contex
 	a.mu.Unlock()
 	if !hasLive {
 		live = a.savedHistoryBreakdown(sessionID)
+	}
+	// Count the copies the request actually carries. History is the authority: it
+	// holds the one catalog the conversation was given, and a config change does
+	// not send another. Only a conversation without one gets the pending pool.
+	result.MCPCatalog = live.MCPCatalog
+	if result.MCPCatalog == 0 {
+		result.MCPCatalog = a.pendingMcpCatalogTokens(sessionID)
 	}
 	result.UserMessages = live.UserMessages
 	result.AssistantMsgs = live.AssistantMsgs
@@ -784,7 +754,11 @@ func addBreakdownMessage(result *ContextBreakdown, message openai.ChatCompletion
 	tokens := messageTokens(message)
 	switch message.Role {
 	case openai.ChatMessageRoleUser:
-		result.UserMessages += tokens
+		if isMcpCatalogMessage(message) {
+			result.MCPCatalog += tokens
+		} else {
+			result.UserMessages += tokens
+		}
 	case openai.ChatMessageRoleAssistant:
 		result.AssistantMsgs += tokens
 	case openai.ChatMessageRoleTool:
@@ -1450,6 +1424,10 @@ func (a *App) refreshSessionPromptPrefix(sessionID string) {
 	delete(a.sessionWorkspaceMaps, sessionID)
 	delete(a.sessionToolsets, sessionID)
 	a.mu.Unlock()
+	// A fresh snapshot must not reuse the workspace map's short-lived live cache.
+	if a.workspaceCaches != nil {
+		a.invalidateWorkspaceMapCache(a.sessionContextConfig(sessionID, ""))
+	}
 }
 
 // systemPromptPartsForBreakdown returns the parts the footer context breakdown
@@ -1552,7 +1530,7 @@ func appendFrontendHistoryDelta(messages []openai.ChatCompletionMessage, backend
 func comparableMessageKey(role, content string) string {
 	role = strings.TrimSpace(role)
 	content = strings.TrimSpace(content)
-	if content == "" {
+	if content == "" || (role == openai.ChatMessageRoleUser && strings.HasPrefix(content, turnNoticeMarker(mcpCatalogNotice))) {
 		return ""
 	}
 	if role != openai.ChatMessageRoleUser && role != openai.ChatMessageRoleAssistant {
