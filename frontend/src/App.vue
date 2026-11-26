@@ -4612,21 +4612,43 @@ function createReplacementSession(title = t('app.sessions.new'), workspacePath =
   return session;
 }
 
+// 会话删除会连同全部对话与模型上下文一起从磁盘移除，且没有回收站可恢复。
+// 与「删除提问 / 删除计划任务 / 删除 SSH 节点」保持同一交互：先确认再删，
+// 而不是单击 / 一个 Delete 键就不可逆地丢掉整段历史。
 function deleteSession(index) {
   const visibleSessions = currentWorkspaceSessions.value;
   if (index < 0 || index >= visibleSessions.length) return;
   const target = visibleSessions[index];
   if (!target) return;
-  const actualIndex = sessions.value.findIndex((session) => session.id === target.id);
-  if (actualIndex < 0) return;
   if (sessionBusy(target)) {
     message.warning(t('app.sessions.runningDeleteBlocked'));
     return;
   }
 
-  const deletedId = target.id;
+  // 确认框打开期间列表可能被后台事件刷新，因此回调里按 id 重新解析目标，
+  // 不能沿用打开时的下标。确认前再查一次忙碌状态（期间可能刚好开跑）。
+  dialog.warning({
+    title: t('app.sessions.deleteConfirmTitle'),
+    content: t('app.sessions.deleteConfirmContent', { title: sessionDisplayTitle(target) }),
+    positiveText: t('common.delete'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => performDeleteSession(target.id),
+  });
+}
+
+function performDeleteSession(deletedId) {
+  const visibleSessions = currentWorkspaceSessions.value;
+  const index = visibleSessions.findIndex((session) => session.id === deletedId);
+  const actualIndex = sessions.value.findIndex((session) => session.id === deletedId);
+  if (actualIndex < 0) return;
+  const target = sessions.value[actualIndex];
+  if (sessionBusy(target)) {
+    message.warning(t('app.sessions.runningDeleteBlocked'));
+    return;
+  }
+
   const wasActive = deletedId === activeSessionId.value;
-  const fallback = visibleSessions[index + 1] || visibleSessions[index - 1] || null;
+  const fallback = index >= 0 ? visibleSessions[index + 1] || visibleSessions[index - 1] || null : null;
   const linkedTabs = workspaceTabs.value.filter((tab) => tab.sessionId === deletedId);
   releaseSessionAttachments(target);
   sessions.value.splice(actualIndex, 1);
@@ -4669,7 +4691,7 @@ function deleteSession(index) {
   expanded.delete(deletedId);
   expandedArchiveSessions.value = expanded;
 
-  sessionsSelectedIndex.value = Math.max(0, Math.min(index, currentWorkspaceSessions.value.length - 1));
+  sessionsSelectedIndex.value = Math.max(0, Math.min(index >= 0 ? index : 0, currentWorkspaceSessions.value.length - 1));
   saveSessions();
 }
 
