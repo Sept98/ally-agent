@@ -46,6 +46,59 @@ func (a *App) emitPlanUpdate(sid string, plan []PlanStep, revision int64) {
 	})
 }
 
+// planForSessionSnapshot returns the plan to store with a session's UI
+// snapshot. The plan's writes still live in the tool history; this copy exists
+// so reopening a session restores the panel and the tool's position exactly,
+// including a plan long enough that one history block carries only a window of
+// it. A session that never wrote a plan returns nil, and its snapshot carries
+// no plan fields at all.
+func (a *App) planForSessionSnapshot(sessionID string) ([]PlanStep, int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	list, ok := a.plans[sessionID]
+	if !ok {
+		return nil, 0
+	}
+	return clonePlan(list), a.planRevisions[sessionID]
+}
+
+// restorePlanFromSnapshot reinstates the plan a saved session carried, so the
+// panel and the plan tool agree on where the work stood after a restart. Only
+// an absent in-memory entry is filled: a session that is already live keeps the
+// plan its runs are writing to. A saved revision is restored with it so the
+// panel's change tracking stays monotonic; a cleared plan (empty list, non-zero
+// revision) is restored as a present, empty plan.
+func (a *App) restorePlanFromSnapshot(sessionID string, list []PlanStep, revision int64) {
+	if sessionID == "" || (len(list) == 0 && revision == 0) {
+		return
+	}
+	if validatePlanList(list) != nil {
+		return // a damaged snapshot must not resurrect a plan the tool would refuse
+	}
+	plan := clonePlan(list)
+	a.mu.Lock()
+	if _, live := a.plans[sessionID]; live {
+		a.mu.Unlock()
+		return
+	}
+	if a.plans == nil {
+		a.plans = map[string][]PlanStep{}
+	}
+	a.plans[sessionID] = plan
+	if a.planRevisions == nil {
+		a.planRevisions = map[string]int64{}
+	}
+	if revision > a.planRevisions[sessionID] {
+		a.planRevisions[sessionID] = revision
+	}
+	revision = a.planRevisions[sessionID]
+	a.mu.Unlock()
+	// Publish through the same event a plan write uses: the panel already
+	// listens for it, so a reopened session repopulates with no load-specific
+	// UI path.
+	a.emitPlanUpdate(sessionID, plan, revision)
+}
+
 // planRevisionFor returns the session's plan revision: 0 before its first write.
 // The run loop compares it around a tool batch to tell whether that batch moved
 // the plan, which is the only thing that makes reported progress current.

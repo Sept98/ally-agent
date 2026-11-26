@@ -75,6 +75,14 @@ type SessionSnapshot struct {
 	ContextTokens int              `json:"contextTokens,omitempty"`
 	HasSnapshot   bool             `json:"hasSnapshot"`
 	Messages      []map[string]any `json:"messages"`
+	// Plan is the session's plan as the panel last showed it. Plan writes live
+	// in the tool history, but that history carries a bounded window per call
+	// (planModelRowLimit), so the snapshot is what lets a long plan reopen at
+	// exactly the position the work left it. PlanRevision keeps the panel's
+	// revision monotonic across restarts; a session that never wrote a plan
+	// carries neither field.
+	Plan         []PlanStep `json:"plan,omitempty"`
+	PlanRevision int64      `json:"planRevision,omitempty"`
 }
 
 // ListSessionIndex is the startup fast path: no directory scans or snapshot
@@ -264,7 +272,9 @@ func (a *App) LoadSession(sessionID string) (SessionSnapshot, error) {
 			if _, imageErr := os.Stat(filepath.Join(a.imagesDir(), imageSessionKey(sessionID))); imageErr == nil {
 				a.restoreGeneratedImageAttachments(&snapshot, a.loadSessionHistoryCopy(sessionID))
 			}
-			return normalizeSessionSnapshot(snapshot, sessionID), nil
+			snapshot = normalizeSessionSnapshot(snapshot, sessionID)
+			a.restorePlanFromSnapshot(snapshot.ID, snapshot.Plan, snapshot.PlanRevision)
+			return snapshot, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return SessionSnapshot{}, err
 		}
@@ -380,6 +390,13 @@ func (a *App) SaveSession(snapshot SessionSnapshot) error {
 // saveSessionLocked persists a normalized snapshot while sessionMu is held.
 func (a *App) saveSessionLocked(snapshot SessionSnapshot) error {
 	snapshot = a.sessionSnapshotForStorage(snapshot)
+	// The plan is the backend's, not whatever the caller had cached: when the
+	// backend holds one, attach the current list here so the saved position
+	// always matches the tool history. A backend that has no plan for the
+	// session keeps a caller-supplied copy instead of dropping it.
+	if plan, revision := a.planForSessionSnapshot(snapshot.ID); plan != nil || revision > 0 {
+		snapshot.Plan, snapshot.PlanRevision = plan, revision
+	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
